@@ -1,0 +1,8 @@
+
+mysocial-testnet-checkpoint-uploader.json
+
+.env
+
+/uploads/*
+
+.cursor/scratchpad.md

@@ -1,13 +1,51 @@
-fastapi
-uvicorn
-pydantic
-librosa
-numpy
-faiss-cpu
-opencv-python
-Pillow
-torch
-transformers
-google-cloud-storage
-psycopg2-binary
-timescale-vector
+# Core FastAPI framework
+fastapi>=0.104.1
+uvicorn[standard]>=0.24.0
+pydantic>=2.5.0
+
+# Audio processing and fingerprinting
+librosa>=0.10.1
+soundfile>=0.12.1
+scipy>=1.11.4
+
+# Machine learning and embeddings
+numpy>=1.24.3
+torch>=2.1.0
+torchvision>=0.16.0
+transformers>=4.35.0
+sentence-transformers>=2.2.2
+
+# Vector similarity search
+faiss-cpu>=1.7.4
+# Alternative: faiss-gpu>=1.7.4  # Uncomment for GPU support
+
+# Image processing
+opencv-python>=4.8.1.78
+Pillow>=10.1.0
+
+# Database and caching
+psycopg2-binary>=2.9.9
+redis>=5.0.1
+sqlalchemy>=2.0.23
+alembic>=1.13.0  # For database migrations
+
+# Cloud storage
+google-cloud-storage>=2.10.0
+boto3>=1.29.0  # For S3-compatible storage
+requests>=2.31.0
+
+# Development and testing
+pytest>=7.4.3
+pytest-asyncio>=0.21.1
+httpx>=0.25.2  # For testing FastAPI endpoints
+
+# Logging and monitoring
+structlog>=23.2.0
+python-json-logger>=2.0.7
+
+# Environment management
+python-dotenv>=1.0.0
+
+# Additional utilities
+python-multipart>=0.0.6  # For file uploads
+aiofiles>=23.2.1  # Async file operations
