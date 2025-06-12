@@ -1,0 +1,13 @@
+fastapi
+uvicorn
+pydantic
+librosa
+numpy
+faiss-cpu
+opencv-python
+Pillow
+torch
+transformers
+google-cloud-storage
+psycopg2-binary
+timescale-vector
