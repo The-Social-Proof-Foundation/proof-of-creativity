@@ -1,0 +1,89 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+pip-log.txt
+pip-delete-this-directory.txt
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Development files
+.env
+.env.local
+.env.development
+.env.test
+*.log
+logs/
+
+# Documentation (keep deployment guide)
+README.md
+docs/
+*.md
+!RAILWAY_DEPLOYMENT.md
+
+# Test files
+tests/
+test_*.py
+*_test.py
+
+# Development scripts
+scripts/
+!scripts/normalize_json_columns.py
+
+# Local uploads (these won't persist on Railway anyway)
+uploads/
+temp/
+tmp/
+
+# Database files
+*.db
+*.sqlite
+*.sqlite3
+
+# Git
+.git/
+.gitignore
+.gitattributes
+
+# Docker (Railway handles this)
+docker-compose.yml
+docker-compose.*.yml
+
+# Development dependencies
+Pipfile
+Pipfile.lock
+poetry.lock
+pyproject.toml
+
+# Coverage reports
+htmlcov/
+.coverage
+.coverage.*
+coverage.xml
+*.cover
+
+# Jupyter Notebooks
+*.ipynb
+.ipynb_checkpoints
+
+# Local configuration
+.env.example 

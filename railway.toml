@@ -1,0 +1,56 @@
+[build]
+builder = "dockerfile"
+dockerfilePath = "Dockerfile"
+
+[deploy]
+startCommand = "uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}"
+healthcheckPath = "/health"
+healthcheckTimeout = 120
+restartPolicyType = "on_failure"
+restartPolicyMaxRetries = 3
+
+[variables]
+# Core Application Settings
+API_HOST = "0.0.0.0"
+DEBUG = "false"
+LOG_LEVEL = "INFO"
+SECRET_KEY = "railway-generated-secret-key-change-me"
+
+# Media Processing Configuration
+MAX_FILE_SIZE = "100000000"
+TEMP_DIR = "/tmp/proof-of-creativity"
+AUDIO_SAMPLE_RATE = "8000"
+KEYFRAME_EXTRACTION_RATE = "1"
+
+# AI Model Configuration
+CLIP_MODEL_NAME = "openai/clip-vit-base-patch32"
+EMBEDDING_DIMENSION = "512"
+
+# Vector Database Settings
+VECTOR_DB = "timescale"
+
+# Storage Configuration (default to local for Railway deployment)
+USE_GCS = "false"
+USE_WALRUS = "false"
+
+# Database Configuration (to be set via Railway environment variables)
+# DB_DSN = "postgresql://username:password@host:port/database"
+# TIMESCALE_DB_DSN = "postgresql://username:password@host:port/database"
+
+# Redis Configuration (if using Railway Redis plugin)
+# Uncomment if you add Redis plugin:
+# REDIS_URL = "redis://default:password@host:port"
+
+[environments.production]
+variables = { 
+  DEBUG = "false", 
+  LOG_LEVEL = "INFO",
+  API_HOST = "0.0.0.0"
+}
+
+[environments.staging]
+variables = { 
+  DEBUG = "true", 
+  LOG_LEVEL = "DEBUG",
+  API_HOST = "0.0.0.0"
+} 
