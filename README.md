@@ -309,20 +309,6 @@ docker run -d \
   proof-of-creativity
 ```
 
-### Railway.com Deployment
-
-1. Connect your GitHub repository
-2. Set environment variables in Railway dashboard
-3. Deploy automatically on push to main
-
-### Production Considerations
-
-- **Database**: Use Timescale Cloud for optimal vector performance
-- **Storage**: Configure appropriate GCS/Walrus buckets
-- **Monitoring**: Set up structured logging aggregation
-- **Security**: Configure CORS, rate limiting, and authentication
-- **Scaling**: Use connection pooling and async processing
-
 ## 📊 Performance Benchmarks
 
 ### Vector Search Performance (Timescale)
