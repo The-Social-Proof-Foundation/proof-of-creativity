@@ -6,7 +6,7 @@ import time
 from typing import List, Optional
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, status, Query, Request
+from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, status, Query, Request, WebSocket, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 import uvicorn
@@ -27,7 +27,7 @@ from app.core.database import (
     check_database_connection
 )
 from app.core.utils import save_temp_upload, new_media_id, calculate_file_hash, cleanup_temp_file
-from app.models.similarity import MediaMatch, UploadResponse, ErrorResponse, HealthResponse
+from app.models.similarity import MediaMatch, UploadResponse, ErrorResponse, HealthResponse, StreamingUploadResponse
 
 # Configure structured logging
 structlog.configure(
@@ -58,10 +58,13 @@ redis_cache = None
 # Global MySocial client (optional)
 mys_client = None
 
+# Global progress tracker
+progress_tracker = None
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan manager for startup and shutdown events."""
-    global storage_client, redis_cache, mys_client
+    global storage_client, redis_cache, mys_client, progress_tracker
     
     # Startup
     logger.info("Starting Proof of Creativity API")
@@ -83,6 +86,11 @@ async def lifespan(app: FastAPI):
             logger.info("✅ Redis cache initialized")
         else:
             logger.warning("⚠️  Redis cache disabled - performance will be slower")
+        
+        # Step 2b: Initialize progress tracker (uses Redis)
+        from app.core.progress_tracker import ProgressTracker
+        progress_tracker = ProgressTracker(redis_cache)
+        logger.info("✅ Progress tracker initialized")
         
         # Step 3: Initialize database connection pool (after migrations)
         from app.core.database import initialize_connection_pool, create_vector_index_if_not_exists
@@ -575,6 +583,131 @@ async def health_check():
             components={"error": str(e)}
         )
 
+@app.post("/upload/stream", response_model=StreamingUploadResponse)
+async def upload_media_streaming(
+    request: Request,
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(..., description="Media file to upload and analyze"),
+    post_id: Optional[str] = None,  # MySocial post ID for blockchain submission
+    _rate_limit: None = Depends(check_rate_limit)
+):
+    """
+    Streaming upload with immediate response and WebSocket progress updates
+    
+    Returns predicted CDN URL immediately, processes in background
+    
+    Flow:
+    1. Validate file
+    2. Check post not already analyzed (if post_id provided)
+    3. Generate media_id and predict URL
+    4. Return immediately with WebSocket info
+    5. Process upload + analysis in background
+    
+    Connect to WebSocket: ws://host:port/ws/upload/{upload_id} for real-time progress
+    """
+    from pathlib import Path
+    
+    try:
+        # Validate file
+        content_type, media_type = await validate_file(file)
+        
+        # Generate media_id upfront
+        media_id = new_media_id()
+        
+        # Check if post was already analyzed (one media per post rule)
+        if post_id and mys_client:
+            try:
+                post_check = mys_client.check_post_already_analyzed(post_id)
+                if post_check.get("already_analyzed"):
+                    raise HTTPException(
+                        status_code=status.HTTP_409_CONFLICT,
+                        detail=f"Post {post_id} was already analyzed by PoC. Only one media per post allowed."
+                    )
+            except HTTPException:
+                raise
+            except Exception as e:
+                logger.warning("Could not check post status", post_id=post_id, error=str(e))
+                # Continue anyway
+        
+        # Generate predicted URL (simplified: just media_id + extension)
+        ext = Path(file.filename).suffix or ".bin"
+        simplified_filename = f"{media_id}{ext}"
+        
+        # Construct predicted CDN URL
+        if config.R2_PUBLIC_DOMAIN:
+            from datetime import datetime
+            now = datetime.now()
+            year = now.strftime("%Y")
+            month = now.strftime("%m")
+            predicted_url = f"https://{config.R2_PUBLIC_DOMAIN}/{media_type}/{year}/{month}/{simplified_filename}"
+        else:
+            predicted_url = f"r2://{config.R2_BUCKET_NAME}/{media_type}/{simplified_filename}"
+        
+        # Save temp file for background processing
+        temp_file_path = save_temp_upload(file)
+        file_hash = calculate_file_hash(temp_file_path)
+        
+        # Create progress entry in Redis
+        if progress_tracker:
+            progress_tracker.create_upload(
+                upload_id=media_id,
+                predicted_url=predicted_url,
+                post_id=post_id
+            )
+        
+        # Spawn background task for processing
+        from app.services.background_tasks import process_upload_background
+        
+        # Determine which similarity detection function to use
+        if media_type == "image":
+            detect_func = detect_image_similarity
+        elif media_type == "audio":
+            detect_func = detect_audio_similarity
+        elif media_type == "video":
+            detect_func = detect_video_similarity
+        else:
+            raise HTTPException(status_code=400, detail="Invalid media type")
+        
+        background_tasks.add_task(
+            process_upload_background,
+            upload_id=media_id,
+            temp_file_path=temp_file_path,
+            filename=file.filename,
+            content_type=content_type,
+            media_type=media_type,
+            file_hash=file_hash,
+            post_id=post_id,
+            progress_tracker=progress_tracker,
+            storage_client=storage_client,
+            mys_client=mys_client,
+            detect_similarity_func=detect_func
+        )
+        
+        # Return immediately with predicted URL and WebSocket info
+        websocket_url = f"ws://{request.url.hostname}:{request.url.port}/ws/upload/{media_id}"
+        
+        logger.info("Upload accepted, processing in background",
+                   upload_id=media_id,
+                   post_id=post_id,
+                   predicted_url=predicted_url)
+        
+        return StreamingUploadResponse(
+            upload_id=media_id,
+            predicted_url=predicted_url,
+            websocket_url=websocket_url,
+            message="Upload accepted, processing in background. Connect to WebSocket for real-time progress.",
+            post_id=post_id
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("Upload initiation failed", error=str(e))
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to initiate upload: {str(e)}"
+        )
+
 @app.post("/upload", response_model=UploadResponse)
 async def upload_media(
     request: Request,
@@ -583,12 +716,16 @@ async def upload_media(
     _rate_limit: None = Depends(check_rate_limit)
 ):
     """
+    Synchronous upload endpoint (legacy/compatibility)
+    
     Upload and analyze media file for similarity detection using PostgreSQL + pgvector.
     
     Supports:
     - Images: JPEG, PNG, GIF, WebP
     - Audio: MP3, WAV, FLAC, OGG  
     - Video: MP4, AVI, MOV, WebM
+    
+    For better UX with progress tracking, use /upload/stream instead
     
     If post_id is provided and MySocial integration is enabled, submits PoC result to blockchain.
     
@@ -604,6 +741,21 @@ async def upload_media(
         
         # Validate file
         content_type, media_type = await validate_file(file)
+        
+        # Check if post was already analyzed (one media per post rule)
+        if post_id and mys_client:
+            try:
+                post_check = mys_client.check_post_already_analyzed(post_id)
+                if post_check.get("already_analyzed"):
+                    raise HTTPException(
+                        status_code=status.HTTP_409_CONFLICT,
+                        detail=f"Post {post_id} was already analyzed by PoC. Only one media per post allowed."
+                    )
+            except HTTPException:
+                raise
+            except Exception as e:
+                logger.warning("Could not check post status", post_id=post_id, error=str(e))
+                # Continue anyway
         
         # Save temporary file
         temp_file_path = save_temp_upload(file)
@@ -632,9 +784,13 @@ async def upload_media(
         elif media_type == "video":
             matches = await detect_video_similarity(temp_file_path, media_id)
         
-        # Upload to storage
+        # Upload to storage (simplified filename: just media_id + extension)
+        from pathlib import Path
+        ext = Path(file.filename).suffix or ".bin"
+        simplified_filename = f"{media_id}{ext}"
+        
         with open(temp_file_path, "rb") as f:
-            storage_uri = storage_client.upload(f"{media_id}_{file.filename}", f, media_type)
+            storage_uri = storage_client.upload(simplified_filename, f, media_type)
         
         # Update media file with storage URI and completion status
         processing_time = (time.time() - start_time) * 1000  # Convert to milliseconds
@@ -811,6 +967,44 @@ async def get_media_attribution(media_id: str):
     except Exception as e:
         logger.error("Failed to get attribution records", media_id=media_id, error=str(e))
         raise HTTPException(status_code=500, detail=f"Failed to get attribution: {str(e)}")
+
+@app.get("/upload/{upload_id}/progress")
+async def get_upload_progress(upload_id: str):
+    """
+    Get current upload progress status (HTTP polling alternative to WebSocket)
+    
+    Returns current progress state
+    """
+    if not progress_tracker:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Progress tracking not available (Redis not configured)"
+        )
+    
+    progress_data = progress_tracker.get_progress(upload_id)
+    
+    if not progress_data:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Upload {upload_id} not found or expired"
+        )
+    
+    return progress_data
+
+@app.websocket("/ws/upload/{upload_id}")
+async def websocket_upload_progress(websocket: WebSocket, upload_id: str):
+    """
+    WebSocket endpoint for real-time upload progress streaming
+    
+    Connect to: ws://host:port/ws/upload/{upload_id}
+    
+    No authentication required
+    Unlimited connections
+    Streams progress until upload complete or 10 minute timeout
+    """
+    from app.api.websocket import stream_upload_progress
+    
+    await stream_upload_progress(websocket, upload_id, progress_tracker)
 
 @app.get("/stats", response_model=dict)
 async def get_system_stats():

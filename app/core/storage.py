@@ -180,7 +180,7 @@ class StorageClient:
         
         logger.info("Walrus HTTP session initialized", endpoint=config.WALRUS_ENDPOINT)
     
-    def upload(self, filename: str, fileobj: BinaryIO, media_type: str = "unknown") -> Dict[str, str]:
+    def upload(self, filename: str, fileobj: BinaryIO, media_type: str = "unknown", progress_callback: Optional[callable] = None) -> str:
         """
         Upload file to configured storage backend(s) with enhanced error handling.
         Priority: R2 (primary) → GCS (optional backup) → Walrus → Local
@@ -209,7 +209,7 @@ class StorageClient:
         # Try Cloudflare R2 first (PRIMARY for CDN delivery)
         if config.USE_CLOUDFLARE_R2 and self.r2_client:
             try:
-                r2_uri = self._upload_to_r2(filename, fileobj, media_type, file_size)
+                r2_uri = self._upload_to_r2(filename, fileobj, media_type, file_size, progress_callback)
                 storage_uris['primary'] = r2_uri
                 logger.info("Primary storage (R2) upload successful", uri=r2_uri)
                 
@@ -255,17 +255,17 @@ class StorageClient:
         logger.warning("No cloud storage backends available, using local storage")
         return self._upload_to_local(filename, fileobj, media_type, file_size)
     
-    def _upload_to_r2(self, filename: str, fileobj: BinaryIO, media_type: str, file_size: int) -> str:
-        """Upload file to Cloudflare R2 (S3-compatible)."""
+    def _upload_to_r2(self, filename: str, fileobj: BinaryIO, media_type: str, file_size: int, progress_callback: Optional[callable] = None) -> str:
+        """Upload file to Cloudflare R2 (S3-compatible) with progress tracking."""
         try:
             bucket_name = config.R2_BUCKET_NAME
             
-            # Create structured storage path
-            storage_path = create_media_storage_path(
-                media_id="",  # Will be handled by caller
-                filename=filename,
-                media_type=media_type
-            )
+            # Simplified storage path: media_type/YYYY/MM/filename (filename is just media_id.ext)
+            from datetime import datetime
+            now = datetime.now()
+            year = now.strftime("%Y")
+            month = now.strftime("%m")
+            storage_path = f"{media_type}/{year}/{month}/{filename}"
             
             # Set metadata (sanitize to ASCII-only for S3/R2 compatibility)
             metadata = {
@@ -284,15 +284,30 @@ class StorageClient:
             
             start_time = time.time()
             
-            # Upload to R2 using boto3 S3 client
+            # Upload to R2 using boto3 S3 client with progress tracking
             fileobj.seek(0)  # Reset to beginning
-            self.r2_client.put_object(
-                Bucket=bucket_name,
-                Key=storage_path,
-                Body=fileobj,
-                ContentType=content_type,
-                Metadata=metadata
-            )
+            
+            if progress_callback and file_size > 0:
+                # Wrap file object to track bytes uploaded
+                from app.core.utils import ProgressFileWrapper
+                wrapped_fileobj = ProgressFileWrapper(fileobj, file_size, progress_callback)
+                
+                self.r2_client.put_object(
+                    Bucket=bucket_name,
+                    Key=storage_path,
+                    Body=wrapped_fileobj,
+                    ContentType=content_type,
+                    Metadata=metadata
+                )
+            else:
+                # No progress tracking
+                self.r2_client.put_object(
+                    Bucket=bucket_name,
+                    Key=storage_path,
+                    Body=fileobj,
+                    ContentType=content_type,
+                    Metadata=metadata
+                )
             
             upload_time = time.time() - start_time
             

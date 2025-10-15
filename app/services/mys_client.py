@@ -240,6 +240,84 @@ class MySocialClient:
             logger.error("Failed to verify oracle authorization", error=str(e))
             return False
     
+    def check_post_already_analyzed(self, post_id: str) -> dict:
+        """
+        Check if a post has already been analyzed by PoC
+        CRITICAL: Prevents duplicate analysis (one media per post rule)
+        
+        Returns:
+            {
+                "already_analyzed": bool,
+                "poc_status": int or None,
+                "poc_badge_id": str or None,
+                "revenue_redirect_to": str or None
+            }
+        """
+        try:
+            # Query post object from MySocial
+            rpc_request = {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "mys_getObject",
+                "params": [
+                    post_id,
+                    {"showContent": True}
+                ]
+            }
+            
+            response = self.session.post(self.rpc_url, json=rpc_request, timeout=10)
+            response.raise_for_status()
+            
+            result = response.json()
+            
+            # Check for errors (post doesn't exist, etc.)
+            if "error" in result:
+                logger.warning("Post not found on blockchain", post_id=post_id)
+                return {
+                    "already_analyzed": False,
+                    "poc_status": None,
+                    "poc_badge_id": None,
+                    "revenue_redirect_to": None,
+                    "error": result["error"]
+                }
+            
+            post_data = result.get("result", {}).get("data", {}).get("content", {}).get("fields", {})
+            
+            # Check PoC fields
+            poc_status = post_data.get("poc_status")
+            poc_badge_id = post_data.get("poc_badge_id")
+            revenue_redirect_to = post_data.get("revenue_redirect_to")
+            
+            # If any PoC field is set, post was already analyzed
+            already_analyzed = (
+                poc_status is not None or
+                poc_badge_id is not None or
+                revenue_redirect_to is not None
+            )
+            
+            logger.info("Post PoC check",
+                       post_id=post_id,
+                       already_analyzed=already_analyzed,
+                       poc_status=poc_status)
+            
+            return {
+                "already_analyzed": already_analyzed,
+                "poc_status": poc_status,
+                "poc_badge_id": poc_badge_id,
+                "revenue_redirect_to": revenue_redirect_to
+            }
+            
+        except Exception as e:
+            logger.error("Failed to check post PoC status", post_id=post_id, error=str(e))
+            # On error, assume not analyzed (fail open)
+            return {
+                "already_analyzed": False,
+                "poc_status": None,
+                "poc_badge_id": None,
+                "revenue_redirect_to": None,
+                "error": str(e)
+            }
+    
     def get_poc_config(self) -> dict:
         """Fetch current PoC configuration from blockchain"""
         try:

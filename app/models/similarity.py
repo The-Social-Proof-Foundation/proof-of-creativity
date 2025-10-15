@@ -40,6 +40,14 @@ class UploadResponse(BaseModel):
     message: str = Field(..., description="Human-readable message")
     blockchain_tx_hash: Optional[str] = Field(None, description="MySocial blockchain transaction hash")
     
+class StreamingUploadResponse(BaseModel):
+    """Response model for streaming upload initiation."""
+    upload_id: str = Field(..., description="Unique upload identifier (media_id)")
+    predicted_url: str = Field(..., description="Predicted CDN URL (available immediately)")
+    websocket_url: str = Field(..., description="WebSocket URL for real-time progress updates")
+    message: str = Field(..., description="Status message")
+    post_id: Optional[str] = Field(None, description="MySocial post ID if provided")
+
 class ErrorResponse(BaseModel):
     """Error response model."""
     error: str = Field(..., description="Error type")
