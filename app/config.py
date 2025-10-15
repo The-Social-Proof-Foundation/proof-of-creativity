@@ -21,3 +21,11 @@ WALRUS_ENDPOINT = os.getenv("WALRUS_ENDPOINT", "https://api.walrus.xyz")
 
 # Rate Limiting (Redis-based)
 RATE_LIMIT_UPLOADS_PER_HOUR = int(os.getenv("RATE_LIMIT_UPLOADS_PER_HOUR", "100"))
+
+# MySocial Blockchain Integration (optional)
+MYS_INTEGRATION_ENABLED = os.getenv("MYS_INTEGRATION_ENABLED", "false").lower() == "true"
+MYSOCIAL_RPC_URL = os.getenv("MYSOCIAL_RPC_URL", "https://fullnode.testnet.mysocial.io")
+MYS_POC_PACKAGE_ID = os.getenv("MYS_POC_PACKAGE_ID", "")
+MYS_POC_CONFIG_ID = os.getenv("MYS_POC_CONFIG_ID", "")
+MYS_POC_REGISTRY_ID = os.getenv("MYS_POC_REGISTRY_ID", "")
+MYS_TOKEN_REGISTRY_ID = os.getenv("MYS_TOKEN_REGISTRY_ID", "")

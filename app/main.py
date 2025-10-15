@@ -55,10 +55,13 @@ storage_client = None
 # Global Redis cache
 redis_cache = None
 
+# Global MySocial client (optional)
+mys_client = None
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan manager for startup and shutdown events."""
-    global storage_client, redis_cache
+    global storage_client, redis_cache, mys_client
     
     # Startup
     logger.info("Starting Proof of Creativity API")
@@ -93,12 +96,20 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             logger.warning("Could not create vector indexes", error=str(e))
         
-        # Step 5: Initialize storage client
+        # Step 5: Initialize MySocial blockchain client (optional)
+        from app.services.mys_client import init_mys_client
+        mys_client = init_mys_client()
+        if mys_client:
+            logger.info("✅ MySocial blockchain integration enabled")
+        else:
+            logger.info("ℹ️  MySocial blockchain integration disabled")
+        
+        # Step 6: Initialize storage client
         storage_client = StorageClient()
         logger.info("Storage client initialized", 
                    storage_backend="R2" if config.USE_CLOUDFLARE_R2 else "GCS" if config.USE_GCS else "Local")
         
-        # Step 6: Verify everything works
+        # Step 7: Verify everything works
         if check_database_connection():
             logger.info("Database connection verified")
         else:
@@ -568,6 +579,7 @@ async def health_check():
 async def upload_media(
     request: Request,
     file: UploadFile = File(..., description="Media file to upload and analyze"),
+    post_id: Optional[str] = None,  # MySocial post ID for blockchain submission
     _rate_limit: None = Depends(check_rate_limit)
 ):
     """
@@ -577,6 +589,8 @@ async def upload_media(
     - Images: JPEG, PNG, GIF, WebP
     - Audio: MP3, WAV, FLAC, OGG  
     - Video: MP4, AVI, MOV, WebM
+    
+    If post_id is provided and MySocial integration is enabled, submits PoC result to blockchain.
     
     Returns similarity matches with other media in the database using advanced vector search.
     """
@@ -649,16 +663,57 @@ async def upload_media(
             "max_similarity_score": max([m.similarity_score for m in matches]) if matches else 0.0
         }
         
+        # Submit to MySocial blockchain if post_id provided
+        blockchain_tx_hash = None
+        if post_id and mys_client:
+            try:
+                # Map media type to contract constants
+                media_type_code = {"image": 1, "audio": 3, "video": 2}.get(media_type, 1)
+                
+                # Calculate highest similarity score (0-100 for contract)
+                highest_similarity = int(max([m.similarity_score for m in matches]) * 100) if matches else 0
+                
+                # Get original creator address if derivative
+                original_creator = None
+                if matches and len([m for m in matches if m.confidence_level == "high"]) > 0:
+                    # TODO: Map match_media_id to MySocial address
+                    # For now, we'd need to store MySocial addresses in media_files table
+                    pass
+                
+                # Submit to blockchain
+                mys_result = mys_client.submit_poc_analysis(
+                    post_id=post_id,
+                    media_type=media_type_code,
+                    similarity_score=highest_similarity,
+                    original_creator=original_creator
+                )
+                
+                blockchain_tx_hash = mys_result.get("tx_hash")
+                
+                logger.info("PoC result submitted to MySocial",
+                           post_id=post_id,
+                           tx_hash=blockchain_tx_hash,
+                           attribution_type=attribution_type)
+                
+            except Exception as e:
+                logger.error("Failed to submit to MySocial blockchain",
+                            post_id=post_id,
+                            error=str(e))
+                # Don't fail upload if blockchain submission fails
+        
+        # Record attribution in local database
         insert_attribution_record(
             media_id=media_id,
             attribution_type=attribution_type,
-            proof_data=proof_data
+            proof_data=proof_data,
+            blockchain_tx_hash=blockchain_tx_hash
         )
         
         logger.info("Attribution recorded", 
                    media_id=media_id, 
                    attribution_type=attribution_type,
-                   matches_found=len(matches))
+                   matches_found=len(matches),
+                   blockchain_tx_hash=blockchain_tx_hash)
         
         # Generate response message based on findings
         if matches:
@@ -679,7 +734,8 @@ async def upload_media(
             storage_uri=storage_uri,
             matches=matches,
             processing_status="completed",
-            message=message
+            message=message,
+            blockchain_tx_hash=blockchain_tx_hash
         )
         
     except HTTPException:
@@ -789,10 +845,13 @@ async def global_exception_handler(request, exc):
     )
 
 if __name__ == "__main__":
+    # Railway sets PORT, fallback to API_PORT or 8080
+    port = int(os.getenv("PORT") or os.getenv("API_PORT") or "8080")
+    
     uvicorn.run(
         "app.main:app",
         host=os.getenv("API_HOST", "0.0.0.0"),
-        port=int(os.getenv("API_PORT", 8000)),
+        port=port,
         reload=os.getenv("DEBUG", "false").lower() == "true",
         log_config=None,  # We handle logging with structlog
     ) 

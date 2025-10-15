@@ -3,7 +3,7 @@ builder = "dockerfile"
 dockerfilePath = "Dockerfile"
 
 [deploy]
-startCommand = "uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}"
+startCommand = "python -m app.main"
 healthcheckPath = "/health"
 healthcheckTimeout = 120
 restartPolicyType = "on_failure"
@@ -14,7 +14,6 @@ restartPolicyMaxRetries = 3
 API_HOST = "0.0.0.0"
 DEBUG = "false"
 LOG_LEVEL = "INFO"
-SECRET_KEY = "railway-generated-secret-key-change-me"
 
 # Media Processing Configuration
 MAX_FILE_SIZE = "100000000"

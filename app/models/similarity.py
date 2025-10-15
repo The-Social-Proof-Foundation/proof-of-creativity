@@ -34,10 +34,11 @@ class UploadResponse(BaseModel):
     content_type: str = Field(..., description="MIME type of the uploaded file")
     file_size: int = Field(..., description="File size in bytes")
     file_hash: str = Field(..., description="SHA-256 hash of file content")
-    storage_uri: str = Field(..., description="Storage URI (GCS or Walrus)")
+    storage_uri: str = Field(..., description="Storage URI (R2, GCS, or local)")
     matches: List[MediaMatch] = Field(default=[], description="Similar media found")
     processing_status: str = Field(..., description="Processing status")
     message: str = Field(..., description="Human-readable message")
+    blockchain_tx_hash: Optional[str] = Field(None, description="MySocial blockchain transaction hash")
     
 class ErrorResponse(BaseModel):
     """Error response model."""
