@@ -54,6 +54,8 @@ GCS_BUCKET_NAME = "proof-of-creativity"
 # Uncomment if you add Redis plugin:
 # REDIS_URL = "redis://default:password@host:port"
 
+RATE_LIMIT_UPLOADS_PER_HOUR=50
+
 [environments.production]
 variables = { 
   DEBUG = "false", 

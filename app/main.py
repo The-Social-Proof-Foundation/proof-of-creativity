@@ -6,7 +6,7 @@ import time
 from typing import List, Optional
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, status, Query
+from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, status, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 import uvicorn
@@ -52,10 +52,13 @@ logger = structlog.get_logger()
 # Global storage client
 storage_client = None
 
+# Global Redis cache
+redis_cache = None
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan manager for startup and shutdown events."""
-    global storage_client
+    global storage_client, redis_cache
     
     # Startup
     logger.info("Starting Proof of Creativity API")
@@ -70,24 +73,32 @@ async def lifespan(app: FastAPI):
         else:
             logger.warning("⚠️  Database migrations failed - continuing anyway")
         
-        # Step 2: Initialize database connection pool (after migrations)
+        # Step 2: Initialize Redis cache (for performance)
+        from app.core.redis_client import get_redis
+        redis_cache = get_redis()
+        if redis_cache.enabled:
+            logger.info("✅ Redis cache initialized")
+        else:
+            logger.warning("⚠️  Redis cache disabled - performance will be slower")
+        
+        # Step 3: Initialize database connection pool (after migrations)
         from app.core.database import initialize_connection_pool, create_vector_index_if_not_exists
         initialize_connection_pool()
         logger.info("Database connection pool initialized")
         
-        # Step 3: Create vector indexes (after tables exist)
+        # Step 4: Create vector indexes (after tables exist)
         try:
             create_vector_index_if_not_exists()
             logger.info("Vector indexes ensured")
         except Exception as e:
             logger.warning("Could not create vector indexes", error=str(e))
         
-        # Step 4: Initialize storage client
+        # Step 5: Initialize storage client
         storage_client = StorageClient()
         logger.info("Storage client initialized", 
                    storage_backend="R2" if config.USE_CLOUDFLARE_R2 else "GCS" if config.USE_GCS else "Local")
         
-        # Step 5: Verify everything works
+        # Step 6: Verify everything works
         if check_database_connection():
             logger.info("Database connection verified")
         else:
@@ -131,6 +142,26 @@ SUPPORTED_IMAGE_TYPES = {"image/jpeg", "image/png", "image/gif", "image/webp"}
 SUPPORTED_AUDIO_TYPES = {"audio/mpeg", "audio/wav", "audio/flac", "audio/ogg"}
 SUPPORTED_VIDEO_TYPES = {"video/mp4", "video/avi", "video/mov", "video/webm"}
 SUPPORTED_TYPES = SUPPORTED_IMAGE_TYPES | SUPPORTED_AUDIO_TYPES | SUPPORTED_VIDEO_TYPES
+
+async def check_rate_limit(request: Request):
+    """Rate limiting dependency - configurable uploads per hour per IP"""
+    if not redis_cache or not redis_cache.enabled:
+        return  # No rate limiting if Redis disabled
+    
+    client_ip = request.client.host if request.client else "unknown"
+    limit = config.RATE_LIMIT_UPLOADS_PER_HOUR
+    
+    allowed, current_count = redis_cache.check_rate_limit(
+        identifier=client_ip,
+        limit=limit,
+        window=3600  # 1 hour
+    )
+    
+    if not allowed:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=f"Rate limit exceeded. Maximum {limit} uploads per hour. Current: {current_count}"
+        )
 
 async def validate_file(file: UploadFile) -> tuple[str, str]:
     """Validate uploaded file and return content type and media type."""
@@ -501,9 +532,13 @@ async def health_check():
         # Check storage
         storage_health = storage_client.health_check() if storage_client else {"error": "not_initialized"}
         
+        # Check Redis
+        redis_health = redis_cache.health_check() if redis_cache else {"available": False}
+        
         components = {
             "database": "healthy" if db_healthy else "unhealthy",
-            "storage": "healthy" if storage_health.get("gcs", {}).get("available") or storage_health.get("walrus", {}).get("available") else "unhealthy",
+            "storage": "healthy" if storage_health.get("r2", {}).get("available") or storage_health.get("gcs", {}).get("available") else "unhealthy",
+            "redis": "healthy" if redis_health.get("available") else "unavailable",
             "embedding_model": "healthy",  # Could add actual model health checks
             "fingerprint_service": "healthy",
             "pgvector": "healthy" if db_stats.get("vector_extension_version") else "unavailable"
@@ -517,7 +552,8 @@ async def health_check():
             components={
                 **components,
                 "database_stats": db_stats,
-                "storage_health": storage_health
+                "storage_health": storage_health,
+                "redis_health": redis_health
             }
         )
     except Exception as e:
@@ -530,7 +566,9 @@ async def health_check():
 
 @app.post("/upload", response_model=UploadResponse)
 async def upload_media(
-    file: UploadFile = File(..., description="Media file to upload and analyze")
+    request: Request,
+    file: UploadFile = File(..., description="Media file to upload and analyze"),
+    _rate_limit: None = Depends(check_rate_limit)
 ):
     """
     Upload and analyze media file for similarity detection using PostgreSQL + pgvector.
@@ -724,10 +762,12 @@ async def get_system_stats():
     try:
         db_stats = get_database_stats()
         storage_health = storage_client.health_check() if storage_client else {}
+        redis_health = redis_cache.health_check() if redis_cache else {"available": False}
         
         return {
             "database": db_stats,
             "storage": storage_health,
+            "redis": redis_health,
             "api_version": "1.0.0",
             "timestamp": time.time()
         }

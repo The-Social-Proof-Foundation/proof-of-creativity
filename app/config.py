@@ -18,3 +18,6 @@ GCS_BACKUP_ENABLED = os.getenv("GCS_BACKUP_ENABLED", "false").lower() == "true"
 
 # Walrus (Decentralized storage)
 WALRUS_ENDPOINT = os.getenv("WALRUS_ENDPOINT", "https://api.walrus.xyz")
+
+# Rate Limiting (Redis-based)
+RATE_LIMIT_UPLOADS_PER_HOUR = int(os.getenv("RATE_LIMIT_UPLOADS_PER_HOUR", "100"))
