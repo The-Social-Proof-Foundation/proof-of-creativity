@@ -6,6 +6,8 @@ import time
 
 from google.cloud import storage
 from google.cloud.exceptions import GoogleCloudError
+import boto3
+from botocore.exceptions import ClientError, BotoCoreError
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -20,19 +22,27 @@ class StorageError(Exception):
     pass
 
 class StorageClient:
-    """Enhanced storage client with support for multiple backends."""
+    """Enhanced storage client with support for multiple backends: Cloudflare R2 (primary), GCS (backup), Walrus, and local."""
     
     def __init__(self):
+        self.r2_client = None
         self.gcs_client = None
         self.session = None
         
-        # Initialize GCS client if enabled
+        # Initialize Cloudflare R2 client if enabled (PRIMARY for videos/CDN)
+        if config.USE_CLOUDFLARE_R2:
+            try:
+                self._initialize_r2()
+            except Exception as e:
+                logger.error("Failed to initialize Cloudflare R2 client", error=str(e))
+                logger.warning("R2 initialization failed, will try other storage backends")
+        
+        # Initialize GCS client if enabled (BACKUP/ARCHIVE - optional)
         if config.USE_GCS:
             try:
                 self._initialize_gcs()
             except Exception as e:
                 logger.error("Failed to initialize GCS client", error=str(e))
-                # Don't fail startup for storage issues in development
                 logger.warning("GCS initialization failed, continuing without GCS storage")
         
         # Initialize HTTP session for Walrus
@@ -44,28 +54,104 @@ class StorageClient:
                 logger.warning("Walrus initialization failed, continuing without Walrus storage")
         
         # Check if any storage backend is available
-        has_storage = (self.gcs_client is not None) or (config.USE_WALRUS and self.session is not None)
+        has_storage = (
+            self.r2_client is not None or 
+            self.gcs_client is not None or 
+            (config.USE_WALRUS and self.session is not None)
+        )
         if not has_storage:
             logger.warning("No storage backends available - uploads will use local storage only")
         
         logger.info("Storage client initialized", 
+                   r2_enabled=self.r2_client is not None,
                    gcs_enabled=self.gcs_client is not None,
                    walrus_enabled=config.USE_WALRUS and self.session is not None)
+    
+    def _initialize_r2(self):
+        """Initialize Cloudflare R2 client (S3-compatible)."""
+        try:
+            # Get R2 credentials from environment
+            account_id = os.getenv("R2_ACCOUNT_ID")
+            access_key_id = os.getenv("R2_ACCESS_KEY_ID")
+            secret_access_key = os.getenv("R2_SECRET_ACCESS_KEY")
+            
+            if not all([account_id, access_key_id, secret_access_key]):
+                raise ValueError("Missing R2 credentials: R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, or R2_SECRET_ACCESS_KEY")
+            
+            # R2 endpoint format: https://<account_id>.r2.cloudflarestorage.com
+            endpoint_url = f"https://{account_id}.r2.cloudflarestorage.com"
+            
+            # Create boto3 S3 client configured for R2
+            self.r2_client = boto3.client(
+                's3',
+                endpoint_url=endpoint_url,
+                aws_access_key_id=access_key_id,
+                aws_secret_access_key=secret_access_key,
+                region_name='auto'  # R2 uses 'auto' region
+            )
+            
+            # Test bucket access
+            bucket_name = config.R2_BUCKET_NAME
+            try:
+                self.r2_client.head_bucket(Bucket=bucket_name)
+                logger.info("Cloudflare R2 client initialized successfully", 
+                           bucket_name=bucket_name,
+                           account_id=account_id)
+            except ClientError as e:
+                error_code = e.response.get('Error', {}).get('Code', 'Unknown')
+                if error_code == '404':
+                    logger.warning("R2 bucket does not exist", bucket_name=bucket_name)
+                    raise ValueError(f"R2 bucket does not exist: {bucket_name}")
+                else:
+                    logger.error("R2 bucket access test failed", error=str(e), error_code=error_code)
+                    raise
+                    
+        except Exception as e:
+            logger.error("R2 initialization failed", error=str(e))
+            raise
     
     def _initialize_gcs(self):
         """Initialize Google Cloud Storage client."""
         try:
-            # Check for credentials
-            credentials_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
-            if credentials_path and not os.path.exists(credentials_path):
-                logger.warning("GCS credentials file not found", path=credentials_path)
+            # Option 1: Check for JSON credentials in environment variable (Railway-friendly)
+            gcs_json = os.getenv("GCS_SERVICE_ACCOUNT_JSON")
+            if gcs_json:
+                import json
+                import tempfile
+                from google.oauth2 import service_account
+                
+                logger.info("Loading GCS credentials from environment variable")
+                
+                try:
+                    # Parse JSON credentials
+                    credentials_info = json.loads(gcs_json)
+                    credentials = service_account.Credentials.from_service_account_info(credentials_info)
+                    self.gcs_client = storage.Client(credentials=credentials, project=credentials_info.get('project_id'))
+                    logger.info("GCS client created from environment JSON credentials")
+                except json.JSONDecodeError as e:
+                    logger.error("Failed to parse GCS_SERVICE_ACCOUNT_JSON", error=str(e))
+                    raise ValueError("Invalid JSON in GCS_SERVICE_ACCOUNT_JSON environment variable")
             
-            self.gcs_client = storage.Client()
+            # Option 2: Check for credentials file path (traditional method)
+            elif os.getenv("GOOGLE_APPLICATION_CREDENTIALS"):
+                credentials_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+                if not os.path.exists(credentials_path):
+                    logger.warning("GCS credentials file not found", path=credentials_path)
+                    raise FileNotFoundError(f"Credentials file not found: {credentials_path}")
+                
+                logger.info("Loading GCS credentials from file", path=credentials_path)
+                self.gcs_client = storage.Client()
+            
+            # Option 3: Try default credentials (for GCE, Cloud Run, etc.)
+            else:
+                logger.info("Attempting to use default GCS credentials")
+                self.gcs_client = storage.Client()
             
             # Test bucket access
             bucket = self.gcs_client.bucket(config.GCS_BUCKET_NAME)
             if not bucket.exists():
                 logger.warning("GCS bucket does not exist", bucket_name=config.GCS_BUCKET_NAME)
+                raise ValueError(f"GCS bucket does not exist: {config.GCS_BUCKET_NAME}")
             else:
                 logger.info("GCS client initialized successfully", 
                            bucket_name=config.GCS_BUCKET_NAME)
@@ -94,9 +180,10 @@ class StorageClient:
         
         logger.info("Walrus HTTP session initialized", endpoint=config.WALRUS_ENDPOINT)
     
-    def upload(self, filename: str, fileobj: BinaryIO, media_type: str = "unknown") -> str:
+    def upload(self, filename: str, fileobj: BinaryIO, media_type: str = "unknown") -> Dict[str, str]:
         """
-        Upload file to configured storage backend with enhanced error handling.
+        Upload file to configured storage backend(s) with enhanced error handling.
+        Priority: R2 (primary) → GCS (optional backup) → Walrus → Local
         
         Args:
             filename: Name of the file
@@ -104,7 +191,7 @@ class StorageClient:
             media_type: Type of media (image, audio, video)
             
         Returns:
-            Storage URI where the file was uploaded
+            Dict with 'primary' storage URI and optional 'backup' URI
         """
         # Get file size for logging
         current_pos = fileobj.tell()
@@ -117,14 +204,42 @@ class StorageClient:
                    file_size_human=format_file_size(file_size),
                    media_type=media_type)
         
-        # Try GCS first if enabled
+        storage_uris = {}
+        
+        # Try Cloudflare R2 first (PRIMARY for CDN delivery)
+        if config.USE_CLOUDFLARE_R2 and self.r2_client:
+            try:
+                r2_uri = self._upload_to_r2(filename, fileobj, media_type, file_size)
+                storage_uris['primary'] = r2_uri
+                logger.info("Primary storage (R2) upload successful", uri=r2_uri)
+                
+                # Optionally backup to GCS if enabled
+                if config.USE_GCS and config.GCS_BACKUP_ENABLED and self.gcs_client:
+                    try:
+                        fileobj.seek(0)  # Reset for second upload
+                        gcs_uri = self._upload_to_gcs(filename, fileobj, media_type, file_size)
+                        storage_uris['backup'] = gcs_uri
+                        logger.info("Backup storage (GCS) upload successful", uri=gcs_uri)
+                    except Exception as e:
+                        logger.warning("GCS backup upload failed, continuing", error=str(e))
+                
+                return storage_uris['primary']  # Return primary URI for backward compatibility
+                
+            except Exception as e:
+                logger.error("R2 upload failed", filename=filename, error=str(e))
+                logger.info("Falling back to other storage backends")
+        
+        # Try GCS if R2 failed or not configured
         if config.USE_GCS and self.gcs_client:
             try:
-                return self._upload_to_gcs(filename, fileobj, media_type, file_size)
+                gcs_uri = self._upload_to_gcs(filename, fileobj, media_type, file_size)
+                storage_uris['primary'] = gcs_uri
+                return gcs_uri
             except Exception as e:
                 logger.error("GCS upload failed", filename=filename, error=str(e))
                 if not config.USE_WALRUS:
-                    raise StorageError(f"GCS upload failed: {e}")
+                    logger.warning("Falling back to local storage")
+                    return self._upload_to_local(filename, fileobj, media_type, file_size)
                 logger.info("Falling back to Walrus storage")
         
         # Try Walrus if enabled
@@ -133,14 +248,84 @@ class StorageClient:
                 return self._upload_to_walrus(filename, fileobj, media_type, file_size)
             except Exception as e:
                 logger.error("Walrus upload failed", filename=filename, error=str(e))
-                if not self.gcs_client:
-                    logger.warning("All storage backends failed, falling back to local storage")
-                    return self._upload_to_local(filename, fileobj, media_type, file_size)
-                raise StorageError(f"All storage backends failed. Last error: {e}")
+                logger.warning("All cloud storage backends failed, falling back to local storage")
+                return self._upload_to_local(filename, fileobj, media_type, file_size)
         
         # Fallback to local storage if no backends are configured
-        logger.warning("No storage backends available, using local storage")
+        logger.warning("No cloud storage backends available, using local storage")
         return self._upload_to_local(filename, fileobj, media_type, file_size)
+    
+    def _upload_to_r2(self, filename: str, fileobj: BinaryIO, media_type: str, file_size: int) -> str:
+        """Upload file to Cloudflare R2 (S3-compatible)."""
+        try:
+            bucket_name = config.R2_BUCKET_NAME
+            
+            # Create structured storage path
+            storage_path = create_media_storage_path(
+                media_id="",  # Will be handled by caller
+                filename=filename,
+                media_type=media_type
+            )
+            
+            # Set metadata (sanitize to ASCII-only for S3/R2 compatibility)
+            metadata = {
+                "original_filename": filename.encode('ascii', 'ignore').decode('ascii'),
+                "media_type": media_type,
+                "file_size": str(file_size),
+                "upload_timestamp": str(int(time.time()))
+            }
+            
+            # Set content type
+            content_type = self._get_content_type(filename) or 'application/octet-stream'
+            
+            # Upload with progress tracking for large files
+            if file_size > 10 * 1024 * 1024:  # 10MB
+                logger.info("Uploading large file to R2", filename=filename, file_size_mb=file_size/1024/1024)
+            
+            start_time = time.time()
+            
+            # Upload to R2 using boto3 S3 client
+            fileobj.seek(0)  # Reset to beginning
+            self.r2_client.put_object(
+                Bucket=bucket_name,
+                Key=storage_path,
+                Body=fileobj,
+                ContentType=content_type,
+                Metadata=metadata
+            )
+            
+            upload_time = time.time() - start_time
+            
+            # Generate storage URI
+            storage_uri = f"r2://{bucket_name}/{storage_path}"
+            
+            # Generate CDN URL if custom domain is configured
+            cdn_url = None
+            if config.R2_PUBLIC_DOMAIN:
+                cdn_url = f"https://{config.R2_PUBLIC_DOMAIN}/{storage_path}"
+                logger.info("R2 upload completed with CDN URL", 
+                           filename=filename,
+                           storage_uri=storage_uri,
+                           cdn_url=cdn_url,
+                           upload_time_seconds=round(upload_time, 2),
+                           upload_speed_mbps=round((file_size / 1024 / 1024) / upload_time, 2) if upload_time > 0 else 0)
+            else:
+                logger.info("R2 upload completed successfully", 
+                           filename=filename,
+                           storage_uri=storage_uri,
+                           upload_time_seconds=round(upload_time, 2),
+                           upload_speed_mbps=round((file_size / 1024 / 1024) / upload_time, 2) if upload_time > 0 else 0)
+            
+            return storage_uri
+            
+        except ClientError as e:
+            error_code = e.response.get('Error', {}).get('Code', 'Unknown')
+            logger.error("R2 API error during upload", 
+                        filename=filename, error=str(e), error_code=error_code)
+            raise
+        except Exception as e:
+            logger.error("Unexpected error during R2 upload", filename=filename, error=str(e))
+            raise
     
     def _upload_to_gcs(self, filename: str, fileobj: BinaryIO, media_type: str, file_size: int) -> str:
         """Upload file to Google Cloud Storage."""
@@ -156,9 +341,9 @@ class StorageClient:
             
             blob = bucket.blob(storage_path)
             
-            # Set metadata
+            # Set metadata (sanitize to ASCII-only for consistency)
             blob.metadata = {
-                "original_filename": filename,
+                "original_filename": filename.encode('ascii', 'ignore').decode('ascii'),
                 "media_type": media_type,
                 "file_size": str(file_size),
                 "upload_timestamp": str(int(time.time()))
@@ -291,7 +476,7 @@ class StorageClient:
         Download file from storage URI.
         
         Args:
-            storage_uri: Storage URI (gs:// or walrus://)
+            storage_uri: Storage URI (r2://, gs://, walrus://, or local://)
             output_path: Optional path to save file
             
         Returns:
@@ -299,12 +484,57 @@ class StorageClient:
         """
         logger.info("Starting file download", storage_uri=storage_uri)
         
-        if storage_uri.startswith("gs://"):
+        if storage_uri.startswith("r2://"):
+            return self._download_from_r2(storage_uri, output_path)
+        elif storage_uri.startswith("gs://"):
             return self._download_from_gcs(storage_uri, output_path)
         elif storage_uri.startswith("walrus://"):
             return self._download_from_walrus(storage_uri, output_path)
+        elif storage_uri.startswith("local://"):
+            # Local files can be accessed directly
+            local_path = storage_uri.replace("local://", "")
+            return local_path if os.path.exists(local_path) else None
         else:
             raise StorageError(f"Unsupported storage URI format: {storage_uri}")
+    
+    def _download_from_r2(self, storage_uri: str, output_path: Optional[str] = None) -> str:
+        """Download file from Cloudflare R2."""
+        try:
+            # Parse R2 URI: r2://bucket-name/path/to/file
+            if not storage_uri.startswith("r2://"):
+                raise ValueError("Invalid R2 URI")
+            
+            path_parts = storage_uri[5:].split("/", 1)  # Remove r2://
+            bucket_name = path_parts[0]
+            object_key = path_parts[1] if len(path_parts) > 1 else ""
+            
+            # Check if object exists
+            try:
+                self.r2_client.head_object(Bucket=bucket_name, Key=object_key)
+            except ClientError as e:
+                error_code = e.response.get('Error', {}).get('Code', 'Unknown')
+                if error_code == '404':
+                    raise StorageError(f"File not found in R2: {storage_uri}")
+                raise
+            
+            # Determine output path
+            if not output_path:
+                output_path = f"/tmp/{Path(object_key).name}"
+            
+            # Download file
+            self.r2_client.download_file(bucket_name, object_key, output_path)
+            
+            logger.info("R2 download completed", 
+                       storage_uri=storage_uri, output_path=output_path)
+            
+            return output_path
+            
+        except ClientError as e:
+            logger.error("R2 download failed", storage_uri=storage_uri, error=str(e))
+            raise
+        except Exception as e:
+            logger.error("Unexpected error during R2 download", storage_uri=storage_uri, error=str(e))
+            raise
     
     def _download_from_gcs(self, storage_uri: str, output_path: Optional[str] = None) -> str:
         """Download file from Google Cloud Storage."""
@@ -505,16 +735,31 @@ class StorageClient:
     def health_check(self) -> Dict[str, Any]:
         """Check the health of storage backends."""
         health = {
+            "r2": {"available": False, "error": None},
             "gcs": {"available": False, "error": None},
             "walrus": {"available": False, "error": None}
         }
         
-        # Check GCS
+        # Check Cloudflare R2
+        if config.USE_CLOUDFLARE_R2 and self.r2_client:
+            try:
+                self.r2_client.head_bucket(Bucket=config.R2_BUCKET_NAME)
+                health["r2"]["available"] = True
+                health["r2"]["bucket"] = config.R2_BUCKET_NAME
+                if config.R2_PUBLIC_DOMAIN:
+                    health["r2"]["cdn_domain"] = config.R2_PUBLIC_DOMAIN
+            except ClientError as e:
+                health["r2"]["error"] = str(e)
+            except Exception as e:
+                health["r2"]["error"] = str(e)
+        
+        # Check GCS (backup)
         if config.USE_GCS and self.gcs_client:
             try:
                 bucket = self.gcs_client.bucket(config.GCS_BUCKET_NAME)
                 bucket.exists()  # This will test connectivity
                 health["gcs"]["available"] = True
+                health["gcs"]["backup_mode"] = config.GCS_BACKUP_ENABLED
             except Exception as e:
                 health["gcs"]["error"] = str(e)
         

@@ -60,12 +60,36 @@ async def lifespan(app: FastAPI):
     # Startup
     logger.info("Starting Proof of Creativity API")
     try:
-        storage_client = StorageClient()
-        logger.info("Storage client initialized", storage_backend="GCS" if config.USE_GCS else "Walrus")
+        # Step 1: Run database migrations first (like Diesel's embedded_migrations)
+        logger.info("Running database migrations...")
+        from app.core.migrations import run_migrations
+        migrations_ok = run_migrations()
         
-        # Test database connection
+        if migrations_ok:
+            logger.info("✅ Database migrations completed")
+        else:
+            logger.warning("⚠️  Database migrations failed - continuing anyway")
+        
+        # Step 2: Initialize database connection pool (after migrations)
+        from app.core.database import initialize_connection_pool, create_vector_index_if_not_exists
+        initialize_connection_pool()
+        logger.info("Database connection pool initialized")
+        
+        # Step 3: Create vector indexes (after tables exist)
+        try:
+            create_vector_index_if_not_exists()
+            logger.info("Vector indexes ensured")
+        except Exception as e:
+            logger.warning("Could not create vector indexes", error=str(e))
+        
+        # Step 4: Initialize storage client
+        storage_client = StorageClient()
+        logger.info("Storage client initialized", 
+                   storage_backend="R2" if config.USE_CLOUDFLARE_R2 else "GCS" if config.USE_GCS else "Local")
+        
+        # Step 5: Verify everything works
         if check_database_connection():
-            logger.info("Timescale database connection verified")
+            logger.info("Database connection verified")
         else:
             logger.warning("Database connection check failed")
             
@@ -81,7 +105,7 @@ async def lifespan(app: FastAPI):
 # Create FastAPI application
 app = FastAPI(
     title="Proof of Creativity API",
-    description="Scalable Media Attribution Architecture for detecting original vs derivative media using Timescale Vector AI",
+    description="Scalable Media Attribution Architecture for detecting original vs derivative media using PostgreSQL + pgvector",
     version="1.0.0",
     docs_url="/docs",
     redoc_url="/redoc",
@@ -368,7 +392,7 @@ async def detect_video_similarity(file_path: str, media_id: str) -> List[MediaMa
         
         all_matches = []
         
-        # Process frame embeddings using Timescale Vector AI
+        # Process frame embeddings using pgvector
         for idx, frame_embedding in enumerate(frame_embeddings):
             similar_embeddings = search_embedding_with_timescale_ai(
                 vector=frame_embedding, 
@@ -460,10 +484,10 @@ async def root():
     return {
         "name": "Proof of Creativity API",
         "version": "1.0.0",
-        "description": "Scalable Media Attribution Architecture with Timescale Vector AI",
+        "description": "Scalable Media Attribution Architecture with PostgreSQL + pgvector",
         "docs_url": "/docs",
         "health_url": "/health",
-        "database": "Timescale with Vector AI"
+        "database": "PostgreSQL with pgvector"
     }
 
 @app.get("/health", response_model=HealthResponse)
@@ -482,7 +506,7 @@ async def health_check():
             "storage": "healthy" if storage_health.get("gcs", {}).get("available") or storage_health.get("walrus", {}).get("available") else "unhealthy",
             "embedding_model": "healthy",  # Could add actual model health checks
             "fingerprint_service": "healthy",
-            "timescale_vector": "healthy" if db_stats.get("vector_extension_version") else "unavailable"
+            "pgvector": "healthy" if db_stats.get("vector_extension_version") else "unavailable"
         }
         
         overall_status = "healthy" if all(status == "healthy" for status in components.values()) else "degraded"
@@ -509,7 +533,7 @@ async def upload_media(
     file: UploadFile = File(..., description="Media file to upload and analyze")
 ):
     """
-    Upload and analyze media file for similarity detection using Timescale Vector AI.
+    Upload and analyze media file for similarity detection using PostgreSQL + pgvector.
     
     Supports:
     - Images: JPEG, PNG, GIF, WebP

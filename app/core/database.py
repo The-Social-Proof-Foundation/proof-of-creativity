@@ -10,10 +10,19 @@ from datetime import datetime, timedelta
 
 logger = structlog.get_logger()
 
-# Timescale Vector AI configuration
-TIMESCALE_DB_DSN = os.getenv("TIMESCALE_DB_DSN", os.getenv("DB_DSN", "postgresql://user:password@localhost:5432/proof_of_creativity"))
-TIMESCALE_SERVICE_URL = os.getenv("TIMESCALE_SERVICE_URL", "")
-TIMESCALE_API_KEY = os.getenv("TIMESCALE_API_KEY", "")
+# Database configuration - works with regular PostgreSQL + pgvector
+def get_database_url():
+    """Get database URL and fix Railway's postgres:// format for SQLAlchemy 2.0"""
+    url = os.getenv("DATABASE_URL") or os.getenv("TIMESCALE_DB_DSN") or os.getenv("DB_DSN") or \
+          "postgresql://user:password@localhost:5432/proof_of_creativity"
+    
+    # Fix Railway/Heroku format (postgres:// → postgresql://)
+    if url.startswith("postgres://"):
+        url = url.replace("postgres://", "postgresql://", 1)
+    
+    return url
+
+DB_DSN = get_database_url()
 
 # Connection pool configuration
 MIN_CONNECTIONS = 1
@@ -23,16 +32,16 @@ MAX_CONNECTIONS = 20
 _connection_pool = None
 
 def initialize_connection_pool():
-    """Initialize the Timescale database connection pool."""
+    """Initialize the PostgreSQL database connection pool."""
     global _connection_pool
     if _connection_pool is None:
         try:
             _connection_pool = SimpleConnectionPool(
                 MIN_CONNECTIONS, 
                 MAX_CONNECTIONS, 
-                TIMESCALE_DB_DSN
+                DB_DSN
             )
-            logger.info("Timescale connection pool initialized", 
+            logger.info("PostgreSQL connection pool initialized", 
                        min_connections=MIN_CONNECTIONS, 
                        max_connections=MAX_CONNECTIONS)
             
@@ -47,12 +56,12 @@ def initialize_connection_pool():
                         logger.warning("Vector extension not found - ensure pgvector is installed")
                         
         except Exception as e:
-            logger.error("Failed to initialize Timescale connection pool", error=str(e))
+            logger.error("Failed to initialize PostgreSQL connection pool", error=str(e))
             raise
 
 @contextmanager
 def get_db_connection():
-    """Context manager for Timescale database connections with automatic cleanup."""
+    """Context manager for PostgreSQL database connections with automatic cleanup."""
     if _connection_pool is None:
         initialize_connection_pool()
     
@@ -71,14 +80,14 @@ def get_db_connection():
 
 def get_conn():
     """Legacy function for backward compatibility."""
-    return psycopg2.connect(TIMESCALE_DB_DSN)
+    return psycopg2.connect(DB_DSN)
 
-# Embedding management with Timescale Vector AI
+# Embedding management with pgvector
 def insert_embedding(media_id: str, kind: str, embedding: List[float], metadata: Dict[str, Any]):
-    """Insert a new embedding into Timescale with vector indexing."""
+    """Insert a new embedding with vector indexing."""
     sql = """
-    INSERT INTO media_embeddings (media_id, kind, embedding, metadata)
-    VALUES (%s, %s, %s, %s)
+    INSERT INTO media_embeddings (id, media_id, kind, embedding, metadata)
+    VALUES (gen_random_uuid(), %s, %s, %s, %s)
     """
     try:
         with get_db_connection() as conn:
@@ -102,7 +111,7 @@ def search_embedding_with_timescale_ai(
     similarity_threshold: float = 0.7
 ) -> List[Tuple]:
     """
-    Advanced vector similarity search using Timescale Vector AI capabilities.
+    Vector similarity search using PostgreSQL + pgvector.
     
     Args:
         vector: Query embedding vector
@@ -158,7 +167,7 @@ def search_embedding_with_timescale_ai(
         return results
         
     except Exception as e:
-        logger.error("Failed to search embeddings with Timescale AI", 
+        logger.error("Failed to search embeddings with pgvector", 
                     top_k=top_k, error=str(e))
         raise
 
@@ -193,8 +202,8 @@ def get_embedding_by_media_id(media_id: str) -> Optional[Tuple]:
 def insert_fingerprint(fp_hash: str, media_id: str, offset_seconds: float, fingerprint_data: Optional[bytes] = None):
     """Insert a new audio fingerprint into the database."""
     sql = """
-    INSERT INTO audio_fingerprints (fp_hash, media_id, offset_seconds, fingerprint_data)
-    VALUES (%s, %s, %s, %s)
+    INSERT INTO audio_fingerprints (id, fp_hash, media_id, offset_seconds, fingerprint_data)
+    VALUES (gen_random_uuid(), %s, %s, %s, %s)
     """
     try:
         with get_db_connection() as conn:
@@ -232,8 +241,8 @@ def search_fingerprint(fp_hash: str) -> List[Tuple]:
 def insert_image_hashes(media_id: str, hashes: dict) -> None:
     """Insert image perceptual hashes into database."""
     sql = """
-    INSERT INTO image_hashes (media_id, dhash, phash, ahash, dhash_16, phash_16)
-    VALUES (%s, %s, %s, %s, %s, %s)
+    INSERT INTO image_hashes (id, media_id, dhash, phash, ahash, dhash_16, phash_16)
+    VALUES (gen_random_uuid(), %s, %s, %s, %s, %s, %s)
     ON CONFLICT (media_id) DO UPDATE SET
         dhash = EXCLUDED.dhash,
         phash = EXCLUDED.phash,
@@ -463,11 +472,11 @@ def insert_similarity_match(
     
     sql = """
     INSERT INTO similarity_matches (
-        query_media_id, match_media_id, match_type, 
+        id, query_media_id, match_media_id, match_type, 
         similarity_score, confidence_level, match_details,
         match_category, embedding_type, fingerprint_hash, offset_seconds
     )
-    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+    VALUES (gen_random_uuid(), %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
     """
     try:
         with get_db_connection() as conn:
@@ -546,12 +555,12 @@ def insert_attribution_record(
     
     sql = """
     INSERT INTO attribution_records (
-        media_id, blockchain_tx_hash, blockchain_address, 
+        id, media_id, blockchain_tx_hash, blockchain_address, 
         attribution_type, proof_data,
         file_hash, media_type, matches_found, high_confidence_matches,
         max_similarity_score, processing_time_ms
     )
-    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+    VALUES (gen_random_uuid(), %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
     """
     try:
         with get_db_connection() as conn:
@@ -595,7 +604,7 @@ def get_attribution_records(media_id: str) -> List[Dict]:
                     media_id=media_id, error=str(e))
         raise
 
-# Timescale Vector AI specific functions
+# PostgreSQL + pgvector specific functions
 def create_vector_index_if_not_exists():
     """Create vector index for optimal similarity search performance."""
     sql = """
@@ -642,18 +651,18 @@ def get_vector_index_stats() -> Dict:
 
 # Database utility functions
 def check_database_connection() -> bool:
-    """Check if Timescale database connection is working."""
+    """Check if PostgreSQL database connection is working."""
     try:
         with get_db_connection() as conn:
             with conn.cursor() as cur:
                 cur.execute("SELECT 1")
                 result = cur.fetchone()
         
-        logger.info("Timescale database connection check successful")
+        logger.info("PostgreSQL database connection check successful")
         return result[0] == 1
         
     except Exception as e:
-        logger.error("Timescale database connection check failed", error=str(e))
+        logger.error("PostgreSQL database connection check failed", error=str(e))
         return False
 
 def get_database_stats() -> Dict:
@@ -684,7 +693,7 @@ def get_database_stats() -> Dict:
                     "postgres_version": result[5],
                     "vector_extension_version": result[6],
                     "connection_pool_size": len(_connection_pool._pool) if _connection_pool else 0,
-                    "database_type": "timescale"
+                    "database_type": "postgresql"
                 }
                 
     except Exception as e:
@@ -730,10 +739,5 @@ def cleanup_old_records(days_old: int = 30) -> Dict:
         logger.error("Database cleanup failed", error=str(e))
         raise
 
-# Initialize connection pool on module import
-try:
-    initialize_connection_pool()
-    # Ensure vector index exists
-    create_vector_index_if_not_exists()
-except Exception as e:
-    logger.warning("Could not initialize Timescale database at startup", error=str(e)) 
+# Connection pool and indexes are initialized in app startup (after migrations run)
+# See app/main.py lifespan function 
