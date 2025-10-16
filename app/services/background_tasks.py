@@ -17,6 +17,7 @@ async def process_upload_background(
     media_type: str,
     file_hash: str,
     post_id: Optional[str],
+    upload_to_stream: bool,
     progress_tracker,
     storage_client,
     mys_client,
@@ -33,6 +34,7 @@ async def process_upload_background(
         media_type: Category (image/audio/video)
         file_hash: SHA-256 hash
         post_id: MySocial post ID (optional)
+        upload_to_stream: Whether to upload video to Cloudflare Stream (opt-in)
         progress_tracker: ProgressTracker instance
         storage_client: StorageClient instance
         mys_client: MySocialClient instance (optional)
@@ -73,7 +75,7 @@ async def process_upload_background(
         ext = Path(filename).suffix or ".bin"
         simplified_filename = f"{upload_id}{ext}"
         
-        # Upload to storage
+        # Upload to R2 (for processing and backup)
         with open(temp_file_path, "rb") as f:
             storage_uri = storage_client.upload(
                 simplified_filename,
@@ -82,11 +84,48 @@ async def process_upload_background(
                 progress_callback=upload_progress_callback
             )
         
+        # Upload to Cloudflare Stream (for video streaming) - opt-in per request
+        streaming_uri = None
+        if upload_to_stream and media_type == "video":
+            try:
+                logger.info("Uploading to Cloudflare Stream (opt-in enabled)",
+                           upload_id=upload_id)
+                
+                with open(temp_file_path, "rb") as f:
+                    streaming_uri = storage_client.upload_to_stream(
+                        simplified_filename,
+                        f,
+                        media_type,
+                        file_size,
+                        metadata={
+                            "media_id": upload_id,
+                            "original_filename": filename,
+                            "post_id": post_id if post_id else ""
+                        }
+                    )
+                
+                if streaming_uri:
+                    logger.info("Video uploaded to Stream successfully", 
+                               upload_id=upload_id,
+                               streaming_uri=streaming_uri)
+                else:
+                    logger.warning("Stream upload returned no URI",
+                                  upload_id=upload_id)
+            except Exception as e:
+                logger.warning("Stream upload failed, continuing with R2 only",
+                              upload_id=upload_id,
+                              error=str(e))
+        elif upload_to_stream and media_type != "video":
+            logger.debug("Stream upload requested but media is not video, skipping",
+                        upload_id=upload_id,
+                        media_type=media_type)
+        
         progress_tracker.update_progress(
             upload_id,
             progress_percent=50,
             message="Upload complete, analyzing content...",
-            storage_uri=storage_uri
+            storage_uri=storage_uri,
+            streaming_uri=streaming_uri
         )
         
         # Insert media file record
@@ -184,6 +223,7 @@ async def process_upload_background(
             media_id=upload_id,
             status="completed",
             storage_uri=storage_uri,
+            streaming_uri=streaming_uri,
             processing_results={
                 "processing_time_ms": processing_time,
                 "matches_found": len(matches),

@@ -35,6 +35,7 @@ class UploadResponse(BaseModel):
     file_size: int = Field(..., description="File size in bytes")
     file_hash: str = Field(..., description="SHA-256 hash of file content")
     storage_uri: str = Field(..., description="Storage URI (R2, GCS, or local)")
+    streaming_uri: Optional[str] = Field(None, description="Cloudflare Stream URI (for videos with upload_to_stream=true)")
     matches: List[MediaMatch] = Field(default=[], description="Similar media found")
     processing_status: str = Field(..., description="Processing status")
     message: str = Field(..., description="Human-readable message")

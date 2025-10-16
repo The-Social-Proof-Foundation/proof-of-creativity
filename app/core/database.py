@@ -406,6 +406,7 @@ def update_media_file_status(
     media_id: str, 
     status: str, 
     storage_uri: Optional[str] = None,
+    streaming_uri: Optional[str] = None,
     processing_results: Optional[Dict] = None
 ):
     """Update media file status and related information with normalized columns."""
@@ -417,6 +418,7 @@ def update_media_file_status(
     sql = """
     UPDATE media_files 
     SET status = %s, storage_uri = COALESCE(%s, storage_uri), 
+        streaming_uri = COALESCE(%s, streaming_uri),
         processing_results = COALESCE(%s, processing_results),
         matches_found = %s, processing_time_ms = %s, media_type = %s,
         updated_at = NOW()
@@ -427,7 +429,8 @@ def update_media_file_status(
             with conn.cursor() as cur:
                 cur.execute(sql, (
                     status, 
-                    storage_uri, 
+                    storage_uri,
+                    streaming_uri,
                     extras.Json(processing_results) if processing_results else None,
                     matches_found, processing_time_ms, media_type,
                     media_id
@@ -436,7 +439,7 @@ def update_media_file_status(
         
         logger.debug("Media file status updated with normalized data", 
                     media_id=media_id, status=status, storage_uri=storage_uri,
-                    matches_found=matches_found, media_type=media_type)
+                    streaming_uri=streaming_uri, matches_found=matches_found, media_type=media_type)
                     
     except Exception as e:
         logger.error("Failed to update media file status", 

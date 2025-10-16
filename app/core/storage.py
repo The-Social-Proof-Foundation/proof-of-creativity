@@ -22,10 +22,11 @@ class StorageError(Exception):
     pass
 
 class StorageClient:
-    """Enhanced storage client with support for multiple backends: Cloudflare R2 (primary), GCS (backup), Walrus, and local."""
+    """Enhanced storage client with support for multiple backends: Cloudflare R2 (primary), Cloudflare Stream (video), GCS (backup), Walrus, and local."""
     
     def __init__(self):
         self.r2_client = None
+        self.stream_client = None
         self.gcs_client = None
         self.session = None
         
@@ -36,6 +37,14 @@ class StorageClient:
             except Exception as e:
                 logger.error("Failed to initialize Cloudflare R2 client", error=str(e))
                 logger.warning("R2 initialization failed, will try other storage backends")
+        
+        # Initialize Cloudflare Stream client if credentials are available (VIDEO STREAMING - opt-in per upload)
+        if config.STREAM_ACCOUNT_ID and config.STREAM_API_TOKEN:
+            try:
+                self._initialize_stream()
+            except Exception as e:
+                logger.error("Failed to initialize Cloudflare Stream client", error=str(e))
+                logger.warning("Stream initialization failed, video streaming URLs will not be available")
         
         # Initialize GCS client if enabled (BACKUP/ARCHIVE - optional)
         if config.USE_GCS:
@@ -64,6 +73,7 @@ class StorageClient:
         
         logger.info("Storage client initialized", 
                    r2_enabled=self.r2_client is not None,
+                   stream_enabled=self.stream_client is not None,
                    gcs_enabled=self.gcs_client is not None,
                    walrus_enabled=config.USE_WALRUS and self.session is not None)
     
@@ -108,6 +118,43 @@ class StorageClient:
                     
         except Exception as e:
             logger.error("R2 initialization failed", error=str(e))
+            raise
+    
+    def _initialize_stream(self):
+        """Initialize Cloudflare Stream client for video streaming."""
+        try:
+            account_id = config.STREAM_ACCOUNT_ID
+            api_token = config.STREAM_API_TOKEN
+            
+            if not all([account_id, api_token]):
+                raise ValueError("Missing Stream credentials: STREAM_ACCOUNT_ID or STREAM_API_TOKEN")
+            
+            # Stream uses REST API (not S3-compatible like R2)
+            # We'll use requests for Stream API calls
+            self.stream_client = {
+                'account_id': account_id,
+                'api_token': api_token,
+                'api_base_url': f"https://api.cloudflare.com/client/v4/accounts/{account_id}/stream",
+                'customer_subdomain': config.STREAM_CUSTOMER_SUBDOMAIN
+            }
+            
+            # Test Stream API access by getting account details
+            headers = {'Authorization': f'Bearer {api_token}'}
+            test_url = f"https://api.cloudflare.com/client/v4/accounts/{account_id}/stream"
+            response = requests.get(test_url, headers=headers, timeout=10)
+            
+            if response.status_code == 200:
+                logger.info("Cloudflare Stream client initialized successfully", 
+                           account_id=account_id,
+                           custom_domain=bool(config.STREAM_CUSTOMER_SUBDOMAIN))
+            else:
+                logger.error("Stream API test failed", 
+                           status_code=response.status_code,
+                           response=response.text[:200])
+                raise ValueError(f"Stream API test failed with status {response.status_code}")
+                
+        except Exception as e:
+            logger.error("Stream initialization failed", error=str(e))
             raise
     
     def _initialize_gcs(self):
@@ -486,6 +533,156 @@ class StorageClient:
             logger.error("Unexpected error during local upload", filename=filename, error=str(e))
             raise
     
+    def upload_to_stream(self, filename: str, fileobj: BinaryIO, media_type: str, file_size: int, metadata: Optional[Dict[str, Any]] = None) -> Optional[str]:
+        """
+        Upload video to Cloudflare Stream for optimized streaming delivery.
+        
+        Args:
+            filename: Name of the file
+            fileobj: File object to upload
+            media_type: Type of media (should be 'video')
+            file_size: File size in bytes
+            metadata: Optional metadata to attach
+            
+        Returns:
+            Stream video UID or None if Stream is not configured
+        """
+        if not self.stream_client:
+            logger.debug("Cloudflare Stream not configured, skipping video upload")
+            return None
+        
+        if media_type != "video":
+            logger.debug("Skipping Stream upload for non-video media", media_type=media_type)
+            return None
+        
+        try:
+            logger.info("Uploading video to Cloudflare Stream", 
+                       filename=filename,
+                       file_size_mb=round(file_size / 1024 / 1024, 2))
+            
+            api_url = self.stream_client['api_base_url']
+            headers = {'Authorization': f"Bearer {self.stream_client['api_token']}"}
+            
+            # Prepare metadata for Stream
+            stream_metadata = {
+                'name': filename,
+                'requireSignedURLs': False,  # Public URLs for Drip Prop
+            }
+            
+            # Add custom metadata if provided
+            if metadata:
+                # Stream allows custom metadata as key-value pairs
+                for key, value in metadata.items():
+                    if isinstance(value, (str, int, float, bool)):
+                        stream_metadata[f'meta_{key}'] = str(value)
+            
+            # Reset file pointer
+            fileobj.seek(0)
+            
+            # Upload to Stream using multipart/form-data
+            # Stream API: POST /accounts/{account_id}/stream
+            files = {'file': (filename, fileobj, self._get_content_type(filename))}
+            
+            start_time = time.time()
+            response = requests.post(
+                api_url,
+                headers=headers,
+                files=files,
+                data=stream_metadata,
+                timeout=600  # 10 minutes for large videos
+            )
+            upload_time = time.time() - start_time
+            
+            response.raise_for_status()
+            result = response.json()
+            
+            if not result.get('success'):
+                error_msg = result.get('errors', [{}])[0].get('message', 'Unknown error')
+                raise StorageError(f"Stream upload failed: {error_msg}")
+            
+            # Extract video UID and playback URL
+            video_data = result.get('result', {})
+            video_uid = video_data.get('uid')
+            
+            if not video_uid:
+                raise StorageError("Stream upload succeeded but no video UID returned")
+            
+            # Generate playback URL
+            if self.stream_client['customer_subdomain']:
+                # Custom domain
+                playback_url = f"https://{self.stream_client['customer_subdomain']}/{video_uid}/manifest/video.m3u8"
+            else:
+                # Default Cloudflare domain
+                playback_url = f"https://customer-{self.stream_client['account_id']}.cloudflarestream.com/{video_uid}/manifest/video.m3u8"
+            
+            # Also get iframe embed URL
+            iframe_url = f"https://customer-{self.stream_client['account_id']}.cloudflarestream.com/{video_uid}/iframe"
+            
+            logger.info("Stream upload completed successfully",
+                       filename=filename,
+                       video_uid=video_uid,
+                       playback_url=playback_url,
+                       upload_time_seconds=round(upload_time, 2),
+                       upload_speed_mbps=round((file_size / 1024 / 1024) / upload_time, 2) if upload_time > 0 else 0)
+            
+            # Return stream URI in format: stream://{video_uid}
+            return f"stream://{video_uid}"
+            
+        except requests.exceptions.RequestException as e:
+            logger.error("Stream API error during upload",
+                        filename=filename,
+                        error=str(e),
+                        status_code=getattr(e.response, 'status_code', None),
+                        response_text=getattr(e.response, 'text', '')[:500])
+            return None
+        except Exception as e:
+            logger.error("Unexpected error during Stream upload",
+                        filename=filename,
+                        error=str(e))
+            return None
+    
+    def get_stream_playback_url(self, stream_uri: str) -> Optional[str]:
+        """
+        Get playback URL from Stream URI.
+        
+        Args:
+            stream_uri: Stream URI in format stream://{video_uid}
+            
+        Returns:
+            Playback URL or None
+        """
+        if not stream_uri or not stream_uri.startswith("stream://"):
+            return None
+        
+        video_uid = stream_uri.replace("stream://", "")
+        
+        if self.stream_client and self.stream_client.get('customer_subdomain'):
+            return f"https://{self.stream_client['customer_subdomain']}/{video_uid}/manifest/video.m3u8"
+        elif self.stream_client:
+            return f"https://customer-{self.stream_client['account_id']}.cloudflarestream.com/{video_uid}/manifest/video.m3u8"
+        else:
+            return None
+    
+    def get_stream_embed_url(self, stream_uri: str) -> Optional[str]:
+        """
+        Get iframe embed URL from Stream URI.
+        
+        Args:
+            stream_uri: Stream URI in format stream://{video_uid}
+            
+        Returns:
+            Embed URL or None
+        """
+        if not stream_uri or not stream_uri.startswith("stream://"):
+            return None
+        
+        video_uid = stream_uri.replace("stream://", "")
+        
+        if self.stream_client:
+            return f"https://customer-{self.stream_client['account_id']}.cloudflarestream.com/{video_uid}/iframe"
+        else:
+            return None
+    
     def download(self, storage_uri: str, output_path: Optional[str] = None) -> str:
         """
         Download file from storage URI.
@@ -751,6 +948,7 @@ class StorageClient:
         """Check the health of storage backends."""
         health = {
             "r2": {"available": False, "error": None},
+            "stream": {"available": False, "error": None},
             "gcs": {"available": False, "error": None},
             "walrus": {"available": False, "error": None}
         }
@@ -767,6 +965,22 @@ class StorageClient:
                 health["r2"]["error"] = str(e)
             except Exception as e:
                 health["r2"]["error"] = str(e)
+        
+        # Check Cloudflare Stream
+        if self.stream_client:
+            try:
+                headers = {'Authorization': f"Bearer {self.stream_client['api_token']}"}
+                test_url = f"{self.stream_client['api_base_url']}"
+                response = requests.get(test_url, headers=headers, timeout=5)
+                if response.status_code == 200:
+                    health["stream"]["available"] = True
+                    health["stream"]["account_id"] = self.stream_client['account_id']
+                    if self.stream_client.get('customer_subdomain'):
+                        health["stream"]["custom_domain"] = self.stream_client['customer_subdomain']
+                else:
+                    health["stream"]["error"] = f"HTTP {response.status_code}"
+            except Exception as e:
+                health["stream"]["error"] = str(e)
         
         # Check GCS (backup)
         if config.USE_GCS and self.gcs_client:

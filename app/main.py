@@ -589,6 +589,7 @@ async def upload_media_streaming(
     background_tasks: BackgroundTasks,
     file: UploadFile = File(..., description="Media file to upload and analyze"),
     post_id: Optional[str] = None,  # MySocial post ID for blockchain submission
+    upload_to_stream: bool = False,  # Whether to upload video to Cloudflare Stream (opt-in)
     _rate_limit: None = Depends(check_rate_limit)
 ):
     """
@@ -677,6 +678,7 @@ async def upload_media_streaming(
             media_type=media_type,
             file_hash=file_hash,
             post_id=post_id,
+            upload_to_stream=upload_to_stream,
             progress_tracker=progress_tracker,
             storage_client=storage_client,
             mys_client=mys_client,
@@ -713,6 +715,7 @@ async def upload_media(
     request: Request,
     file: UploadFile = File(..., description="Media file to upload and analyze"),
     post_id: Optional[str] = None,  # MySocial post ID for blockchain submission
+    upload_to_stream: bool = False,  # Whether to upload video to Cloudflare Stream (opt-in)
     _rate_limit: None = Depends(check_rate_limit)
 ):
     """
@@ -791,6 +794,34 @@ async def upload_media(
         
         with open(temp_file_path, "rb") as f:
             storage_uri = storage_client.upload(simplified_filename, f, media_type)
+        
+        # Upload to Cloudflare Stream if requested (opt-in)
+        streaming_uri = None
+        if upload_to_stream and media_type == "video":
+            try:
+                logger.info("Uploading to Cloudflare Stream (opt-in enabled)",
+                           media_id=media_id)
+                file_size = os.path.getsize(temp_file_path)
+                with open(temp_file_path, "rb") as f:
+                    streaming_uri = storage_client.upload_to_stream(
+                        simplified_filename,
+                        f,
+                        media_type,
+                        file_size,
+                        metadata={
+                            "media_id": media_id,
+                            "original_filename": file.filename,
+                            "post_id": post_id if post_id else ""
+                        }
+                    )
+                if streaming_uri:
+                    logger.info("Video uploaded to Stream successfully",
+                               media_id=media_id,
+                               streaming_uri=streaming_uri)
+            except Exception as e:
+                logger.warning("Stream upload failed, continuing with R2 only",
+                              media_id=media_id,
+                              error=str(e))
         
         # Update media file with storage URI and completion status
         processing_time = (time.time() - start_time) * 1000  # Convert to milliseconds
@@ -888,6 +919,7 @@ async def upload_media(
             file_size=file_size,
             file_hash=file_hash,
             storage_uri=storage_uri,
+            streaming_uri=streaming_uri,
             matches=matches,
             processing_status="completed",
             message=message,

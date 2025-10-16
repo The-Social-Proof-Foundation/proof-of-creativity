@@ -41,6 +41,13 @@ USE_WALRUS = "false"
 R2_BUCKET_NAME = "proof-of-creativity-testnet"  # Updated: all media types, not just videos
 # R2_PUBLIC_DOMAIN = "cdn.dripdrop.app"  # Optional custom domain for CDN URLs
 
+# Cloudflare Stream (Video streaming platform - opt-in per upload)
+# Stream provides optimized video delivery with automatic encoding/adaptive bitrate
+# Usage: Set upload_to_stream=true in API request to enable for specific videos
+# STREAM_ACCOUNT_ID = "your-cloudflare-account-id"
+# STREAM_API_TOKEN = "your-stream-api-token"
+# STREAM_CUSTOMER_SUBDOMAIN = ""  # Optional: custom domain
+
 # GCS (Backup - optional)
 GCS_BUCKET_NAME = "proof-of-creativity"
 # GCS_SERVICE_ACCOUNT_JSON = "{...}"  # Set if GCS_BACKUP_ENABLED=true

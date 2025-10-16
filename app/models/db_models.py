@@ -21,6 +21,7 @@ class MediaFile(Base):
     content_type = Column(String(100))
     file_size = Column(BigInteger)
     storage_uri = Column(Text)
+    streaming_uri = Column(Text)  # Cloudflare Stream URI for video streaming (optional, opt-in)
     file_hash = Column(String(128))
     upload_user_id = Column(String(100))  # Increased for consistency
     upload_ip = Column(INET)
