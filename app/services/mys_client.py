@@ -172,6 +172,48 @@ class MySocialClient:
             ]
         }
         
+        # Extract transaction details for logging
+        tx_call_data = tx_data.get("data", {})
+        function_name = tx_call_data.get("function", "unknown")
+        module_name = tx_call_data.get("module", "unknown")
+        arguments = tx_call_data.get("arguments", [])
+        
+        # Parse arguments for detailed logging
+        post_id = arguments[3] if len(arguments) > 3 else "unknown"
+        media_type = arguments[4] if len(arguments) > 4 else "unknown"
+        similarity_score = arguments[5] if len(arguments) > 5 else "unknown"
+        original_creator = arguments[6] if len(arguments) > 6 else []
+        
+        # Map media type to human-readable
+        media_type_map = {1: "image", 2: "video", 3: "audio"}
+        media_type_name = media_type_map.get(media_type, f"unknown({media_type})")
+        
+        # Log comprehensive transaction details before submission
+        logger.info("=" * 80)
+        logger.info("🚀 SUBMITTING PROOF_OF_CREATIVITY TRANSACTION TO BLOCKCHAIN")
+        logger.info("=" * 80)
+        logger.info("Contract Details:",
+                   package_id=self.package_id,
+                   module=module_name,
+                   function=function_name,
+                   config_id=self.config_id,
+                   registry_id=self.registry_id,
+                   token_registry_id=self.token_registry_id)
+        logger.info("Transaction Parameters:",
+                   post_id=post_id,
+                   media_type=f"{media_type_name} ({media_type})",
+                   similarity_score=f"{similarity_score}/100",
+                   original_creator=original_creator[0] if original_creator else None,
+                   is_derivative=len(original_creator) > 0)
+        logger.info("Oracle Details:",
+                   oracle_address=self.wallet.get_address(),
+                   rpc_endpoint=self.rpc_url)
+        logger.info("Full Transaction Data:",
+                   tx_data=json.dumps(tx_data, indent=2))
+        logger.info("=" * 80)
+        logger.info("⏳ Submitting transaction to MySocial RPC...")
+        logger.info("=" * 80)
+        
         try:
             response = self.session.post(self.rpc_url, json=rpc_request, timeout=30)
             response.raise_for_status()
@@ -179,24 +221,72 @@ class MySocialClient:
             result = response.json()
             
             if "error" in result:
-                raise Exception(f"RPC error: {result['error']}")
+                error_msg = result.get("error", {})
+                logger.error("=" * 80)
+                logger.error("❌ PROOF_OF_CREATIVITY TRANSACTION REJECTED BY RPC")
+                logger.error("=" * 80)
+                logger.error("RPC Error Response:",
+                           error=json.dumps(error_msg, indent=2))
+                logger.error("=" * 80)
+                raise Exception(f"RPC error: {error_msg}")
             
             # Extract transaction hash
             tx_result = result.get("result", {})
             tx_hash = tx_result.get("digest")
+            tx_status = tx_result.get("effects", {}).get("status")
+            tx_events = tx_result.get("events", [])
+            
+            # Log successful submission with transaction hash
+            logger.info("=" * 80)
+            logger.info("✅ PROOF_OF_CREATIVITY TRANSACTION SUBMITTED SUCCESSFULLY")
+            logger.info("=" * 80)
+            logger.info("Transaction Result:",
+                       tx_hash=tx_hash,
+                       status=tx_status,
+                       events_count=len(tx_events))
+            
+            # Log events if any (especially AnalysisSubmittedEvent, PoCBadgeIssuedEvent, etc.)
+            if tx_events:
+                logger.info("Transaction Events:")
+                for i, event in enumerate(tx_events):
+                    event_type = event.get("type", "unknown")
+                    logger.info(f"  Event {i+1}: {event_type}",
+                               event_data=json.dumps(event, indent=2))
+            
+            logger.info("=" * 80)
             
             return {
                 "success": True,
                 "tx_hash": tx_hash,
-                "status": tx_result.get("effects", {}).get("status"),
-                "events": tx_result.get("events", [])
+                "status": tx_status,
+                "events": tx_events
             }
             
         except requests.exceptions.RequestException as e:
-            logger.error("MySocial RPC request failed", error=str(e))
+            logger.error("=" * 80)
+            logger.error("❌ PROOF_OF_CREATIVITY TRANSACTION SUBMISSION FAILED")
+            logger.error("=" * 80)
+            logger.error("RPC Request Error:",
+                       error=str(e),
+                       rpc_url=self.rpc_url,
+                       error_type=type(e).__name__)
+            logger.error("=" * 80)
             raise
         except Exception as e:
-            logger.error("Transaction submission failed", error=str(e))
+            logger.error("=" * 80)
+            logger.error("❌ PROOF_OF_CREATIVITY TRANSACTION SUBMISSION FAILED")
+            logger.error("=" * 80)
+            logger.error("Transaction Error:",
+                       error=str(e),
+                       error_type=type(e).__name__)
+            # If we got a response with an error, log it
+            if hasattr(e, 'response') and hasattr(e.response, 'text'):
+                try:
+                    error_data = json.loads(e.response.text)
+                    logger.error("RPC Error Response:", error_data=json.dumps(error_data, indent=2))
+                except:
+                    logger.error("RPC Error Response (raw):", response_text=e.response.text[:500])
+            logger.error("=" * 80)
             raise
     
     def verify_oracle_authorization(self) -> bool:
