@@ -6,6 +6,8 @@ import time
 
 from google.cloud import storage
 from google.cloud.exceptions import GoogleCloudError
+import boto3
+from botocore.exceptions import ClientError, BotoCoreError
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -20,19 +22,36 @@ class StorageError(Exception):
     pass
 
 class StorageClient:
-    """Enhanced storage client with support for multiple backends."""
+    """Enhanced storage client with support for multiple backends: Cloudflare R2 (primary), Cloudflare Stream (video), GCS (backup), Walrus, and local."""
     
     def __init__(self):
+        self.r2_client = None
+        self.stream_client = None
         self.gcs_client = None
         self.session = None
         
-        # Initialize GCS client if enabled
+        # Initialize Cloudflare R2 client if enabled (PRIMARY for videos/CDN)
+        if config.USE_CLOUDFLARE_R2:
+            try:
+                self._initialize_r2()
+            except Exception as e:
+                logger.error("Failed to initialize Cloudflare R2 client", error=str(e))
+                logger.warning("R2 initialization failed, will try other storage backends")
+        
+        # Initialize Cloudflare Stream client if credentials are available (VIDEO STREAMING - opt-in per upload)
+        if config.STREAM_ACCOUNT_ID and config.STREAM_API_TOKEN:
+            try:
+                self._initialize_stream()
+            except Exception as e:
+                logger.error("Failed to initialize Cloudflare Stream client", error=str(e))
+                logger.warning("Stream initialization failed, video streaming URLs will not be available")
+        
+        # Initialize GCS client if enabled (BACKUP/ARCHIVE - optional)
         if config.USE_GCS:
             try:
                 self._initialize_gcs()
             except Exception as e:
                 logger.error("Failed to initialize GCS client", error=str(e))
-                # Don't fail startup for storage issues in development
                 logger.warning("GCS initialization failed, continuing without GCS storage")
         
         # Initialize HTTP session for Walrus
@@ -44,28 +63,142 @@ class StorageClient:
                 logger.warning("Walrus initialization failed, continuing without Walrus storage")
         
         # Check if any storage backend is available
-        has_storage = (self.gcs_client is not None) or (config.USE_WALRUS and self.session is not None)
+        has_storage = (
+            self.r2_client is not None or 
+            self.gcs_client is not None or 
+            (config.USE_WALRUS and self.session is not None)
+        )
         if not has_storage:
             logger.warning("No storage backends available - uploads will use local storage only")
         
         logger.info("Storage client initialized", 
+                   r2_enabled=self.r2_client is not None,
+                   stream_enabled=self.stream_client is not None,
                    gcs_enabled=self.gcs_client is not None,
                    walrus_enabled=config.USE_WALRUS and self.session is not None)
+    
+    def _initialize_r2(self):
+        """Initialize Cloudflare R2 client (S3-compatible)."""
+        try:
+            # Get R2 credentials from environment
+            account_id = os.getenv("R2_ACCOUNT_ID")
+            access_key_id = os.getenv("R2_ACCESS_KEY_ID")
+            secret_access_key = os.getenv("R2_SECRET_ACCESS_KEY")
+            
+            if not all([account_id, access_key_id, secret_access_key]):
+                raise ValueError("Missing R2 credentials: R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, or R2_SECRET_ACCESS_KEY")
+            
+            # R2 endpoint format: https://<account_id>.r2.cloudflarestorage.com
+            endpoint_url = f"https://{account_id}.r2.cloudflarestorage.com"
+            
+            # Create boto3 S3 client configured for R2
+            self.r2_client = boto3.client(
+                's3',
+                endpoint_url=endpoint_url,
+                aws_access_key_id=access_key_id,
+                aws_secret_access_key=secret_access_key,
+                region_name='auto'  # R2 uses 'auto' region
+            )
+            
+            # Test bucket access
+            bucket_name = config.R2_BUCKET_NAME
+            try:
+                self.r2_client.head_bucket(Bucket=bucket_name)
+                logger.info("Cloudflare R2 client initialized successfully", 
+                           bucket_name=bucket_name,
+                           account_id=account_id)
+            except ClientError as e:
+                error_code = e.response.get('Error', {}).get('Code', 'Unknown')
+                if error_code == '404':
+                    logger.warning("R2 bucket does not exist", bucket_name=bucket_name)
+                    raise ValueError(f"R2 bucket does not exist: {bucket_name}")
+                else:
+                    logger.error("R2 bucket access test failed", error=str(e), error_code=error_code)
+                    raise
+                    
+        except Exception as e:
+            logger.error("R2 initialization failed", error=str(e))
+            raise
+    
+    def _initialize_stream(self):
+        """Initialize Cloudflare Stream client for video streaming."""
+        try:
+            account_id = config.STREAM_ACCOUNT_ID
+            api_token = config.STREAM_API_TOKEN
+            
+            if not all([account_id, api_token]):
+                raise ValueError("Missing Stream credentials: STREAM_ACCOUNT_ID or STREAM_API_TOKEN")
+            
+            # Stream uses REST API (not S3-compatible like R2)
+            # We'll use requests for Stream API calls
+            self.stream_client = {
+                'account_id': account_id,
+                'api_token': api_token,
+                'api_base_url': f"https://api.cloudflare.com/client/v4/accounts/{account_id}/stream",
+                'customer_subdomain': config.STREAM_CUSTOMER_SUBDOMAIN
+            }
+            
+            # Test Stream API access by getting account details
+            headers = {'Authorization': f'Bearer {api_token}'}
+            test_url = f"https://api.cloudflare.com/client/v4/accounts/{account_id}/stream"
+            response = requests.get(test_url, headers=headers, timeout=10)
+            
+            if response.status_code == 200:
+                logger.info("Cloudflare Stream client initialized successfully", 
+                           account_id=account_id,
+                           custom_domain=bool(config.STREAM_CUSTOMER_SUBDOMAIN))
+            else:
+                logger.error("Stream API test failed", 
+                           status_code=response.status_code,
+                           response=response.text[:200])
+                raise ValueError(f"Stream API test failed with status {response.status_code}")
+                
+        except Exception as e:
+            logger.error("Stream initialization failed", error=str(e))
+            raise
     
     def _initialize_gcs(self):
         """Initialize Google Cloud Storage client."""
         try:
-            # Check for credentials
-            credentials_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
-            if credentials_path and not os.path.exists(credentials_path):
-                logger.warning("GCS credentials file not found", path=credentials_path)
+            # Option 1: Check for JSON credentials in environment variable (Railway-friendly)
+            gcs_json = os.getenv("GCS_SERVICE_ACCOUNT_JSON")
+            if gcs_json:
+                import json
+                import tempfile
+                from google.oauth2 import service_account
+                
+                logger.info("Loading GCS credentials from environment variable")
+                
+                try:
+                    # Parse JSON credentials
+                    credentials_info = json.loads(gcs_json)
+                    credentials = service_account.Credentials.from_service_account_info(credentials_info)
+                    self.gcs_client = storage.Client(credentials=credentials, project=credentials_info.get('project_id'))
+                    logger.info("GCS client created from environment JSON credentials")
+                except json.JSONDecodeError as e:
+                    logger.error("Failed to parse GCS_SERVICE_ACCOUNT_JSON", error=str(e))
+                    raise ValueError("Invalid JSON in GCS_SERVICE_ACCOUNT_JSON environment variable")
             
-            self.gcs_client = storage.Client()
+            # Option 2: Check for credentials file path (traditional method)
+            elif os.getenv("GOOGLE_APPLICATION_CREDENTIALS"):
+                credentials_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+                if not os.path.exists(credentials_path):
+                    logger.warning("GCS credentials file not found", path=credentials_path)
+                    raise FileNotFoundError(f"Credentials file not found: {credentials_path}")
+                
+                logger.info("Loading GCS credentials from file", path=credentials_path)
+                self.gcs_client = storage.Client()
+            
+            # Option 3: Try default credentials (for GCE, Cloud Run, etc.)
+            else:
+                logger.info("Attempting to use default GCS credentials")
+                self.gcs_client = storage.Client()
             
             # Test bucket access
             bucket = self.gcs_client.bucket(config.GCS_BUCKET_NAME)
             if not bucket.exists():
                 logger.warning("GCS bucket does not exist", bucket_name=config.GCS_BUCKET_NAME)
+                raise ValueError(f"GCS bucket does not exist: {config.GCS_BUCKET_NAME}")
             else:
                 logger.info("GCS client initialized successfully", 
                            bucket_name=config.GCS_BUCKET_NAME)
@@ -94,9 +227,10 @@ class StorageClient:
         
         logger.info("Walrus HTTP session initialized", endpoint=config.WALRUS_ENDPOINT)
     
-    def upload(self, filename: str, fileobj: BinaryIO, media_type: str = "unknown") -> str:
+    def upload(self, filename: str, fileobj: BinaryIO, media_type: str = "unknown", progress_callback: Optional[callable] = None) -> str:
         """
-        Upload file to configured storage backend with enhanced error handling.
+        Upload file to configured storage backend(s) with enhanced error handling.
+        Priority: R2 (primary) → GCS (optional backup) → Walrus → Local
         
         Args:
             filename: Name of the file
@@ -104,7 +238,7 @@ class StorageClient:
             media_type: Type of media (image, audio, video)
             
         Returns:
-            Storage URI where the file was uploaded
+            Dict with 'primary' storage URI and optional 'backup' URI
         """
         # Get file size for logging
         current_pos = fileobj.tell()
@@ -117,14 +251,42 @@ class StorageClient:
                    file_size_human=format_file_size(file_size),
                    media_type=media_type)
         
-        # Try GCS first if enabled
+        storage_uris = {}
+        
+        # Try Cloudflare R2 first (PRIMARY for CDN delivery)
+        if config.USE_CLOUDFLARE_R2 and self.r2_client:
+            try:
+                r2_uri = self._upload_to_r2(filename, fileobj, media_type, file_size, progress_callback)
+                storage_uris['primary'] = r2_uri
+                logger.info("Primary storage (R2) upload successful", uri=r2_uri)
+                
+                # Optionally backup to GCS if enabled
+                if config.USE_GCS and config.GCS_BACKUP_ENABLED and self.gcs_client:
+                    try:
+                        fileobj.seek(0)  # Reset for second upload
+                        gcs_uri = self._upload_to_gcs(filename, fileobj, media_type, file_size)
+                        storage_uris['backup'] = gcs_uri
+                        logger.info("Backup storage (GCS) upload successful", uri=gcs_uri)
+                    except Exception as e:
+                        logger.warning("GCS backup upload failed, continuing", error=str(e))
+                
+                return storage_uris['primary']  # Return primary URI for backward compatibility
+                
+            except Exception as e:
+                logger.error("R2 upload failed", filename=filename, error=str(e))
+                logger.info("Falling back to other storage backends")
+        
+        # Try GCS if R2 failed or not configured
         if config.USE_GCS and self.gcs_client:
             try:
-                return self._upload_to_gcs(filename, fileobj, media_type, file_size)
+                gcs_uri = self._upload_to_gcs(filename, fileobj, media_type, file_size)
+                storage_uris['primary'] = gcs_uri
+                return gcs_uri
             except Exception as e:
                 logger.error("GCS upload failed", filename=filename, error=str(e))
                 if not config.USE_WALRUS:
-                    raise StorageError(f"GCS upload failed: {e}")
+                    logger.warning("Falling back to local storage")
+                    return self._upload_to_local(filename, fileobj, media_type, file_size)
                 logger.info("Falling back to Walrus storage")
         
         # Try Walrus if enabled
@@ -133,14 +295,99 @@ class StorageClient:
                 return self._upload_to_walrus(filename, fileobj, media_type, file_size)
             except Exception as e:
                 logger.error("Walrus upload failed", filename=filename, error=str(e))
-                if not self.gcs_client:
-                    logger.warning("All storage backends failed, falling back to local storage")
-                    return self._upload_to_local(filename, fileobj, media_type, file_size)
-                raise StorageError(f"All storage backends failed. Last error: {e}")
+                logger.warning("All cloud storage backends failed, falling back to local storage")
+                return self._upload_to_local(filename, fileobj, media_type, file_size)
         
         # Fallback to local storage if no backends are configured
-        logger.warning("No storage backends available, using local storage")
+        logger.warning("No cloud storage backends available, using local storage")
         return self._upload_to_local(filename, fileobj, media_type, file_size)
+    
+    def _upload_to_r2(self, filename: str, fileobj: BinaryIO, media_type: str, file_size: int, progress_callback: Optional[callable] = None) -> str:
+        """Upload file to Cloudflare R2 (S3-compatible) with progress tracking."""
+        try:
+            bucket_name = config.R2_BUCKET_NAME
+            
+            # Simplified storage path: media_type/YYYY/MM/filename (filename is just media_id.ext)
+            from datetime import datetime
+            now = datetime.now()
+            year = now.strftime("%Y")
+            month = now.strftime("%m")
+            storage_path = f"{media_type}/{year}/{month}/{filename}"
+            
+            # Set metadata (sanitize to ASCII-only for S3/R2 compatibility)
+            metadata = {
+                "original_filename": filename.encode('ascii', 'ignore').decode('ascii'),
+                "media_type": media_type,
+                "file_size": str(file_size),
+                "upload_timestamp": str(int(time.time()))
+            }
+            
+            # Set content type
+            content_type = self._get_content_type(filename) or 'application/octet-stream'
+            
+            # Upload with progress tracking for large files
+            if file_size > 10 * 1024 * 1024:  # 10MB
+                logger.info("Uploading large file to R2", filename=filename, file_size_mb=file_size/1024/1024)
+            
+            start_time = time.time()
+            
+            # Upload to R2 using boto3 S3 client with progress tracking
+            fileobj.seek(0)  # Reset to beginning
+            
+            if progress_callback and file_size > 0:
+                # Wrap file object to track bytes uploaded
+                from app.core.utils import ProgressFileWrapper
+                wrapped_fileobj = ProgressFileWrapper(fileobj, file_size, progress_callback)
+                
+                self.r2_client.put_object(
+                    Bucket=bucket_name,
+                    Key=storage_path,
+                    Body=wrapped_fileobj,
+                    ContentType=content_type,
+                    Metadata=metadata
+                )
+            else:
+                # No progress tracking
+                self.r2_client.put_object(
+                    Bucket=bucket_name,
+                    Key=storage_path,
+                    Body=fileobj,
+                    ContentType=content_type,
+                    Metadata=metadata
+                )
+            
+            upload_time = time.time() - start_time
+            
+            # Generate storage URI
+            storage_uri = f"r2://{bucket_name}/{storage_path}"
+            
+            # Generate CDN URL if custom domain is configured
+            cdn_url = None
+            if config.R2_PUBLIC_DOMAIN:
+                cdn_url = f"https://{config.R2_PUBLIC_DOMAIN}/{storage_path}"
+                logger.info("R2 upload completed with CDN URL", 
+                           filename=filename,
+                           storage_uri=storage_uri,
+                           cdn_url=cdn_url,
+                           upload_time_seconds=round(upload_time, 2),
+                           upload_speed_mbps=round((file_size / 1024 / 1024) / upload_time, 2) if upload_time > 0 else 0)
+            else:
+                logger.info("R2 upload completed successfully", 
+                           filename=filename,
+                           storage_uri=storage_uri,
+                           upload_time_seconds=round(upload_time, 2),
+                           upload_speed_mbps=round((file_size / 1024 / 1024) / upload_time, 2) if upload_time > 0 else 0)
+            
+            return storage_uri
+            
+        except ClientError as e:
+            error_code = e.response.get('Error', {}).get('Code', 'Unknown')
+            logger.error("R2 API error during upload", 
+                        filename=filename, error=str(e), error_code=error_code)
+            raise
+        except Exception as e:
+            logger.error("Unexpected error during R2 upload", filename=filename, error=str(e))
+            raise
     
     def _upload_to_gcs(self, filename: str, fileobj: BinaryIO, media_type: str, file_size: int) -> str:
         """Upload file to Google Cloud Storage."""
@@ -156,9 +403,9 @@ class StorageClient:
             
             blob = bucket.blob(storage_path)
             
-            # Set metadata
+            # Set metadata (sanitize to ASCII-only for consistency)
             blob.metadata = {
-                "original_filename": filename,
+                "original_filename": filename.encode('ascii', 'ignore').decode('ascii'),
                 "media_type": media_type,
                 "file_size": str(file_size),
                 "upload_timestamp": str(int(time.time()))
@@ -286,12 +533,162 @@ class StorageClient:
             logger.error("Unexpected error during local upload", filename=filename, error=str(e))
             raise
     
+    def upload_to_stream(self, filename: str, fileobj: BinaryIO, media_type: str, file_size: int, metadata: Optional[Dict[str, Any]] = None) -> Optional[str]:
+        """
+        Upload video to Cloudflare Stream for optimized streaming delivery.
+        
+        Args:
+            filename: Name of the file
+            fileobj: File object to upload
+            media_type: Type of media (should be 'video')
+            file_size: File size in bytes
+            metadata: Optional metadata to attach
+            
+        Returns:
+            Stream video UID or None if Stream is not configured
+        """
+        if not self.stream_client:
+            logger.debug("Cloudflare Stream not configured, skipping video upload")
+            return None
+        
+        if media_type != "video":
+            logger.debug("Skipping Stream upload for non-video media", media_type=media_type)
+            return None
+        
+        try:
+            logger.info("Uploading video to Cloudflare Stream", 
+                       filename=filename,
+                       file_size_mb=round(file_size / 1024 / 1024, 2))
+            
+            api_url = self.stream_client['api_base_url']
+            headers = {'Authorization': f"Bearer {self.stream_client['api_token']}"}
+            
+            # Prepare metadata for Stream
+            stream_metadata = {
+                'name': filename,
+                'requireSignedURLs': False,  # Public URLs for Drip Prop
+            }
+            
+            # Add custom metadata if provided
+            if metadata:
+                # Stream allows custom metadata as key-value pairs
+                for key, value in metadata.items():
+                    if isinstance(value, (str, int, float, bool)):
+                        stream_metadata[f'meta_{key}'] = str(value)
+            
+            # Reset file pointer
+            fileobj.seek(0)
+            
+            # Upload to Stream using multipart/form-data
+            # Stream API: POST /accounts/{account_id}/stream
+            files = {'file': (filename, fileobj, self._get_content_type(filename))}
+            
+            start_time = time.time()
+            response = requests.post(
+                api_url,
+                headers=headers,
+                files=files,
+                data=stream_metadata,
+                timeout=600  # 10 minutes for large videos
+            )
+            upload_time = time.time() - start_time
+            
+            response.raise_for_status()
+            result = response.json()
+            
+            if not result.get('success'):
+                error_msg = result.get('errors', [{}])[0].get('message', 'Unknown error')
+                raise StorageError(f"Stream upload failed: {error_msg}")
+            
+            # Extract video UID and playback URL
+            video_data = result.get('result', {})
+            video_uid = video_data.get('uid')
+            
+            if not video_uid:
+                raise StorageError("Stream upload succeeded but no video UID returned")
+            
+            # Generate playback URL
+            if self.stream_client['customer_subdomain']:
+                # Custom domain
+                playback_url = f"https://{self.stream_client['customer_subdomain']}/{video_uid}/manifest/video.m3u8"
+            else:
+                # Default Cloudflare domain
+                playback_url = f"https://customer-{self.stream_client['account_id']}.cloudflarestream.com/{video_uid}/manifest/video.m3u8"
+            
+            # Also get iframe embed URL
+            iframe_url = f"https://customer-{self.stream_client['account_id']}.cloudflarestream.com/{video_uid}/iframe"
+            
+            logger.info("Stream upload completed successfully",
+                       filename=filename,
+                       video_uid=video_uid,
+                       playback_url=playback_url,
+                       upload_time_seconds=round(upload_time, 2),
+                       upload_speed_mbps=round((file_size / 1024 / 1024) / upload_time, 2) if upload_time > 0 else 0)
+            
+            # Return stream URI in format: stream://{video_uid}
+            return f"stream://{video_uid}"
+            
+        except requests.exceptions.RequestException as e:
+            logger.error("Stream API error during upload",
+                        filename=filename,
+                        error=str(e),
+                        status_code=getattr(e.response, 'status_code', None),
+                        response_text=getattr(e.response, 'text', '')[:500])
+            return None
+        except Exception as e:
+            logger.error("Unexpected error during Stream upload",
+                        filename=filename,
+                        error=str(e))
+            return None
+    
+    def get_stream_playback_url(self, stream_uri: str) -> Optional[str]:
+        """
+        Get playback URL from Stream URI.
+        
+        Args:
+            stream_uri: Stream URI in format stream://{video_uid}
+            
+        Returns:
+            Playback URL or None
+        """
+        if not stream_uri or not stream_uri.startswith("stream://"):
+            return None
+        
+        video_uid = stream_uri.replace("stream://", "")
+        
+        if self.stream_client and self.stream_client.get('customer_subdomain'):
+            return f"https://{self.stream_client['customer_subdomain']}/{video_uid}/manifest/video.m3u8"
+        elif self.stream_client:
+            return f"https://customer-{self.stream_client['account_id']}.cloudflarestream.com/{video_uid}/manifest/video.m3u8"
+        else:
+            return None
+    
+    def get_stream_embed_url(self, stream_uri: str) -> Optional[str]:
+        """
+        Get iframe embed URL from Stream URI.
+        
+        Args:
+            stream_uri: Stream URI in format stream://{video_uid}
+            
+        Returns:
+            Embed URL or None
+        """
+        if not stream_uri or not stream_uri.startswith("stream://"):
+            return None
+        
+        video_uid = stream_uri.replace("stream://", "")
+        
+        if self.stream_client:
+            return f"https://customer-{self.stream_client['account_id']}.cloudflarestream.com/{video_uid}/iframe"
+        else:
+            return None
+    
     def download(self, storage_uri: str, output_path: Optional[str] = None) -> str:
         """
         Download file from storage URI.
         
         Args:
-            storage_uri: Storage URI (gs:// or walrus://)
+            storage_uri: Storage URI (r2://, gs://, walrus://, or local://)
             output_path: Optional path to save file
             
         Returns:
@@ -299,12 +696,57 @@ class StorageClient:
         """
         logger.info("Starting file download", storage_uri=storage_uri)
         
-        if storage_uri.startswith("gs://"):
+        if storage_uri.startswith("r2://"):
+            return self._download_from_r2(storage_uri, output_path)
+        elif storage_uri.startswith("gs://"):
             return self._download_from_gcs(storage_uri, output_path)
         elif storage_uri.startswith("walrus://"):
             return self._download_from_walrus(storage_uri, output_path)
+        elif storage_uri.startswith("local://"):
+            # Local files can be accessed directly
+            local_path = storage_uri.replace("local://", "")
+            return local_path if os.path.exists(local_path) else None
         else:
             raise StorageError(f"Unsupported storage URI format: {storage_uri}")
+    
+    def _download_from_r2(self, storage_uri: str, output_path: Optional[str] = None) -> str:
+        """Download file from Cloudflare R2."""
+        try:
+            # Parse R2 URI: r2://bucket-name/path/to/file
+            if not storage_uri.startswith("r2://"):
+                raise ValueError("Invalid R2 URI")
+            
+            path_parts = storage_uri[5:].split("/", 1)  # Remove r2://
+            bucket_name = path_parts[0]
+            object_key = path_parts[1] if len(path_parts) > 1 else ""
+            
+            # Check if object exists
+            try:
+                self.r2_client.head_object(Bucket=bucket_name, Key=object_key)
+            except ClientError as e:
+                error_code = e.response.get('Error', {}).get('Code', 'Unknown')
+                if error_code == '404':
+                    raise StorageError(f"File not found in R2: {storage_uri}")
+                raise
+            
+            # Determine output path
+            if not output_path:
+                output_path = f"/tmp/{Path(object_key).name}"
+            
+            # Download file
+            self.r2_client.download_file(bucket_name, object_key, output_path)
+            
+            logger.info("R2 download completed", 
+                       storage_uri=storage_uri, output_path=output_path)
+            
+            return output_path
+            
+        except ClientError as e:
+            logger.error("R2 download failed", storage_uri=storage_uri, error=str(e))
+            raise
+        except Exception as e:
+            logger.error("Unexpected error during R2 download", storage_uri=storage_uri, error=str(e))
+            raise
     
     def _download_from_gcs(self, storage_uri: str, output_path: Optional[str] = None) -> str:
         """Download file from Google Cloud Storage."""
@@ -505,16 +947,48 @@ class StorageClient:
     def health_check(self) -> Dict[str, Any]:
         """Check the health of storage backends."""
         health = {
+            "r2": {"available": False, "error": None},
+            "stream": {"available": False, "error": None},
             "gcs": {"available": False, "error": None},
             "walrus": {"available": False, "error": None}
         }
         
-        # Check GCS
+        # Check Cloudflare R2
+        if config.USE_CLOUDFLARE_R2 and self.r2_client:
+            try:
+                self.r2_client.head_bucket(Bucket=config.R2_BUCKET_NAME)
+                health["r2"]["available"] = True
+                health["r2"]["bucket"] = config.R2_BUCKET_NAME
+                if config.R2_PUBLIC_DOMAIN:
+                    health["r2"]["cdn_domain"] = config.R2_PUBLIC_DOMAIN
+            except ClientError as e:
+                health["r2"]["error"] = str(e)
+            except Exception as e:
+                health["r2"]["error"] = str(e)
+        
+        # Check Cloudflare Stream
+        if self.stream_client:
+            try:
+                headers = {'Authorization': f"Bearer {self.stream_client['api_token']}"}
+                test_url = f"{self.stream_client['api_base_url']}"
+                response = requests.get(test_url, headers=headers, timeout=5)
+                if response.status_code == 200:
+                    health["stream"]["available"] = True
+                    health["stream"]["account_id"] = self.stream_client['account_id']
+                    if self.stream_client.get('customer_subdomain'):
+                        health["stream"]["custom_domain"] = self.stream_client['customer_subdomain']
+                else:
+                    health["stream"]["error"] = f"HTTP {response.status_code}"
+            except Exception as e:
+                health["stream"]["error"] = str(e)
+        
+        # Check GCS (backup)
         if config.USE_GCS and self.gcs_client:
             try:
                 bucket = self.gcs_client.bucket(config.GCS_BUCKET_NAME)
                 bucket.exists()  # This will test connectivity
                 health["gcs"]["available"] = True
+                health["gcs"]["backup_mode"] = config.GCS_BACKUP_ENABLED
             except Exception as e:
                 health["gcs"]["error"] = str(e)
         

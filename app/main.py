@@ -6,7 +6,7 @@ import time
 from typing import List, Optional
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, status, Query
+from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, status, Query, Request, WebSocket, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 import uvicorn
@@ -27,7 +27,7 @@ from app.core.database import (
     check_database_connection
 )
 from app.core.utils import save_temp_upload, new_media_id, calculate_file_hash, cleanup_temp_file
-from app.models.similarity import MediaMatch, UploadResponse, ErrorResponse, HealthResponse
+from app.models.similarity import MediaMatch, UploadResponse, ErrorResponse, HealthResponse, StreamingUploadResponse
 
 # Configure structured logging
 structlog.configure(
@@ -52,20 +52,74 @@ logger = structlog.get_logger()
 # Global storage client
 storage_client = None
 
+# Global Redis cache
+redis_cache = None
+
+# Global MySocial client (optional)
+mys_client = None
+
+# Global progress tracker
+progress_tracker = None
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan manager for startup and shutdown events."""
-    global storage_client
+    global storage_client, redis_cache, mys_client, progress_tracker
     
     # Startup
     logger.info("Starting Proof of Creativity API")
     try:
-        storage_client = StorageClient()
-        logger.info("Storage client initialized", storage_backend="GCS" if config.USE_GCS else "Walrus")
+        # Step 1: Run database migrations first (like Diesel's embedded_migrations)
+        logger.info("Running database migrations...")
+        from app.core.migrations import run_migrations
+        migrations_ok = run_migrations()
         
-        # Test database connection
+        if migrations_ok:
+            logger.info("✅ Database migrations completed")
+        else:
+            logger.warning("⚠️  Database migrations failed - continuing anyway")
+        
+        # Step 2: Initialize Redis cache (for performance)
+        from app.core.redis_client import get_redis
+        redis_cache = get_redis()
+        if redis_cache.enabled:
+            logger.info("✅ Redis cache initialized")
+        else:
+            logger.warning("⚠️  Redis cache disabled - performance will be slower")
+        
+        # Step 2b: Initialize progress tracker (uses Redis)
+        from app.core.progress_tracker import ProgressTracker
+        progress_tracker = ProgressTracker(redis_cache)
+        logger.info("✅ Progress tracker initialized")
+        
+        # Step 3: Initialize database connection pool (after migrations)
+        from app.core.database import initialize_connection_pool, create_vector_index_if_not_exists
+        initialize_connection_pool()
+        logger.info("Database connection pool initialized")
+        
+        # Step 4: Create vector indexes (after tables exist)
+        try:
+            create_vector_index_if_not_exists()
+            logger.info("Vector indexes ensured")
+        except Exception as e:
+            logger.warning("Could not create vector indexes", error=str(e))
+        
+        # Step 5: Initialize MySocial blockchain client (optional)
+        from app.services.mys_client import init_mys_client
+        mys_client = init_mys_client()
+        if mys_client:
+            logger.info("✅ MySocial blockchain integration enabled")
+        else:
+            logger.info("ℹ️  MySocial blockchain integration disabled")
+        
+        # Step 6: Initialize storage client
+        storage_client = StorageClient()
+        logger.info("Storage client initialized", 
+                   storage_backend="R2" if config.USE_CLOUDFLARE_R2 else "GCS" if config.USE_GCS else "Local")
+        
+        # Step 7: Verify everything works
         if check_database_connection():
-            logger.info("Timescale database connection verified")
+            logger.info("Database connection verified")
         else:
             logger.warning("Database connection check failed")
             
@@ -81,7 +135,7 @@ async def lifespan(app: FastAPI):
 # Create FastAPI application
 app = FastAPI(
     title="Proof of Creativity API",
-    description="Scalable Media Attribution Architecture for detecting original vs derivative media using Timescale Vector AI",
+    description="Scalable Media Attribution Architecture for detecting original vs derivative media using PostgreSQL + pgvector",
     version="1.0.0",
     docs_url="/docs",
     redoc_url="/redoc",
@@ -107,6 +161,26 @@ SUPPORTED_IMAGE_TYPES = {"image/jpeg", "image/png", "image/gif", "image/webp"}
 SUPPORTED_AUDIO_TYPES = {"audio/mpeg", "audio/wav", "audio/flac", "audio/ogg"}
 SUPPORTED_VIDEO_TYPES = {"video/mp4", "video/avi", "video/mov", "video/webm"}
 SUPPORTED_TYPES = SUPPORTED_IMAGE_TYPES | SUPPORTED_AUDIO_TYPES | SUPPORTED_VIDEO_TYPES
+
+async def check_rate_limit(request: Request):
+    """Rate limiting dependency - configurable uploads per hour per IP"""
+    if not redis_cache or not redis_cache.enabled:
+        return  # No rate limiting if Redis disabled
+    
+    client_ip = request.client.host if request.client else "unknown"
+    limit = config.RATE_LIMIT_UPLOADS_PER_HOUR
+    
+    allowed, current_count = redis_cache.check_rate_limit(
+        identifier=client_ip,
+        limit=limit,
+        window=3600  # 1 hour
+    )
+    
+    if not allowed:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=f"Rate limit exceeded. Maximum {limit} uploads per hour. Current: {current_count}"
+        )
 
 async def validate_file(file: UploadFile) -> tuple[str, str]:
     """Validate uploaded file and return content type and media type."""
@@ -368,7 +442,7 @@ async def detect_video_similarity(file_path: str, media_id: str) -> List[MediaMa
         
         all_matches = []
         
-        # Process frame embeddings using Timescale Vector AI
+        # Process frame embeddings using pgvector
         for idx, frame_embedding in enumerate(frame_embeddings):
             similar_embeddings = search_embedding_with_timescale_ai(
                 vector=frame_embedding, 
@@ -460,10 +534,10 @@ async def root():
     return {
         "name": "Proof of Creativity API",
         "version": "1.0.0",
-        "description": "Scalable Media Attribution Architecture with Timescale Vector AI",
+        "description": "Scalable Media Attribution Architecture with PostgreSQL + pgvector",
         "docs_url": "/docs",
         "health_url": "/health",
-        "database": "Timescale with Vector AI"
+        "database": "PostgreSQL with pgvector"
     }
 
 @app.get("/health", response_model=HealthResponse)
@@ -477,12 +551,16 @@ async def health_check():
         # Check storage
         storage_health = storage_client.health_check() if storage_client else {"error": "not_initialized"}
         
+        # Check Redis
+        redis_health = redis_cache.health_check() if redis_cache else {"available": False}
+        
         components = {
             "database": "healthy" if db_healthy else "unhealthy",
-            "storage": "healthy" if storage_health.get("gcs", {}).get("available") or storage_health.get("walrus", {}).get("available") else "unhealthy",
+            "storage": "healthy" if storage_health.get("r2", {}).get("available") or storage_health.get("gcs", {}).get("available") else "unhealthy",
+            "redis": "healthy" if redis_health.get("available") else "unavailable",
             "embedding_model": "healthy",  # Could add actual model health checks
             "fingerprint_service": "healthy",
-            "timescale_vector": "healthy" if db_stats.get("vector_extension_version") else "unavailable"
+            "pgvector": "healthy" if db_stats.get("vector_extension_version") else "unavailable"
         }
         
         overall_status = "healthy" if all(status == "healthy" for status in components.values()) else "degraded"
@@ -493,7 +571,8 @@ async def health_check():
             components={
                 **components,
                 "database_stats": db_stats,
-                "storage_health": storage_health
+                "storage_health": storage_health,
+                "redis_health": redis_health
             }
         )
     except Exception as e:
@@ -504,17 +583,154 @@ async def health_check():
             components={"error": str(e)}
         )
 
-@app.post("/upload", response_model=UploadResponse)
-async def upload_media(
-    file: UploadFile = File(..., description="Media file to upload and analyze")
+@app.post("/upload/stream", response_model=StreamingUploadResponse)
+async def upload_media_streaming(
+    request: Request,
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(..., description="Media file to upload and analyze"),
+    post_id: Optional[str] = None,  # MySocial post ID for blockchain submission
+    upload_to_stream: bool = False,  # Whether to upload video to Cloudflare Stream (opt-in)
+    _rate_limit: None = Depends(check_rate_limit)
 ):
     """
-    Upload and analyze media file for similarity detection using Timescale Vector AI.
+    Streaming upload with immediate response and WebSocket progress updates
+    
+    Returns predicted CDN URL immediately, processes in background
+    
+    Flow:
+    1. Validate file
+    2. Check post not already analyzed (if post_id provided)
+    3. Generate media_id and predict URL
+    4. Return immediately with WebSocket info
+    5. Process upload + analysis in background
+    
+    Connect to WebSocket: ws://host:port/ws/upload/{upload_id} for real-time progress
+    """
+    from pathlib import Path
+    
+    try:
+        # Validate file
+        content_type, media_type = await validate_file(file)
+        
+        # Generate media_id upfront
+        media_id = new_media_id()
+        
+        # Check if post was already analyzed (one media per post rule)
+        if post_id and mys_client:
+            try:
+                post_check = mys_client.check_post_already_analyzed(post_id)
+                if post_check.get("already_analyzed"):
+                    raise HTTPException(
+                        status_code=status.HTTP_409_CONFLICT,
+                        detail=f"Post {post_id} was already analyzed by PoC. Only one media per post allowed."
+                    )
+            except HTTPException:
+                raise
+            except Exception as e:
+                logger.warning("Could not check post status", post_id=post_id, error=str(e))
+                # Continue anyway
+        
+        # Generate predicted URL (simplified: just media_id + extension)
+        ext = Path(file.filename).suffix or ".bin"
+        simplified_filename = f"{media_id}{ext}"
+        
+        # Construct predicted CDN URL
+        if config.R2_PUBLIC_DOMAIN:
+            from datetime import datetime
+            now = datetime.now()
+            year = now.strftime("%Y")
+            month = now.strftime("%m")
+            predicted_url = f"https://{config.R2_PUBLIC_DOMAIN}/{media_type}/{year}/{month}/{simplified_filename}"
+        else:
+            predicted_url = f"r2://{config.R2_BUCKET_NAME}/{media_type}/{simplified_filename}"
+        
+        # Save temp file for background processing
+        temp_file_path = save_temp_upload(file)
+        file_hash = calculate_file_hash(temp_file_path)
+        
+        # Create progress entry in Redis
+        if progress_tracker:
+            progress_tracker.create_upload(
+                upload_id=media_id,
+                predicted_url=predicted_url,
+                post_id=post_id
+            )
+        
+        # Spawn background task for processing
+        from app.services.background_tasks import process_upload_background
+        
+        # Determine which similarity detection function to use
+        if media_type == "image":
+            detect_func = detect_image_similarity
+        elif media_type == "audio":
+            detect_func = detect_audio_similarity
+        elif media_type == "video":
+            detect_func = detect_video_similarity
+        else:
+            raise HTTPException(status_code=400, detail="Invalid media type")
+        
+        background_tasks.add_task(
+            process_upload_background,
+            upload_id=media_id,
+            temp_file_path=temp_file_path,
+            filename=file.filename,
+            content_type=content_type,
+            media_type=media_type,
+            file_hash=file_hash,
+            post_id=post_id,
+            upload_to_stream=upload_to_stream,
+            progress_tracker=progress_tracker,
+            storage_client=storage_client,
+            mys_client=mys_client,
+            detect_similarity_func=detect_func
+        )
+        
+        # Return immediately with predicted URL and WebSocket info
+        websocket_url = f"ws://{request.url.hostname}:{request.url.port}/ws/upload/{media_id}"
+        
+        logger.info("Upload accepted, processing in background",
+                   upload_id=media_id,
+                   post_id=post_id,
+                   predicted_url=predicted_url)
+        
+        return StreamingUploadResponse(
+            upload_id=media_id,
+            predicted_url=predicted_url,
+            websocket_url=websocket_url,
+            message="Upload accepted, processing in background. Connect to WebSocket for real-time progress.",
+            post_id=post_id
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("Upload initiation failed", error=str(e))
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to initiate upload: {str(e)}"
+        )
+
+@app.post("/upload", response_model=UploadResponse)
+async def upload_media(
+    request: Request,
+    file: UploadFile = File(..., description="Media file to upload and analyze"),
+    post_id: Optional[str] = None,  # MySocial post ID for blockchain submission
+    upload_to_stream: bool = False,  # Whether to upload video to Cloudflare Stream (opt-in)
+    _rate_limit: None = Depends(check_rate_limit)
+):
+    """
+    Synchronous upload endpoint (legacy/compatibility)
+    
+    Upload and analyze media file for similarity detection using PostgreSQL + pgvector.
     
     Supports:
     - Images: JPEG, PNG, GIF, WebP
     - Audio: MP3, WAV, FLAC, OGG  
     - Video: MP4, AVI, MOV, WebM
+    
+    For better UX with progress tracking, use /upload/stream instead
+    
+    If post_id is provided and MySocial integration is enabled, submits PoC result to blockchain.
     
     Returns similarity matches with other media in the database using advanced vector search.
     """
@@ -528,6 +744,21 @@ async def upload_media(
         
         # Validate file
         content_type, media_type = await validate_file(file)
+        
+        # Check if post was already analyzed (one media per post rule)
+        if post_id and mys_client:
+            try:
+                post_check = mys_client.check_post_already_analyzed(post_id)
+                if post_check.get("already_analyzed"):
+                    raise HTTPException(
+                        status_code=status.HTTP_409_CONFLICT,
+                        detail=f"Post {post_id} was already analyzed by PoC. Only one media per post allowed."
+                    )
+            except HTTPException:
+                raise
+            except Exception as e:
+                logger.warning("Could not check post status", post_id=post_id, error=str(e))
+                # Continue anyway
         
         # Save temporary file
         temp_file_path = save_temp_upload(file)
@@ -556,9 +787,41 @@ async def upload_media(
         elif media_type == "video":
             matches = await detect_video_similarity(temp_file_path, media_id)
         
-        # Upload to storage
+        # Upload to storage (simplified filename: just media_id + extension)
+        from pathlib import Path
+        ext = Path(file.filename).suffix or ".bin"
+        simplified_filename = f"{media_id}{ext}"
+        
         with open(temp_file_path, "rb") as f:
-            storage_uri = storage_client.upload(f"{media_id}_{file.filename}", f, media_type)
+            storage_uri = storage_client.upload(simplified_filename, f, media_type)
+        
+        # Upload to Cloudflare Stream if requested (opt-in)
+        streaming_uri = None
+        if upload_to_stream and media_type == "video":
+            try:
+                logger.info("Uploading to Cloudflare Stream (opt-in enabled)",
+                           media_id=media_id)
+                file_size = os.path.getsize(temp_file_path)
+                with open(temp_file_path, "rb") as f:
+                    streaming_uri = storage_client.upload_to_stream(
+                        simplified_filename,
+                        f,
+                        media_type,
+                        file_size,
+                        metadata={
+                            "media_id": media_id,
+                            "original_filename": file.filename,
+                            "post_id": post_id if post_id else ""
+                        }
+                    )
+                if streaming_uri:
+                    logger.info("Video uploaded to Stream successfully",
+                               media_id=media_id,
+                               streaming_uri=streaming_uri)
+            except Exception as e:
+                logger.warning("Stream upload failed, continuing with R2 only",
+                              media_id=media_id,
+                              error=str(e))
         
         # Update media file with storage URI and completion status
         processing_time = (time.time() - start_time) * 1000  # Convert to milliseconds
@@ -587,16 +850,57 @@ async def upload_media(
             "max_similarity_score": max([m.similarity_score for m in matches]) if matches else 0.0
         }
         
+        # Submit to MySocial blockchain if post_id provided
+        blockchain_tx_hash = None
+        if post_id and mys_client:
+            try:
+                # Map media type to contract constants
+                media_type_code = {"image": 1, "audio": 3, "video": 2}.get(media_type, 1)
+                
+                # Calculate highest similarity score (0-100 for contract)
+                highest_similarity = int(max([m.similarity_score for m in matches]) * 100) if matches else 0
+                
+                # Get original creator address if derivative
+                original_creator = None
+                if matches and len([m for m in matches if m.confidence_level == "high"]) > 0:
+                    # TODO: Map match_media_id to MySocial address
+                    # For now, we'd need to store MySocial addresses in media_files table
+                    pass
+                
+                # Submit to blockchain
+                mys_result = mys_client.submit_poc_analysis(
+                    post_id=post_id,
+                    media_type=media_type_code,
+                    similarity_score=highest_similarity,
+                    original_creator=original_creator
+                )
+                
+                blockchain_tx_hash = mys_result.get("tx_hash")
+                
+                logger.info("PoC result submitted to MySocial",
+                           post_id=post_id,
+                           tx_hash=blockchain_tx_hash,
+                           attribution_type=attribution_type)
+                
+            except Exception as e:
+                logger.error("Failed to submit to MySocial blockchain",
+                            post_id=post_id,
+                            error=str(e))
+                # Don't fail upload if blockchain submission fails
+        
+        # Record attribution in local database
         insert_attribution_record(
             media_id=media_id,
             attribution_type=attribution_type,
-            proof_data=proof_data
+            proof_data=proof_data,
+            blockchain_tx_hash=blockchain_tx_hash
         )
         
         logger.info("Attribution recorded", 
                    media_id=media_id, 
                    attribution_type=attribution_type,
-                   matches_found=len(matches))
+                   matches_found=len(matches),
+                   blockchain_tx_hash=blockchain_tx_hash)
         
         # Generate response message based on findings
         if matches:
@@ -615,9 +919,11 @@ async def upload_media(
             file_size=file_size,
             file_hash=file_hash,
             storage_uri=storage_uri,
+            streaming_uri=streaming_uri,
             matches=matches,
             processing_status="completed",
-            message=message
+            message=message,
+            blockchain_tx_hash=blockchain_tx_hash
         )
         
     except HTTPException:
@@ -694,16 +1000,56 @@ async def get_media_attribution(media_id: str):
         logger.error("Failed to get attribution records", media_id=media_id, error=str(e))
         raise HTTPException(status_code=500, detail=f"Failed to get attribution: {str(e)}")
 
+@app.get("/upload/{upload_id}/progress")
+async def get_upload_progress(upload_id: str):
+    """
+    Get current upload progress status (HTTP polling alternative to WebSocket)
+    
+    Returns current progress state
+    """
+    if not progress_tracker:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Progress tracking not available (Redis not configured)"
+        )
+    
+    progress_data = progress_tracker.get_progress(upload_id)
+    
+    if not progress_data:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Upload {upload_id} not found or expired"
+        )
+    
+    return progress_data
+
+@app.websocket("/ws/upload/{upload_id}")
+async def websocket_upload_progress(websocket: WebSocket, upload_id: str):
+    """
+    WebSocket endpoint for real-time upload progress streaming
+    
+    Connect to: ws://host:port/ws/upload/{upload_id}
+    
+    No authentication required
+    Unlimited connections
+    Streams progress until upload complete or 10 minute timeout
+    """
+    from app.api.websocket import stream_upload_progress
+    
+    await stream_upload_progress(websocket, upload_id, progress_tracker)
+
 @app.get("/stats", response_model=dict)
 async def get_system_stats():
     """Get comprehensive system statistics."""
     try:
         db_stats = get_database_stats()
         storage_health = storage_client.health_check() if storage_client else {}
+        redis_health = redis_cache.health_check() if redis_cache else {"available": False}
         
         return {
             "database": db_stats,
             "storage": storage_health,
+            "redis": redis_health,
             "api_version": "1.0.0",
             "timestamp": time.time()
         }
@@ -725,10 +1071,13 @@ async def global_exception_handler(request, exc):
     )
 
 if __name__ == "__main__":
+    # Railway sets PORT, fallback to API_PORT or 8080
+    port = int(os.getenv("PORT") or os.getenv("API_PORT") or "8080")
+    
     uvicorn.run(
         "app.main:app",
         host=os.getenv("API_HOST", "0.0.0.0"),
-        port=int(os.getenv("API_PORT", 8000)),
+        port=port,
         reload=os.getenv("DEBUG", "false").lower() == "true",
         log_config=None,  # We handle logging with structlog
     ) 

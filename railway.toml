@@ -3,7 +3,7 @@ builder = "dockerfile"
 dockerfilePath = "Dockerfile"
 
 [deploy]
-startCommand = "uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}"
+startCommand = "python -m app.main"
 healthcheckPath = "/health"
 healthcheckTimeout = 120
 restartPolicyType = "on_failure"
@@ -14,7 +14,6 @@ restartPolicyMaxRetries = 3
 API_HOST = "0.0.0.0"
 DEBUG = "false"
 LOG_LEVEL = "INFO"
-SECRET_KEY = "railway-generated-secret-key-change-me"
 
 # Media Processing Configuration
 MAX_FILE_SIZE = "100000000"
@@ -27,19 +26,41 @@ CLIP_MODEL_NAME = "openai/clip-vit-base-patch32"
 EMBEDDING_DIMENSION = "512"
 
 # Vector Database Settings
-VECTOR_DB = "timescale"
+VECTOR_DB = "postgresql"
 
-# Storage Configuration (default to local for Railway deployment)
-USE_GCS = "false"
+# Storage Configuration - Cloudflare R2 primary, GCS backup optional
+USE_CLOUDFLARE_R2 = "true"
+USE_GCS = "true"
+GCS_BACKUP_ENABLED = "true"
 USE_WALRUS = "false"
 
-# Database Configuration (to be set via Railway environment variables)
-# DB_DSN = "postgresql://username:password@host:port/database"
-# TIMESCALE_DB_DSN = "postgresql://username:password@host:port/database"
+# Cloudflare R2 (Primary - set via Railway environment variables)
+# R2_ACCOUNT_ID = "your-account-id"
+# R2_ACCESS_KEY_ID = "your-access-key"
+# R2_SECRET_ACCESS_KEY = "your-secret-key"
+R2_BUCKET_NAME = "proof-of-creativity-testnet"  # Updated: all media types, not just videos
+# R2_PUBLIC_DOMAIN = "cdn.dripdrop.app"  # Optional custom domain for CDN URLs
+
+# Cloudflare Stream (Video streaming platform - opt-in per upload)
+# Stream provides optimized video delivery with automatic encoding/adaptive bitrate
+# Usage: Set upload_to_stream=true in API request to enable for specific videos
+# STREAM_ACCOUNT_ID = "your-cloudflare-account-id"
+# STREAM_API_TOKEN = "your-stream-api-token"
+# STREAM_CUSTOMER_SUBDOMAIN = ""  # Optional: custom domain
+
+# GCS (Backup - optional)
+GCS_BUCKET_NAME = "proof-of-creativity"
+# GCS_SERVICE_ACCOUNT_JSON = "{...}"  # Set if GCS_BACKUP_ENABLED=true
+
+# Database Configuration (Railway PostgreSQL plugin auto-sets DATABASE_URL)
+# DATABASE_URL is automatically provided by Railway PostgreSQL plugin
+# No manual configuration needed!
 
 # Redis Configuration (if using Railway Redis plugin)
 # Uncomment if you add Redis plugin:
 # REDIS_URL = "redis://default:password@host:port"
+
+RATE_LIMIT_UPLOADS_PER_HOUR=50
 
 [environments.production]
 variables = { 
