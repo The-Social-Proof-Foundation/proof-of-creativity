@@ -162,6 +162,10 @@ async def process_upload_background(
         
         # Stage 3: Blockchain Submission (80-95%)
         blockchain_tx_hash = None
+        
+        # PRINT STATEMENT FOR JANE - Check if we'll submit
+        print(f"\n[POC] Blockchain submission check - post_id={post_id}, mys_client={'initialized' if mys_client else 'None'}\n")
+        
         if post_id and mys_client:
             try:
                 progress_tracker.update_progress(

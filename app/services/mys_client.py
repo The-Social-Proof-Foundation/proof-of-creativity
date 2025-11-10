@@ -64,6 +64,9 @@ class MySocialClient:
             Transaction result dict with tx_hash
         """
         try:
+            # PRINT STATEMENT FOR JANE - Function entry
+            print(f"\n[POC] submit_poc_analysis CALLED - post_id={post_id}, media_type={media_type}, similarity={similarity_score}\n")
+            
             logger.info("Submitting PoC analysis to MySocial",
                        post_id=post_id,
                        media_type=media_type,
@@ -188,31 +191,33 @@ class MySocialClient:
         media_type_map = {1: "image", 2: "video", 3: "audio"}
         media_type_name = media_type_map.get(media_type, f"unknown({media_type})")
         
-        # Log comprehensive transaction details before submission
-        logger.info("=" * 80)
-        logger.info("🚀 SUBMITTING PROOF_OF_CREATIVITY TRANSACTION TO BLOCKCHAIN")
-        logger.info("=" * 80)
-        logger.info("Contract Details:",
+        # PRINT STATEMENTS FOR JANE - These will show up regardless of logging config
+        print("\n" + "=" * 80)
+        print("🚀 SUBMITTING PROOF_OF_CREATIVITY TRANSACTION TO BLOCKCHAIN")
+        print("=" * 80)
+        print(f"Contract: {module_name}::{function_name}")
+        print(f"Package ID: {self.package_id}")
+        print(f"Post ID: {post_id}")
+        print(f"Media Type: {media_type_name} ({media_type})")
+        print(f"Similarity Score: {similarity_score}/100")
+        print(f"Original Creator: {original_creator[0] if original_creator else 'None'}")
+        print(f"Oracle Address: {self.wallet.get_address()}")
+        print(f"RPC Endpoint: {self.rpc_url}")
+        print("=" * 80)
+        print("⏳ Submitting transaction to MySocial RPC...")
+        print("=" * 80 + "\n")
+        
+        # Also log via structlog
+        logger.info("🚀 SUBMITTING PROOF_OF_CREATIVITY TRANSACTION TO BLOCKCHAIN",
                    package_id=self.package_id,
                    module=module_name,
                    function=function_name,
-                   config_id=self.config_id,
-                   registry_id=self.registry_id,
-                   token_registry_id=self.token_registry_id)
-        logger.info("Transaction Parameters:",
                    post_id=post_id,
                    media_type=f"{media_type_name} ({media_type})",
                    similarity_score=f"{similarity_score}/100",
                    original_creator=original_creator[0] if original_creator else None,
-                   is_derivative=len(original_creator) > 0)
-        logger.info("Oracle Details:",
                    oracle_address=self.wallet.get_address(),
                    rpc_endpoint=self.rpc_url)
-        logger.info("Full Transaction Data:",
-                   tx_data=json.dumps(tx_data, indent=2))
-        logger.info("=" * 80)
-        logger.info("⏳ Submitting transaction to MySocial RPC...")
-        logger.info("=" * 80)
         
         try:
             response = self.session.post(self.rpc_url, json=rpc_request, timeout=30)
@@ -222,12 +227,14 @@ class MySocialClient:
             
             if "error" in result:
                 error_msg = result.get("error", {})
-                logger.error("=" * 80)
-                logger.error("❌ PROOF_OF_CREATIVITY TRANSACTION REJECTED BY RPC")
-                logger.error("=" * 80)
-                logger.error("RPC Error Response:",
+                # PRINT STATEMENTS FOR JANE - RPC Error
+                print("\n" + "=" * 80)
+                print("❌ PROOF_OF_CREATIVITY TRANSACTION REJECTED BY RPC")
+                print("=" * 80)
+                print(f"Error: {json.dumps(error_msg, indent=2)}")
+                print("=" * 80 + "\n")
+                logger.error("❌ PROOF_OF_CREATIVITY TRANSACTION REJECTED BY RPC",
                            error=json.dumps(error_msg, indent=2))
-                logger.error("=" * 80)
                 raise Exception(f"RPC error: {error_msg}")
             
             # Extract transaction hash
@@ -236,24 +243,25 @@ class MySocialClient:
             tx_status = tx_result.get("effects", {}).get("status")
             tx_events = tx_result.get("events", [])
             
-            # Log successful submission with transaction hash
-            logger.info("=" * 80)
-            logger.info("✅ PROOF_OF_CREATIVITY TRANSACTION SUBMITTED SUCCESSFULLY")
-            logger.info("=" * 80)
-            logger.info("Transaction Result:",
+            # PRINT STATEMENTS FOR JANE - Success
+            print("\n" + "=" * 80)
+            print("✅ PROOF_OF_CREATIVITY TRANSACTION SUBMITTED SUCCESSFULLY")
+            print("=" * 80)
+            print(f"Transaction Hash: {tx_hash}")
+            print(f"Status: {tx_status}")
+            print(f"Events Count: {len(tx_events)}")
+            if tx_events:
+                print("\nTransaction Events:")
+                for i, event in enumerate(tx_events):
+                    event_type = event.get("type", "unknown")
+                    print(f"  Event {i+1}: {event_type}")
+            print("=" * 80 + "\n")
+            
+            # Also log via structlog
+            logger.info("✅ PROOF_OF_CREATIVITY TRANSACTION SUBMITTED SUCCESSFULLY",
                        tx_hash=tx_hash,
                        status=tx_status,
                        events_count=len(tx_events))
-            
-            # Log events if any (especially AnalysisSubmittedEvent, PoCBadgeIssuedEvent, etc.)
-            if tx_events:
-                logger.info("Transaction Events:")
-                for i, event in enumerate(tx_events):
-                    event_type = event.get("type", "unknown")
-                    logger.info(f"  Event {i+1}: {event_type}",
-                               event_data=json.dumps(event, indent=2))
-            
-            logger.info("=" * 80)
             
             return {
                 "success": True,
@@ -263,30 +271,32 @@ class MySocialClient:
             }
             
         except requests.exceptions.RequestException as e:
-            logger.error("=" * 80)
-            logger.error("❌ PROOF_OF_CREATIVITY TRANSACTION SUBMISSION FAILED")
-            logger.error("=" * 80)
-            logger.error("RPC Request Error:",
+            # PRINT STATEMENTS FOR JANE - Request Error
+            print("\n" + "=" * 80)
+            print("❌ PROOF_OF_CREATIVITY TRANSACTION SUBMISSION FAILED")
+            print("=" * 80)
+            print(f"RPC Request Error: {str(e)}")
+            print(f"RPC URL: {self.rpc_url}")
+            print(f"Error Type: {type(e).__name__}")
+            print("=" * 80 + "\n")
+            logger.error("❌ PROOF_OF_CREATIVITY TRANSACTION SUBMISSION FAILED",
                        error=str(e),
                        rpc_url=self.rpc_url,
                        error_type=type(e).__name__)
-            logger.error("=" * 80)
             raise
         except Exception as e:
-            logger.error("=" * 80)
-            logger.error("❌ PROOF_OF_CREATIVITY TRANSACTION SUBMISSION FAILED")
-            logger.error("=" * 80)
-            logger.error("Transaction Error:",
+            # PRINT STATEMENTS FOR JANE - General Error
+            print("\n" + "=" * 80)
+            print("❌ PROOF_OF_CREATIVITY TRANSACTION SUBMISSION FAILED")
+            print("=" * 80)
+            print(f"Transaction Error: {str(e)}")
+            print(f"Error Type: {type(e).__name__}")
+            if hasattr(e, 'response') and hasattr(e.response, 'text'):
+                print(f"Response: {e.response.text[:500]}")
+            print("=" * 80 + "\n")
+            logger.error("❌ PROOF_OF_CREATIVITY TRANSACTION SUBMISSION FAILED",
                        error=str(e),
                        error_type=type(e).__name__)
-            # If we got a response with an error, log it
-            if hasattr(e, 'response') and hasattr(e.response, 'text'):
-                try:
-                    error_data = json.loads(e.response.text)
-                    logger.error("RPC Error Response:", error_data=json.dumps(error_data, indent=2))
-                except:
-                    logger.error("RPC Error Response (raw):", response_text=e.response.text[:500])
-            logger.error("=" * 80)
             raise
     
     def verify_oracle_authorization(self) -> bool:
