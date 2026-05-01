@@ -17,14 +17,36 @@ load_dotenv()
 
 # Import our modules with new structure
 from app import config
-from app.services import embedding, fingerprint, video_processing, image_hash
+from app.services.media_similarity import detect_image_similarity, detect_audio_similarity
+from app.services.poc_video import analyze_video_similarity
+
+# Older streaming handlers referenced this name; stale reloads or forks can still evaluate it at import/runtime.
+detect_video_similarity = analyze_video_similarity
+
+from app.services.poc_submission import (
+    attempt_proof_of_creativity_submission,
+    attribution_type_from_chain_summary,
+    build_upload_attribution_message,
+    preview_poc_chain_summary_for_upload,
+    preview_video_track_attestation,
+)
+from app.services.poc_utils import (
+    OFFCHAIN_DEFAULT_POC_CONFIG,
+    mys_integration_enabled_from_env,
+    mysocial_readiness_payload,
+    poc_fail_lifespan_on_mys_misconfig_from_env,
+    poc_require_tx_when_post_id_from_env,
+    similarity_float_to_u64_percent,
+)
 from app.core.storage import StorageClient
 from app.core.database import (
-    insert_embedding, search_embedding_with_timescale_ai, insert_fingerprint, search_fingerprint,
-    insert_image_hashes, search_similar_image_hashes, get_image_hashes,
-    insert_media_file, update_media_file_status, insert_similarity_match, get_similarity_matches,
-    insert_attribution_record, get_attribution_records, get_database_stats,
-    check_database_connection
+    insert_media_file,
+    update_media_file_status,
+    insert_attribution_record,
+    get_attribution_records,
+    get_similarity_matches,
+    get_database_stats,
+    check_database_connection,
 )
 from app.core.utils import save_temp_upload, new_media_id, calculate_file_hash, cleanup_temp_file
 from app.models.similarity import MediaMatch, UploadResponse, ErrorResponse, HealthResponse, StreamingUploadResponse
@@ -56,7 +78,7 @@ storage_client = None
 redis_cache = None
 
 # Global MySocial client (optional)
-mys_client = None
+myso_client = None
 
 # Global progress tracker
 progress_tracker = None
@@ -64,10 +86,13 @@ progress_tracker = None
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan manager for startup and shutdown events."""
-    global storage_client, redis_cache, mys_client, progress_tracker
+    global storage_client, redis_cache, myso_client, progress_tracker
     
     # Startup
-    logger.info("Starting Proof of Creativity API")
+    logger.info(
+        "Starting Proof of Creativity API",
+        main_module_path=os.path.abspath(__file__),
+    )
     try:
         # Step 1: Run database migrations first (like Diesel's embedded_migrations)
         logger.info("Running database migrations...")
@@ -105,12 +130,24 @@ async def lifespan(app: FastAPI):
             logger.warning("Could not create vector indexes", error=str(e))
         
         # Step 5: Initialize MySocial blockchain client (optional)
-        from app.services.mys_client import init_mys_client
-        mys_client = init_mys_client()
-        if mys_client:
+        from app.services.myso_client import init_myso_client
+
+        myso_client = init_myso_client()
+        if myso_client:
             logger.info("✅ MySocial blockchain integration enabled")
         else:
-            logger.info("ℹ️  MySocial blockchain integration disabled")
+            logger.info("ℹ️  MySocial blockchain integration disabled or unavailable")
+        if (
+            mys_integration_enabled_from_env()
+            and myso_client is None
+            and poc_fail_lifespan_on_mys_misconfig_from_env()
+        ):
+            raise RuntimeError(
+                "MySocial integration is enabled (MYSO_INTEGRATION_ENABLED) but the PoC client did not "
+                "initialize (missing object IDs, MYSO_POC_STRICT_ORACLE mismatch, wallet error, etc.). "
+                "Fix env or set MYSO_INTEGRATION_ENABLED=false. "
+                "To allow boot without chain, unset MYSO_POC_FAIL_LIFESPAN_ON_MYS_MISCONFIG."
+            )
         
         # Step 6: Initialize storage client
         storage_client = StorageClient()
@@ -135,7 +172,10 @@ async def lifespan(app: FastAPI):
 # Create FastAPI application
 app = FastAPI(
     title="Proof of Creativity API",
-    description="Scalable Media Attribution Architecture for detecting original vs derivative media using PostgreSQL + pgvector",
+    description=(
+        "Oracle service: media fingerprinting, similarity search (0–1 float scores + 0–100 integer percents for chain), "
+        "and optional MySocial Move submission. See README for oracle vs indexer vs chain roles."
+    ),
     version="1.0.0",
     docs_url="/docs",
     redoc_url="/redoc",
@@ -226,308 +266,6 @@ async def validate_file(file: UploadFile) -> tuple[str, str]:
     
     return content_type, media_type
 
-async def detect_image_similarity(file_path: str, media_id: str) -> List[MediaMatch]:
-    """Process image and detect similar content using dual-mode approach: perceptual hashing + CLIP embeddings."""
-    try:
-        logger.info("Processing image for similarity detection", media_id=media_id)
-        
-        # Step 1: Generate and check perceptual hashes for exact/near-exact duplicates
-        logger.debug("Generating perceptual hashes", media_id=media_id)
-        image_hashes = image_hash.generate_image_hashes(file_path)
-        
-        # Search for exact hash matches (true duplicates)
-        hash_matches = search_similar_image_hashes(image_hashes, exclude_media_id=media_id)
-        
-        # Store image hashes
-        insert_image_hashes(media_id, image_hashes)
-        
-        matches = []
-        
-        # Process perceptual hash matches (highest priority - exact duplicates)
-        for hash_match in hash_matches:
-            match_media_id = hash_match[0]  # First column is media_id
-            stored_hashes = {
-                'dhash': hash_match[1],
-                'phash': hash_match[2], 
-                'ahash': hash_match[3],
-                'dhash_16': hash_match[4],
-                'phash_16': hash_match[5]
-            }
-            
-            # Calculate exact similarity between hashes
-            hash_similarity, match_type = image_hash.calculate_hash_similarity(image_hashes, stored_hashes)
-            
-            if hash_similarity >= 0.99:  # 99%+ hash similarity = exact duplicate
-                confidence = "high"
-                match_category = "exact_duplicate"
-                
-                # Record the perceptual hash match
-                insert_similarity_match(
-                    query_media_id=media_id,
-                    match_media_id=match_media_id,
-                    match_type="perceptual_hash",
-                    similarity_score=float(hash_similarity),
-                    confidence_level=confidence,
-                    match_details={
-                        "hash_type": match_type,
-                        "match_category": match_category,
-                        "hash_similarity": hash_similarity
-                    }
-                )
-                
-                matches.append(MediaMatch(
-                    media_id=match_media_id,
-                    similarity_score=float(hash_similarity),
-                    match_type="perceptual_hash",
-                    confidence_level=confidence
-                ))
-        
-        # Step 2: Only check CLIP embeddings if no perceptual hash duplicates found
-        if not matches:
-            logger.debug("No perceptual hash duplicates found, checking CLIP embeddings", media_id=media_id)
-            
-            # Generate CLIP embedding
-            embedding_vector = embedding.image_embedding(file_path)
-            
-            # Use higher threshold for semantic similarity (98% for near-duplicates, 90% for similar content)
-            duplicate_threshold = 0.98  # Near-duplicate via semantic similarity (raised from 0.95)
-            similar_threshold = 0.90    # Similar content (raised from 0.85)
-            
-            # Search for similar embeddings
-            duplicate_embeddings = search_embedding_with_timescale_ai(
-                vector=embedding_vector, 
-                top_k=10,
-                kind_filter="image",
-                similarity_threshold=duplicate_threshold
-            )
-            
-            # Only check for similar content if no duplicates found
-            similar_embeddings = search_embedding_with_timescale_ai(
-                vector=embedding_vector, 
-                top_k=10,
-                kind_filter="image", 
-                similarity_threshold=similar_threshold
-            ) if not duplicate_embeddings else []
-            
-            # Store the new embedding
-            insert_embedding(media_id, "image", embedding_vector, {})
-            
-            # Process CLIP embedding matches
-            all_embeddings = duplicate_embeddings + similar_embeddings
-            
-            for match in all_embeddings:
-                match_media_id, kind, metadata, uploaded_at, similarity_score, distance = match
-                if match_media_id != media_id:  # Don't match against self
-                    
-                    # Categorize based on CLIP similarity score (stricter thresholds)
-                    if similarity_score >= 0.99:
-                        confidence = "high"
-                        match_category = "semantic_duplicate"
-                    elif similarity_score >= 0.98:
-                        confidence = "high" 
-                        match_category = "semantic_near_duplicate"
-                    elif similarity_score >= 0.95:
-                        confidence = "medium"
-                        match_category = "similar_content"
-                    elif similarity_score >= 0.90:
-                        confidence = "medium"
-                        match_category = "related_content"
-                    else:
-                        confidence = "low"
-                        match_category = "loosely_related"
-                    
-                    # Record the CLIP embedding match
-                    insert_similarity_match(
-                        query_media_id=media_id,
-                        match_media_id=match_media_id,
-                        match_type="embedding",
-                        similarity_score=float(similarity_score),
-                        confidence_level=confidence,
-                        match_details={
-                            "embedding_type": "clip", 
-                            "kind": kind,
-                            "match_category": match_category,
-                            "duplicate_threshold": duplicate_threshold,
-                            "similar_threshold": similar_threshold
-                        }
-                    )
-                    
-                    matches.append(MediaMatch(
-                        media_id=match_media_id,
-                        similarity_score=float(similarity_score),
-                        match_type="embedding",
-                        confidence_level=confidence
-                    ))
-            
-            logger.info("CLIP embedding search completed", 
-                       media_id=media_id, 
-                       duplicates_found=len(duplicate_embeddings),
-                       similar_found=len(similar_embeddings))
-        else:
-            # Still store CLIP embedding for future searches, but don't search with it
-            logger.debug("Perceptual duplicates found, storing CLIP embedding without search", media_id=media_id)
-            embedding_vector = embedding.image_embedding(file_path)
-            insert_embedding(media_id, "image", embedding_vector, {})
-        
-        logger.info("Image similarity detection completed", 
-                   media_id=media_id, 
-                   matches_found=len(matches),
-                   hash_matches_found=len(hash_matches))
-        return matches
-        
-    except Exception as e:
-        logger.error("Failed to detect image similarity", 
-                    media_id=media_id, error=str(e))
-        raise HTTPException(status_code=500, detail=f"Image similarity detection failed: {str(e)}")
-
-async def detect_audio_similarity(file_path: str, media_id: str) -> List[MediaMatch]:
-    """Process audio and detect similar content."""
-    try:
-        logger.info("Processing audio for similarity detection", media_id=media_id)
-        
-        # Generate fingerprint
-        fp_hash = fingerprint.fingerprint_audio(file_path)
-        
-        # Search for similar fingerprints
-        similar_fingerprints = search_fingerprint(fp_hash)
-        
-        # Store the new fingerprint
-        insert_fingerprint(fp_hash, media_id, 0.0)
-        
-        # Process matches
-        matches = []
-        for match in similar_fingerprints:
-            match_media_id, offset = match
-            if match_media_id != media_id:  # Don't match against self
-                # For fingerprints, exact match means high confidence
-                confidence = "high"
-                similarity_score = 1.0  # Exact fingerprint match
-                
-                # Record the match in database
-                insert_similarity_match(
-                    query_media_id=media_id,
-                    match_media_id=match_media_id,
-                    match_type="fingerprint",
-                    similarity_score=similarity_score,
-                    confidence_level=confidence,
-                    match_details={"fingerprint_hash": fp_hash, "offset": offset}
-                )
-                
-                matches.append(MediaMatch(
-                    media_id=match_media_id,
-                    similarity_score=similarity_score,
-                    match_type="fingerprint",
-                    confidence_level=confidence
-                ))
-        
-        logger.info("Audio similarity detection completed", 
-                   media_id=media_id, matches_found=len(matches))
-        return matches
-        
-    except Exception as e:
-        logger.error("Error in audio similarity detection", 
-                    media_id=media_id, error=str(e))
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Error processing audio: {str(e)}"
-        )
-
-async def detect_video_similarity(file_path: str, media_id: str) -> List[MediaMatch]:
-    """Process video and detect similar content."""
-    try:
-        logger.info("Processing video for similarity detection", media_id=media_id)
-        
-        # Process video (extract frames and audio)
-        frame_embeddings, audio_fp_hash = video_processing.process_video(file_path)
-        
-        all_matches = []
-        
-        # Process frame embeddings using pgvector
-        for idx, frame_embedding in enumerate(frame_embeddings):
-            similar_embeddings = search_embedding_with_timescale_ai(
-                vector=frame_embedding, 
-                top_k=5,
-                kind_filter="video_frame",
-                similarity_threshold=0.7
-            )
-            frame_media_id = f"{media_id}_frame_{idx}"
-            
-            # Store frame embedding
-            insert_embedding(
-                frame_media_id, 
-                "video_frame", 
-                frame_embedding, 
-                {"parent_media_id": media_id, "frame_index": idx}
-            )
-            
-            # Process frame matches
-            for match in similar_embeddings:
-                match_media_id, kind, metadata, uploaded_at, similarity_score, distance = match
-                if not match_media_id.startswith(media_id):  # Don't match against self
-                    confidence = "high" if similarity_score > 0.9 else "medium" if similarity_score > 0.7 else "low"
-                    
-                    insert_similarity_match(
-                        query_media_id=media_id,
-                        match_media_id=match_media_id,
-                        match_type="embedding",
-                        similarity_score=float(similarity_score),
-                        confidence_level=confidence,
-                        match_details={"embedding_type": "clip", "kind": kind, "frame_index": idx}
-                    )
-                    
-                    all_matches.append(MediaMatch(
-                        media_id=match_media_id,
-                        similarity_score=float(similarity_score),
-                        match_type="embedding",
-                        confidence_level=confidence
-                    ))
-        
-        # Process audio fingerprint
-        if audio_fp_hash:
-            similar_fingerprints = search_fingerprint(audio_fp_hash)
-            insert_fingerprint(audio_fp_hash, media_id, 0.0)
-            
-            for match in similar_fingerprints:
-                match_media_id, offset = match
-                if match_media_id != media_id:
-                    confidence = "high"
-                    similarity_score = 1.0
-                    
-                    insert_similarity_match(
-                        query_media_id=media_id,
-                        match_media_id=match_media_id,
-                        match_type="fingerprint",
-                        similarity_score=similarity_score,
-                        confidence_level=confidence,
-                        match_details={"fingerprint_hash": audio_fp_hash, "offset": offset}
-                    )
-                    
-                    all_matches.append(MediaMatch(
-                        media_id=match_media_id,
-                        similarity_score=similarity_score,
-                        match_type="fingerprint",
-                        confidence_level=confidence
-                    ))
-        
-        # Deduplicate matches by media_id (keep highest score)
-        unique_matches = {}
-        for match in all_matches:
-            if match.media_id not in unique_matches or match.similarity_score > unique_matches[match.media_id].similarity_score:
-                unique_matches[match.media_id] = match
-        
-        final_matches = list(unique_matches.values())
-        logger.info("Video similarity detection completed", 
-                   media_id=media_id, matches_found=len(final_matches))
-        return final_matches
-        
-    except Exception as e:
-        logger.error("Error in video similarity detection", 
-                    media_id=media_id, error=str(e))
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Error processing video: {str(e)}"
-        )
-
 @app.get("/", response_model=dict)
 async def root():
     """Root endpoint with API information."""
@@ -537,6 +275,7 @@ async def root():
         "description": "Scalable Media Attribution Architecture with PostgreSQL + pgvector",
         "docs_url": "/docs",
         "health_url": "/health",
+        "readyz_url": "/readyz",
         "database": "PostgreSQL with pgvector"
     }
 
@@ -560,7 +299,7 @@ async def health_check():
             "redis": "healthy" if redis_health.get("available") else "unavailable",
             "embedding_model": "healthy",  # Could add actual model health checks
             "fingerprint_service": "healthy",
-            "pgvector": "healthy" if db_stats.get("vector_extension_version") else "unavailable"
+            "pgvector": "healthy" if db_stats.get("vector_extension_version") else "unavailable",
         }
         
         overall_status = "healthy" if all(status == "healthy" for status in components.values()) else "degraded"
@@ -572,7 +311,8 @@ async def health_check():
                 **components,
                 "database_stats": db_stats,
                 "storage_health": storage_health,
-                "redis_health": redis_health
+                "redis_health": redis_health,
+                "mysocial": mysocial_readiness_payload(myso_client),
             }
         )
     except Exception as e:
@@ -583,14 +323,47 @@ async def health_check():
             components={"error": str(e)}
         )
 
+@app.get("/readyz")
+async def readiness():
+    """
+    Load balancer / orchestrator probe: DB must be up; if MySocial integration is enabled,
+    oracle client must be active and wallet must match PoCConfig oracle_address.
+    """
+    db_ok = check_database_connection()
+    mys = mysocial_readiness_payload(myso_client)
+    ready = db_ok and mys.get("ready_for_submission", True)
+    payload = {
+        "ready": ready,
+        "database": "healthy" if db_ok else "unhealthy",
+        "mysocial": mys,
+    }
+    return JSONResponse(
+        status_code=200 if ready else 503,
+        content=payload,
+    )
+
 @app.post("/upload/stream", response_model=StreamingUploadResponse)
 async def upload_media_streaming(
     request: Request,
     background_tasks: BackgroundTasks,
     file: UploadFile = File(..., description="Media file to upload and analyze"),
-    post_id: Optional[str] = None,  # MySocial post ID for blockchain submission
-    upload_to_stream: bool = False,  # Whether to upload video to Cloudflare Stream (opt-in)
-    _rate_limit: None = Depends(check_rate_limit)
+    post_id: Optional[str] = Query(None, description="MySocial post object id for PoC submission"),
+    spt_pool_id: Optional[str] = Query(
+        None, description="Optional Social Proof Token pool id (enables analyze_and_update_post_sync_token_pool)"
+    ),
+    force_reanalyze: bool = Query(
+        False,
+        description="Forwarded to post preflight; overturn-cleared posts omit active PoC without requiring this flag",
+    ),
+    creator_address: Optional[str] = Query(
+        None, description="Optional creator wallet stored on this media_files row for attribution lookups",
+    ),
+    royalty_free: bool = Query(
+        False,
+        description="With post_id + MySocial: submit explicit royalty-free PoC outcome (on-chain outcome 4)",
+    ),
+    upload_to_stream: bool = False,
+    _rate_limit: None = Depends(check_rate_limit),
 ):
     """
     Streaming upload with immediate response and WebSocket progress updates
@@ -616,9 +389,9 @@ async def upload_media_streaming(
         media_id = new_media_id()
         
         # Check if post was already analyzed (one media per post rule)
-        if post_id and mys_client:
+        if post_id and myso_client:
             try:
-                post_check = mys_client.check_post_already_analyzed(post_id)
+                post_check = myso_client.check_post_already_analyzed(post_id, force_reanalyze=force_reanalyze)
                 if post_check.get("already_analyzed"):
                     raise HTTPException(
                         status_code=status.HTTP_409_CONFLICT,
@@ -647,7 +420,33 @@ async def upload_media_streaming(
         # Save temp file for background processing
         temp_file_path = save_temp_upload(file)
         file_hash = calculate_file_hash(temp_file_path)
-        
+        file_size = os.path.getsize(temp_file_path)
+
+        # Persist catalog row immediately (same as /upload). Background work may fail or be
+        # interrupted (reload/worker); without this, streaming uploads leave no DB trace.
+        try:
+            insert_media_file(
+                media_id=media_id,
+                filename=simplified_filename,
+                original_filename=file.filename or simplified_filename,
+                content_type=content_type,
+                file_size=file_size,
+                file_hash=file_hash,
+                status="processing",
+                creator_address=creator_address,
+            )
+        except Exception as e:
+            logger.error(
+                "Failed to record streaming upload in database",
+                media_id=media_id,
+                error=str(e),
+            )
+            cleanup_temp_file(temp_file_path)
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Failed to record upload: {str(e)}",
+            )
+
         # Create progress entry in Redis
         if progress_tracker:
             progress_tracker.create_upload(
@@ -658,17 +457,7 @@ async def upload_media_streaming(
         
         # Spawn background task for processing
         from app.services.background_tasks import process_upload_background
-        
-        # Determine which similarity detection function to use
-        if media_type == "image":
-            detect_func = detect_image_similarity
-        elif media_type == "audio":
-            detect_func = detect_audio_similarity
-        elif media_type == "video":
-            detect_func = detect_video_similarity
-        else:
-            raise HTTPException(status_code=400, detail="Invalid media type")
-        
+
         background_tasks.add_task(
             process_upload_background,
             upload_id=media_id,
@@ -678,11 +467,14 @@ async def upload_media_streaming(
             media_type=media_type,
             file_hash=file_hash,
             post_id=post_id,
+            spt_pool_id=spt_pool_id,
+            force_reanalyze=force_reanalyze,
+            creator_address=creator_address,
+            royalty_free=royalty_free,
             upload_to_stream=upload_to_stream,
             progress_tracker=progress_tracker,
             storage_client=storage_client,
-            mys_client=mys_client,
-            detect_similarity_func=detect_func
+            myso_client=myso_client,
         )
         
         # Return immediately with predicted URL and WebSocket info
@@ -714,9 +506,21 @@ async def upload_media_streaming(
 async def upload_media(
     request: Request,
     file: UploadFile = File(..., description="Media file to upload and analyze"),
-    post_id: Optional[str] = None,  # MySocial post ID for blockchain submission
-    upload_to_stream: bool = False,  # Whether to upload video to Cloudflare Stream (opt-in)
-    _rate_limit: None = Depends(check_rate_limit)
+    post_id: Optional[str] = Query(None, description="MySocial post object id"),
+    spt_pool_id: Optional[str] = Query(None, description="Optional SPT pool id for synced PoC mint fields"),
+    force_reanalyze: bool = Query(
+        False,
+        description="Preflight flag echoed to post lookups; overturn-cleared posts lack active PoC automatically",
+    ),
+    creator_address: Optional[str] = Query(
+        None, description="Optional wallet stored alongside this upload for attribution mapping",
+    ),
+    royalty_free: bool = Query(
+        False,
+        description="With post_id + MySocial: submit explicit royalty-free PoC outcome (on-chain outcome 4)",
+    ),
+    upload_to_stream: bool = False,
+    _rate_limit: None = Depends(check_rate_limit),
 ):
     """
     Synchronous upload endpoint (legacy/compatibility)
@@ -746,9 +550,9 @@ async def upload_media(
         content_type, media_type = await validate_file(file)
         
         # Check if post was already analyzed (one media per post rule)
-        if post_id and mys_client:
+        if post_id and myso_client:
             try:
-                post_check = mys_client.check_post_already_analyzed(post_id)
+                post_check = myso_client.check_post_already_analyzed(post_id, force_reanalyze=force_reanalyze)
                 if post_check.get("already_analyzed"):
                     raise HTTPException(
                         status_code=status.HTTP_409_CONFLICT,
@@ -775,17 +579,19 @@ async def upload_media(
             content_type=content_type,
             file_size=file_size,
             file_hash=file_hash,
-            status="processing"
+            status="processing",
+            creator_address=creator_address,
         )
-        
-        # Detect similarity based on media type
-        matches = []
+
+        video_analysis = None
+        matches: List[MediaMatch] = []
         if media_type == "image":
             matches = await detect_image_similarity(temp_file_path, media_id)
         elif media_type == "audio":
             matches = await detect_audio_similarity(temp_file_path, media_id)
         elif media_type == "video":
-            matches = await detect_video_similarity(temp_file_path, media_id)
+            video_analysis = analyze_video_similarity(temp_file_path, media_id)
+            matches = video_analysis.matches
         
         # Upload to storage (simplified filename: just media_id + extension)
         from pathlib import Path
@@ -829,6 +635,7 @@ async def upload_media(
             media_id=media_id,
             status="completed",
             storage_uri=storage_uri,
+            streaming_uri=streaming_uri,
             processing_results={
                 "processing_time_ms": processing_time,
                 "matches_found": len(matches),
@@ -837,7 +644,155 @@ async def upload_media(
         )
         
         # Record attribution automatically based on similarity analysis
-        attribution_type = determine_attribution_type(matches)
+        media_type_code = {"image": 1, "audio": 3, "video": 2}.get(media_type, 1)
+        poc_cfg = OFFCHAIN_DEFAULT_POC_CONFIG
+        if myso_client:
+            try:
+                poc_cfg = myso_client.get_poc_config()
+            except Exception:
+                pass
+
+        summary = preview_poc_chain_summary_for_upload(
+            media_cat=media_type,
+            media_type_code=media_type_code,
+            matches=matches,
+            video_analysis=video_analysis,
+            poc_config=poc_cfg,
+            royalty_free=royalty_free,
+        )
+        video_attestation_model = None
+        if media_type == "video" and video_analysis is not None:
+            video_attestation_model = preview_video_track_attestation(video_analysis, poc_cfg)
+
+        tx_hash = None
+        poc_submission_snap = None
+
+        if post_id and myso_client:
+            try:
+                myso_result, video_attestation_model, poc_submission_snap, summary = attempt_proof_of_creativity_submission(
+                    myso_client=myso_client,
+                    post_id=post_id,
+                    media_cat=media_type,
+                    media_type_code=media_type_code,
+                    matches=matches,
+                    video_analysis=video_analysis,
+                    spt_pool_id=spt_pool_id,
+                    royalty_free=royalty_free,
+                )
+                tx_hash = myso_result.get("tx_hash")
+                if poc_require_tx_when_post_id_from_env() and not tx_hash:
+                    raise RuntimeError("MySocial PoC RPC returned no transaction digest (tx_hash)")
+                logger.info(
+                    "PoC result submitted to MySocial",
+                    post_id=post_id,
+                    tx_hash=tx_hash,
+                    attribution_type=attribution_type_from_chain_summary(summary),
+                )
+            except Exception as e:
+                if poc_require_tx_when_post_id_from_env():
+                    err_msg = str(e)
+                    logger.warning(
+                        "MySocial PoC submission failed; oracle upload still completed "
+                        "(MYSO_POC_REQUIRE_TX_WHEN_POST_ID=true)",
+                        post_id=post_id,
+                        error=err_msg,
+                    )
+                    fail_attribution_type = attribution_type_from_chain_summary(summary)
+                    proof_fail = {
+                        "file_hash": file_hash,
+                        "original_filename": file.filename,
+                        "upload_timestamp": time.time(),
+                        "processing_time_ms": processing_time,
+                        "matches_found": len(matches),
+                        "media_type": media_type,
+                        "high_confidence_matches": len(
+                            [m for m in matches if m.confidence_level == "high"]
+                        ),
+                        "match_types": list(set(m.match_type for m in matches)) if matches else [],
+                        "max_similarity_score": max([m.similarity_score for m in matches])
+                        if matches
+                        else 0.0,
+                        "max_similarity_score_u64": summary.highest_similarity_score_u64,
+                        "effective_threshold_u64": summary.effective_threshold_u64,
+                        "poc_submission": None,
+                        "poc_chain_summary": summary.model_dump(),
+                        "royalty_free_requested": royalty_free,
+                        "video_attestation": video_attestation_model.model_dump()
+                        if video_attestation_model
+                        else None,
+                        "post_id": post_id,
+                        "spt_pool_id": spt_pool_id,
+                        "poc_submission_error": err_msg,
+                        "chain_submission_failed": True,
+                    }
+                    try:
+                        insert_attribution_record(
+                            media_id=media_id,
+                            attribution_type=fail_attribution_type,
+                            proof_data=proof_fail,
+                            tx_hash=None,
+                        )
+                    except Exception as att_e:
+                        logger.warning(
+                            "Could not record attribution after chain failure",
+                            media_id=media_id,
+                            error=str(att_e),
+                        )
+                    try:
+                        update_media_file_status(
+                            media_id,
+                            "completed",
+                            storage_uri=storage_uri,
+                            streaming_uri=streaming_uri,
+                            processing_results={
+                                "processing_time_ms": processing_time,
+                                "matches_found": len(matches),
+                                "media_type": media_type,
+                                "poc_submission_error": err_msg,
+                                "chain_submission_failed": True,
+                                "max_similarity_score_u64": summary.highest_similarity_score_u64,
+                                "effective_threshold_u64": summary.effective_threshold_u64,
+                                "poc_chain_summary": summary.model_dump(),
+                            },
+                        )
+                    except Exception:
+                        pass
+                    base_msg = build_upload_attribution_message(matches, summary)
+                    chain_suffix = (
+                        f" MySocial PoC submission failed (required when post_id present): {err_msg}"
+                    )
+                    return UploadResponse(
+                        media_id=media_id,
+                        filename=file.filename,
+                        content_type=content_type,
+                        file_size=file_size,
+                        file_hash=file_hash,
+                        storage_uri=storage_uri,
+                        streaming_uri=streaming_uri,
+                        matches=matches,
+                        processing_status="completed",
+                        message=base_msg + chain_suffix,
+                        tx_hash=None,
+                        video_attestation=video_attestation_model,
+                        poc_chain_summary=summary,
+                        poc_submission_error=err_msg,
+                    )
+                logger.error(
+                    "Failed to submit to MySocial blockchain",
+                    post_id=post_id,
+                    error=str(e),
+                )
+                summary = preview_poc_chain_summary_for_upload(
+                    media_cat=media_type,
+                    media_type_code=media_type_code,
+                    matches=matches,
+                    video_analysis=video_analysis,
+                    poc_config=poc_cfg,
+                    royalty_free=royalty_free,
+                )
+        attribution_type = attribution_type_from_chain_summary(summary)
+        message = build_upload_attribution_message(matches, summary)
+
         proof_data = {
             "file_hash": file_hash,
             "original_filename": file.filename,
@@ -847,71 +802,34 @@ async def upload_media(
             "media_type": media_type,
             "high_confidence_matches": len([m for m in matches if m.confidence_level == "high"]),
             "match_types": list(set(m.match_type for m in matches)) if matches else [],
-            "max_similarity_score": max([m.similarity_score for m in matches]) if matches else 0.0
+            "max_similarity_score": max([m.similarity_score for m in matches]) if matches else 0.0,
+            "max_similarity_score_u64": summary.highest_similarity_score_u64,
+            "effective_threshold_u64": summary.effective_threshold_u64,
+            "poc_submission": poc_submission_snap,
+            "poc_chain_summary": summary.model_dump(),
+            "royalty_free_requested": royalty_free,
+            "video_attestation": video_attestation_model.model_dump()
+            if video_attestation_model
+            else None,
+            "post_id": post_id,
+            "spt_pool_id": spt_pool_id,
         }
-        
-        # Submit to MySocial blockchain if post_id provided
-        blockchain_tx_hash = None
-        if post_id and mys_client:
-            try:
-                # Map media type to contract constants
-                media_type_code = {"image": 1, "audio": 3, "video": 2}.get(media_type, 1)
-                
-                # Calculate highest similarity score (0-100 for contract)
-                highest_similarity = int(max([m.similarity_score for m in matches]) * 100) if matches else 0
-                
-                # Get original creator address if derivative
-                original_creator = None
-                if matches and len([m for m in matches if m.confidence_level == "high"]) > 0:
-                    # TODO: Map match_media_id to MySocial address
-                    # For now, we'd need to store MySocial addresses in media_files table
-                    pass
-                
-                # Submit to blockchain
-                mys_result = mys_client.submit_poc_analysis(
-                    post_id=post_id,
-                    media_type=media_type_code,
-                    similarity_score=highest_similarity,
-                    original_creator=original_creator
-                )
-                
-                blockchain_tx_hash = mys_result.get("tx_hash")
-                
-                logger.info("PoC result submitted to MySocial",
-                           post_id=post_id,
-                           tx_hash=blockchain_tx_hash,
-                           attribution_type=attribution_type)
-                
-            except Exception as e:
-                logger.error("Failed to submit to MySocial blockchain",
-                            post_id=post_id,
-                            error=str(e))
-                # Don't fail upload if blockchain submission fails
-        
-        # Record attribution in local database
+
         insert_attribution_record(
             media_id=media_id,
             attribution_type=attribution_type,
             proof_data=proof_data,
-            blockchain_tx_hash=blockchain_tx_hash
+            tx_hash=tx_hash,
         )
-        
-        logger.info("Attribution recorded", 
-                   media_id=media_id, 
-                   attribution_type=attribution_type,
-                   matches_found=len(matches),
-                   blockchain_tx_hash=blockchain_tx_hash)
-        
-        # Generate response message based on findings
-        if matches:
-            high_confidence_count = len([m for m in matches if m.confidence_level == "high"])
-            if high_confidence_count > 0:
-                message = f"Found {high_confidence_count} high-confidence matches - possible derivative content"
-            else:
-                message = f"Found {len(matches)} potential matches - review for similarity"
-        else:
-            message = "No similar content found - appears to be original"
-        
+
+        logger.info(
+            "Attribution recorded",
+            media_id=media_id,
+            attribution_type=attribution_type,
+            matches_found=len(matches),
+            tx_hash=tx_hash,
+        )
+
         return UploadResponse(
             media_id=media_id,
             filename=file.filename,
@@ -923,9 +841,11 @@ async def upload_media(
             matches=matches,
             processing_status="completed",
             message=message,
-            blockchain_tx_hash=blockchain_tx_hash
+            tx_hash=tx_hash,
+            video_attestation=video_attestation_model,
+            poc_chain_summary=summary,
         )
-        
+
     except HTTPException:
         raise
     except Exception as e:
@@ -947,29 +867,6 @@ async def upload_media(
         if temp_file_path:
             cleanup_temp_file(temp_file_path)
 
-def determine_attribution_type(matches: List[MediaMatch]) -> str:
-    """
-    Determine attribution type based on similarity analysis.
-    
-    Logic:
-    - No matches: 'original' 
-    - 1-2 high confidence matches: 'derivative'
-    - 3+ high confidence matches: 'remix'
-    - (Future: blockchain verified: 'licensed')
-    """
-    if not matches:
-        return "original"
-    
-    high_confidence_matches = [m for m in matches if m.confidence_level == "high"]
-    
-    if len(high_confidence_matches) == 0:
-        return "original"  # No high confidence matches
-    elif len(high_confidence_matches) <= 2:
-        return "derivative"  # Clear derivative from 1-2 sources
-    else:
-        return "remix"  # Multiple sources combined
-
-@app.get("/media/{media_id}/matches", response_model=List[MediaMatch])
 async def get_media_matches(
     media_id: str,
     limit: int = Query(default=10, ge=1, le=100, description="Maximum number of matches to return")
@@ -981,8 +878,9 @@ async def get_media_matches(
             MediaMatch(
                 media_id=match["match_media_id"],
                 similarity_score=match["similarity_score"],
+                similarity_score_percent=similarity_float_to_u64_percent(float(match["similarity_score"])),
                 match_type=match["match_type"],
-                confidence_level=match["confidence_level"]
+                confidence_level=match["confidence_level"],
             )
             for match in matches
         ]

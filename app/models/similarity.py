@@ -20,12 +20,62 @@ class MediaMatch(BaseModel):
     """Model for a similarity match between media files."""
     media_id: str = Field(..., description="ID of the matched media")
     similarity_score: float = Field(..., ge=0.0, le=1.0, description="Similarity score (0.0 to 1.0)")
+    similarity_score_percent: Optional[int] = Field(
+        default=None,
+        ge=0,
+        le=100,
+        description="Same signal as Move/indexer: integer percent 0–100 (rounded from similarity_score)",
+    )
     match_type: MatchType = Field(..., description="Type of match")
     confidence_level: ConfidenceLevel = Field(..., description="Confidence level")
     match_details: Optional[Dict[str, Any]] = Field(default=None, description="Additional match details")
     
     class Config:
         use_enum_values = True
+
+class TrackMatchSummary(BaseModel):
+    """Per-modality similarity summary used for PoC attestations."""
+
+    similarity_score: float = Field(..., ge=0.0, le=1.0)
+    similarity_score_u64: int = Field(..., ge=0, le=100, description="Integer percent mapped for Move thresholds")
+    best_match_media_id: Optional[str] = None
+    derivative_by_chain_threshold: bool = Field(
+        default=False,
+        description="True iff score meets on-chain modality threshold AND creator attributable",
+    )
+
+
+class VideoTrackAttestation(BaseModel):
+    """Off-chain attestations for VIDEO: visual vs embedded-audio modalities."""
+
+    video_visual: TrackMatchSummary
+    embedded_audio: TrackMatchSummary
+    embedded_audio_only_derivative_sent: bool = Field(
+        default=False,
+        description="Matches embedded_audio_only_derivative passed on-chain when applicable.",
+    )
+
+
+class PocChainSummary(BaseModel):
+    """Oracle interpretation aligned with Move PoC thresholds (integer percent 0–100)."""
+
+    media_type_code: int = Field(..., description="Move media type: 1 image, 2 video, 3 audio")
+    highest_similarity_score_u64: int = Field(..., ge=0, le=100)
+    effective_threshold_u64: int = Field(
+        ...,
+        ge=0,
+        le=100,
+        description="Threshold used for derivative detection (video+embedded_audio uses audio_threshold)",
+    )
+    would_apply_derivative_redirect: bool = Field(
+        ...,
+        description="True iff score >= effective threshold and original_creator is set (non-explicit path)",
+    )
+    embedded_audio_only_derivative: bool = False
+    original_creator: Optional[str] = None
+    apply_explicit_outcome: bool = False
+    explicit_poc_outcome: int = 0
+
 
 class UploadResponse(BaseModel):
     """Response model for media upload and processing."""
@@ -39,8 +89,21 @@ class UploadResponse(BaseModel):
     matches: List[MediaMatch] = Field(default=[], description="Similar media found")
     processing_status: str = Field(..., description="Processing status")
     message: str = Field(..., description="Human-readable message")
-    blockchain_tx_hash: Optional[str] = Field(None, description="MySocial blockchain transaction hash")
-    
+    tx_hash: Optional[str] = Field(None, description="Transaction hash after PoC submission (when applicable)")
+    video_attestation: Optional[VideoTrackAttestation] = Field(
+        default=None,
+        description="Separate visual vs embedded-audio signals (videos only)",
+    )
+    poc_chain_summary: Optional[PocChainSummary] = Field(
+        default=None,
+        description="Chain-aligned score/threshold/creator interpretation for this submission",
+    )
+    poc_submission_error: Optional[str] = Field(
+        default=None,
+        description="When post_id PoC RPC submission fails but oracle processing completed",
+    )
+
+
 class StreamingUploadResponse(BaseModel):
     """Response model for streaming upload initiation."""
     upload_id: str = Field(..., description="Unique upload identifier (media_id)")

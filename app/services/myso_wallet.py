@@ -260,16 +260,16 @@ def load_oracle_wallet() -> MySocialWallet:
     Load oracle wallet from environment variables
     
     Environment variables:
-    - MYS_ORACLE_PRIVATE_KEY: Direct private key (Base64 or hex)
-    - MYS_ORACLE_MNEMONIC: BIP39 mnemonic
-    - MYS_ORACLE_CURVE: "ed25519", "secp256k1", or "secp256r1" (default: ed25519)
+    - MYSO_ORACLE_PRIVATE_KEY: Direct private key (Base64 or hex)
+    - MYSO_ORACLE_MNEMONIC: BIP39 mnemonic
+    - MYSO_ORACLE_CURVE: "ed25519", "secp256k1", or "secp256r1" (default: ed25519)
     """
-    private_key = os.getenv("MYS_ORACLE_PRIVATE_KEY")
-    mnemonic = os.getenv("MYS_ORACLE_MNEMONIC")
-    curve = os.getenv("MYS_ORACLE_CURVE", "ed25519")  # Default to Ed25519
+    private_key = os.getenv("MYSO_ORACLE_PRIVATE_KEY")
+    mnemonic = os.getenv("MYSO_ORACLE_MNEMONIC")
+    curve = os.getenv("MYSO_ORACLE_CURVE", "ed25519")  # Default to Ed25519
     
     if not private_key and not mnemonic:
-        raise ValueError("Must set MYS_ORACLE_PRIVATE_KEY or MYS_ORACLE_MNEMONIC")
+        raise ValueError("Must set MYSO_ORACLE_PRIVATE_KEY or MYSO_ORACLE_MNEMONIC")
     
     if private_key:
         wallet = MySocialWallet(private_key=private_key, curve=curve)

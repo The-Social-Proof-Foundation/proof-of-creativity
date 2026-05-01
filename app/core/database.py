@@ -78,6 +78,12 @@ def get_db_connection():
     conn = None
     try:
         conn = _connection_pool.getconn()
+        try:
+            from pgvector.psycopg2 import register_vector
+
+            register_vector(conn)
+        except Exception:
+            pass
         yield conn
     except Exception as e:
         if conn:
@@ -210,7 +216,11 @@ def get_embedding_by_media_id(media_id: str) -> Optional[Tuple]:
 
 # Audio fingerprint management functions
 def insert_fingerprint(fp_hash: str, media_id: str, offset_seconds: float, fingerprint_data: Optional[bytes] = None):
-    """Insert a new audio fingerprint into the database with Redis caching."""
+    """Insert audio fingerprint; fingerprint_data is optional pickled constellation hashes (see fingerprint_audio_with_blob)."""
+    from app.services.fingerprint import normalize_audio_fp_hash
+
+    fp_hash = normalize_audio_fp_hash(fp_hash)
+    blob_octets = len(fingerprint_data) if fingerprint_data else 0
     sql = """
     INSERT INTO audio_fingerprints (id, fp_hash, media_id, offset_seconds, fingerprint_data)
     VALUES (gen_random_uuid(), %s, %s, %s, %s)
@@ -220,87 +230,85 @@ def insert_fingerprint(fp_hash: str, media_id: str, offset_seconds: float, finge
             with conn.cursor() as cur:
                 cur.execute(sql, (fp_hash, media_id, offset_seconds, fingerprint_data))
                 conn.commit()
-        
-        # Cache in Redis for fast lookups
-        redis_cache = get_redis_cache()
-        if redis_cache:
-            redis_cache.cache_fingerprint(fp_hash, media_id, offset_seconds)
-        
-        logger.debug("Fingerprint inserted successfully", 
-                    fp_hash=fp_hash, media_id=media_id, offset=offset_seconds)
-                    
+
+        logger.debug(
+            "Fingerprint inserted successfully",
+            fp_hash=fp_hash,
+            fp_hash_len=len(fp_hash),
+            media_id=media_id,
+            offset=offset_seconds,
+            fingerprint_data_octets=blob_octets,
+        )
+
     except Exception as e:
-        logger.error("Failed to insert fingerprint", 
+        logger.error("Failed to insert fingerprint",
                     fp_hash=fp_hash, media_id=media_id, error=str(e))
         raise
 
-def search_fingerprint(fp_hash: str) -> List[Tuple]:
-    """Search for matching fingerprints with Redis cache (10-40x faster!)"""
-    
-    # Try Redis cache first (1-5ms)
-    redis_cache = get_redis_cache()
-    if redis_cache:
-        cached_results = redis_cache.get_fingerprint_matches(fp_hash)
-        if cached_results is not None:
-            logger.debug("Fingerprint cache hit (Redis)", 
-                        fp_hash=fp_hash, results_count=len(cached_results))
-            return cached_results
-    
-    # Cache miss - query PostgreSQL (50-200ms)
-    sql = "SELECT media_id, offset_seconds FROM audio_fingerprints WHERE fp_hash = %s"
-    
+def search_fingerprint_rows(fp_hash: str) -> List[Tuple[str, float, Optional[bytes]]]:
+    """
+    Corpus candidates for audio similarity: latest row per media_id (handles retries).
+    Includes fingerprint_data for README step 5 (constellation verification).
+    PostgreSQL only — Redis is not authoritative for similarity.
+    """
+    from app.services.fingerprint import normalize_audio_fp_hash
+
+    fp_hash = normalize_audio_fp_hash(fp_hash)
+    sql = """
+    SELECT DISTINCT ON (media_id) media_id, offset_seconds, fingerprint_data
+    FROM audio_fingerprints
+    WHERE fp_hash = %s
+    ORDER BY media_id, created_at DESC
+    """
     try:
         with get_db_connection() as conn:
             with conn.cursor() as cur:
                 cur.execute(sql, (fp_hash,))
                 results = cur.fetchall()
-        
-        # Cache results in Redis for next time
-        if redis_cache and results:
-            for media_id, offset in results:
-                redis_cache.cache_fingerprint(fp_hash, media_id, offset)
-        
-        logger.debug("Fingerprint search completed (PostgreSQL)", 
-                    fp_hash=fp_hash, results_count=len(results))
+        logger.debug(
+            "Fingerprint candidate rows loaded",
+            fp_hash=fp_hash,
+            candidates=len(results),
+        )
         return results
-        
     except Exception as e:
-        logger.error("Failed to search fingerprint", fp_hash=fp_hash, error=str(e))
+        logger.error("Failed to search fingerprint rows", fp_hash=fp_hash, error=str(e))
         raise
+
+
+def search_fingerprint(fp_hash: str) -> List[Tuple]:
+    """Return (media_id, offset_seconds) for callers that do not need blobs."""
+    rows = search_fingerprint_rows(fp_hash)
+    return [(mid, off) for mid, off, _blob in rows]
 
 # Image perceptual hash management functions
 def insert_image_hashes(media_id: str, hashes: dict) -> None:
-    """Insert image perceptual hashes into database."""
-    sql = """
+    """Insert image perceptual hashes into database (delete-then-insert; works without UNIQUE)."""
+    sql_insert = """
     INSERT INTO image_hashes (id, media_id, dhash, phash, ahash, dhash_16, phash_16)
     VALUES (gen_random_uuid(), %s, %s, %s, %s, %s, %s)
-    ON CONFLICT (media_id) DO UPDATE SET
-        dhash = EXCLUDED.dhash,
-        phash = EXCLUDED.phash,
-        ahash = EXCLUDED.ahash,
-        dhash_16 = EXCLUDED.dhash_16,
-        phash_16 = EXCLUDED.phash_16,
-        updated_at = NOW()
     """
     try:
         with get_db_connection() as conn:
             with conn.cursor() as cur:
-                cur.execute(sql, (
-                    media_id,
-                    hashes.get('dhash'),
-                    hashes.get('phash'),
-                    hashes.get('ahash'), 
-                    hashes.get('dhash_16'),
-                    hashes.get('phash_16')
-                ))
+                cur.execute("DELETE FROM image_hashes WHERE media_id = %s", (media_id,))
+                cur.execute(
+                    sql_insert,
+                    (
+                        media_id,
+                        hashes.get("dhash"),
+                        hashes.get("phash"),
+                        hashes.get("ahash"),
+                        hashes.get("dhash_16"),
+                        hashes.get("phash_16"),
+                    ),
+                )
                 conn.commit()
-        
-        logger.debug("Image hashes inserted", 
-                    media_id=media_id, hash_types=list(hashes.keys()))
-                    
+
+        logger.debug("Image hashes inserted", media_id=media_id, hash_types=list(hashes.keys()))
+
     except Exception as e:
-        logger.error("Failed to insert image hashes", 
-                    media_id=media_id, error=str(e))
+        logger.error("Failed to insert image hashes", media_id=media_id, error=str(e))
         raise
 
 def search_similar_image_hashes(hashes: dict, exclude_media_id: Optional[str] = None) -> List[Tuple]:
@@ -368,26 +376,35 @@ def insert_media_file(
     content_type: str,
     file_size: int,
     file_hash: str,
-    upload_user_id: Optional[str] = None,
-    upload_ip: Optional[str] = None,
-    status: str = "processing"
+    status: str = "processing",
+    creator_address: Optional[str] = None,
 ):
     """Insert a new media file record with Redis caching for deduplication."""
     sql = """
     INSERT INTO media_files (
         media_id, filename, original_filename, content_type, file_size, 
-        file_hash, upload_user_id, upload_ip, status
+        file_hash, creator_address, status
     )
-    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
     """
     try:
         with get_db_connection() as conn:
             with conn.cursor() as cur:
-                cur.execute(sql, (
-                    media_id, filename, original_filename, content_type, 
-                    file_size, file_hash, upload_user_id, upload_ip, status
-                ))
+                cur.execute(
+                    sql,
+                    (
+                        media_id,
+                        filename,
+                        original_filename,
+                        content_type,
+                        file_size,
+                        file_hash,
+                        creator_address,
+                        status,
+                    ),
+                )
                 conn.commit()
+
         
         # Cache file hash for fast deduplication
         redis_cache = get_redis_cache()
@@ -398,11 +415,54 @@ def insert_media_file(
                    media_id=media_id, filename=filename, file_size=file_size)
                    
     except Exception as e:
-        logger.error("Failed to insert media file record", 
-                    media_id=media_id, filename=filename, error=str(e))
+        logger.error(
+            "Failed to insert media file record",
+            media_id=media_id,
+            filename=filename,
+            error=str(e),
+        )
         raise
 
+
+def lookup_mysocial_creator_for_media_ids(media_ids: List[str]) -> Optional[str]:
+    """
+    Return first non-empty creator_address among catalog rows.
+
+    Enables mapping matched media_id → on-chain attribution address once rows are labeled.
+    Video frame ids (suffix \"_frame_<n>\") are expanded to their parent media_id so
+    creator_address stored on the parent row resolves correctly.
+    """
+    from app.services.poc_media_ids import expand_media_ids_for_creator_lookup
+
+    ids = expand_media_ids_for_creator_lookup(media_ids)
+    if not ids:
+        return None
+    try:
+        placeholders = ",".join(["%s"] * len(ids))
+        sql = f"""
+            SELECT creator_address FROM media_files
+            WHERE media_id IN ({placeholders})
+              AND creator_address IS NOT NULL
+              AND TRIM(creator_address) <> ''
+            LIMIT 1
+        """
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, tuple(ids))
+                row = cur.fetchone()
+                if row and row[0]:
+                    return str(row[0]).strip()
+    except Exception as e:
+        logger.warning(
+            "lookup_mysocial_creator_for_media_ids failed",
+            error=str(e),
+            media_sample=ids[:3],
+        )
+    return None
+
+
 def update_media_file_status(
+
     media_id: str, 
     status: str, 
     storage_uri: Optional[str] = None,
@@ -579,8 +639,8 @@ def get_similarity_matches(
 def insert_attribution_record(
     media_id: str,
     attribution_type: str = "original",
-    blockchain_tx_hash: Optional[str] = None,
-    blockchain_address: Optional[str] = None,
+    tx_hash: Optional[str] = None,
+    wallet_address: Optional[str] = None,
     proof_data: Optional[Dict] = None
 ):
     """Insert a blockchain attribution record with normalized columns."""
@@ -591,10 +651,10 @@ def insert_attribution_record(
     high_confidence_matches = proof_data.get('high_confidence_matches', 0) if proof_data else 0
     max_similarity_score = proof_data.get('max_similarity_score', 0.0) if proof_data else 0.0
     processing_time_ms = proof_data.get('processing_time_ms', 0.0) if proof_data else 0.0
-    
+
     sql = """
     INSERT INTO attribution_records (
-        id, media_id, blockchain_tx_hash, blockchain_address, 
+        id, media_id, tx_hash, wallet_address, 
         attribution_type, proof_data,
         file_hash, media_type, matches_found, high_confidence_matches,
         max_similarity_score, processing_time_ms
@@ -605,7 +665,7 @@ def insert_attribution_record(
         with get_db_connection() as conn:
             with conn.cursor() as cur:
                 cur.execute(sql, (
-                    media_id, blockchain_tx_hash, blockchain_address,
+                    media_id, tx_hash, wallet_address,
                     attribution_type, extras.Json(proof_data) if proof_data else None,
                     file_hash, media_type, matches_found, high_confidence_matches,
                     max_similarity_score, processing_time_ms
@@ -624,7 +684,7 @@ def insert_attribution_record(
 def get_attribution_records(media_id: str) -> List[Dict]:
     """Get attribution records for a media file."""
     sql = """
-    SELECT blockchain_tx_hash, blockchain_address, attribution_type, 
+    SELECT tx_hash, wallet_address, attribution_type, 
            proof_data, created_at
     FROM attribution_records 
     WHERE media_id = %s

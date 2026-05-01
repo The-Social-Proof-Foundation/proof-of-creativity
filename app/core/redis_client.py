@@ -49,10 +49,10 @@ class RedisCache:
             logger.error("Redis initialization failed", error=str(e))
             logger.warning("Continuing without Redis cache")
     
-    # === Audio Fingerprint Caching ===
-    
+    # === Audio Fingerprint Redis helpers (informational cache only; similarity uses PostgreSQL blobs) ===
+
     def cache_fingerprint(self, fp_hash: str, media_id: str, offset: float = 0.0, ttl: int = 86400):
-        """Cache audio fingerprint lookup (1 day TTL)"""
+        """Legacy SET helper — oracle similarity does not read this for authoritative matching."""
         if not self.enabled:
             return False
         
@@ -73,7 +73,7 @@ class RedisCache:
             return False
     
     def get_fingerprint_matches(self, fp_hash: str) -> List[tuple]:
-        """Get cached fingerprint matches (fast lookup)"""
+        """Legacy read — prefer PostgreSQL search_fingerprint_rows for similarity candidates."""
         if not self.enabled:
             return None
         

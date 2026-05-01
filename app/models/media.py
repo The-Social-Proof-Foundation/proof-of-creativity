@@ -35,15 +35,11 @@ class MediaFileBase(BaseModel):
 
 class MediaFileCreate(MediaFileBase):
     """Model for creating a new media file record."""
-    upload_user_id: Optional[str] = Field(None, description="ID of the uploading user")
-    upload_ip: Optional[str] = Field(None, description="IP address of uploader")
 
 class MediaFile(MediaFileBase):
     """Complete media file model with all fields."""
     media_id: str = Field(..., description="Unique identifier for the media")
     storage_uri: Optional[str] = Field(None, description="Storage URI (GCS/Walrus)")
-    upload_user_id: Optional[str] = Field(None, description="ID of the uploading user")
-    upload_ip: Optional[str] = Field(None, description="IP address of uploader")
     status: ProcessingStatus = Field(default=ProcessingStatus.PROCESSING)
     processing_results: Optional[Dict[str, Any]] = Field(default=None)
     created_at: datetime = Field(default_factory=datetime.utcnow)
@@ -87,8 +83,8 @@ class AttributionRecordBase(BaseModel):
 class AttributionRecord(AttributionRecordBase):
     """Complete attribution record model."""
     id: Optional[str] = Field(None, description="Unique attribution ID")
-    blockchain_tx_hash: Optional[str] = Field(None, description="Blockchain transaction hash")
-    blockchain_address: Optional[str] = Field(None, description="Blockchain address")
+    tx_hash: Optional[str] = Field(None, description="Transaction hash (on-chain submission)")
+    wallet_address: Optional[str] = Field(None, description="Wallet address associated with attribution")
     proof_data: Optional[Dict[str, Any]] = Field(default=None, description="Proof data")
     created_at: datetime = Field(default_factory=datetime.utcnow)
 

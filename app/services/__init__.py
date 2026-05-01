@@ -1,7 +1,6 @@
 """
-Media processing services for embedding, fingerprinting, and video processing.
-"""
+Media processing services (embedding, fingerprinting, video processing).
 
-from .embedding import *
-from .fingerprint import *
-from .video_processing import * 
+Heavy modules are imported from their concrete submodules — not re-exported here —
+so importing lightweight helpers does not pull in optional GPU/torch stacks.
+"""

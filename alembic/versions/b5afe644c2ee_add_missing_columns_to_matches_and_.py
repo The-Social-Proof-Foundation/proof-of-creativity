@@ -27,7 +27,13 @@ def upgrade() -> None:
     op.add_column('attribution_records', sa.Column('high_confidence_matches', sa.Integer(), nullable=True))
     op.add_column('attribution_records', sa.Column('max_similarity_score', sa.Float(), nullable=True))
     op.add_column('attribution_records', sa.Column('processing_time_ms', sa.Float(), nullable=True))
-    op.drop_index(op.f('idx_media_embeddings_vector_hnsw'), table_name='media_embeddings', postgresql_with={'m': '16', 'ef_construction': '64'}, postgresql_using='hnsw')
+    op.drop_index(
+        op.f("idx_media_embeddings_vector_hnsw"),
+        table_name="media_embeddings",
+        postgresql_with={"m": "16", "ef_construction": "64"},
+        postgresql_using="hnsw",
+        if_exists=True,
+    )
     op.add_column('similarity_matches', sa.Column('match_category', sa.String(length=50), nullable=True))
     op.add_column('similarity_matches', sa.Column('embedding_type', sa.String(length=50), nullable=True))
     op.add_column('similarity_matches', sa.Column('fingerprint_hash', sa.String(length=128), nullable=True))

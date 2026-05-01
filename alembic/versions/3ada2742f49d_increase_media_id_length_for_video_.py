@@ -37,7 +37,13 @@ def upgrade() -> None:
                existing_type=sa.VARCHAR(length=36),
                type_=sa.String(length=100),
                existing_nullable=False)
-    op.drop_index(op.f('idx_media_embeddings_vector_hnsw'), table_name='media_embeddings', postgresql_with={'m': '16', 'ef_construction': '64'}, postgresql_using='hnsw')
+    op.drop_index(
+        op.f("idx_media_embeddings_vector_hnsw"),
+        table_name="media_embeddings",
+        postgresql_with={"m": "16", "ef_construction": "64"},
+        postgresql_using="hnsw",
+        if_exists=True,
+    )
     op.alter_column('media_files', 'media_id',
                existing_type=sa.VARCHAR(length=36),
                type_=sa.String(length=100),

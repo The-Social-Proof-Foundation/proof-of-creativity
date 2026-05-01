@@ -178,6 +178,33 @@ curl -X POST "http://localhost:8000/upload" \
   -F "file=@your-image.jpg"
 ```
 
+### MySocial Proof of Creativity (oracle)
+
+**Roles:** this service is the **oracle**: it fingerprints media, computes similarity, resolves **`original_creator`** from `media_files.creator_address` (including video frame ids mapped to parent media), maps scores to **integer 0–100** for Move, and submits `analyze_and_update_post` or `analyze_and_update_post_sync_token_pool`. The **chain** applies thresholds and mints/redirects; the **indexer** (separate Postgres) ingests events—keep scores and redirect percentages ≤ 100 so redirection events index cleanly.
+
+When `MYSO_INTEGRATION_ENABLED=true`, the service submits Move entries as above when **`MYSO_TOKEN_REGISTRY_ID`** and a per-post **`spt_pool_id`** (query param or inferred from the post object) are available for the sync variant. Required object IDs include **`MYSO_POC_VAULT_DIRECTORY_ID`** in addition to package, config, and registry. If the post has no token pool but you call the sync entry, expect on-chain abort (e.g. `ENoTokenPoolForPost`); the plain `analyze_and_update_post` path is used when pool + token registry are not both configured.
+
+**Chain submission checklist (actually hitting Move):**
+
+1. Set **`MYSO_INTEGRATION_ENABLED=true`** and fill **`MYSO_POC_PACKAGE_ID`**, **`MYSO_POC_CONFIG_ID`**, **`MYSO_POC_REGISTRY_ID`**, **`MYSO_POC_VAULT_DIRECTORY_ID`**, **`MYSOCIAL_RPC_URL`**, and oracle key (**`MYSO_ORACLE_PRIVATE_KEY`** or mnemonic via `myso_wallet`).
+2. Ensure the signing address matches **`PoCConfig.oracle_address`** on chain (use **`MYSO_POC_STRICT_ORACLE=true`** to fail client init if it does not).
+3. Pass **`post_id`** on **`POST /upload`** or **`POST /upload/stream`**; without it, the API only runs similarity + DB attribution and **does not** submit a PoC transaction.
+4. Optionally set **`MYSO_POC_REQUIRE_TX_WHEN_POST_ID=true`** in production so a missing or failed submission returns **502** (sync) or marks the streaming job **failed** instead of completing with `tx_hash=null`.
+5. Optional **`MYSO_POC_FAIL_LIFESPAN_ON_MYS_MISCONFIG=true`**: refuse to boot if integration is on but the client cannot initialize (missing IDs, strict oracle, wallet error).
+6. **`GET /health`** includes a **`mysocial`** object (`integration_requested`, `client_active`, `oracle_authorized`, `ready_for_submission`). **`GET /readyz`** returns **503** when the database is down or when integration is requested but the oracle is not ready to submit.
+
+- **Prefetch:** uploads with `post_id` call `myso_getObject` and return **409** when the post still has active PoC data (`poc_outcome` ≠ none, populated redirect option, badge snapshot/object). After a dispute **clear**, fields are empty and analysis may run again. Set **`MYSO_POC_ALLOW_FORCE_RESUBMIT=true`** *and* pass `force_reanalyze=true` only for controlled operator reruns (bypasses that preflight).
+- **`MYSO_POC_REDIRECT_TARGET`:** `wallet` (0) vs `escrow` (1) for Move `derivative_redirection_target`.
+- **`MYSO_POC_CONFIG_CACHE_TTL_SECONDS`:** how long parsed `PoCConfig` stays in memory before refreshing from RPC (limits, thresholds, `max_reasoning_length`, etc.).
+
+**Upload query parameters:** `post_id`, optional `spt_pool_id`, `force_reanalyze`, optional `creator_address` (stored on `media_files` for **`original_creator`** resolution from matched corpus ids), **`royalty_free`** (explicit on-chain outcome 4 when PoC integration is enabled), and `upload_to_stream` on `/upload`.
+
+**Responses:** `UploadResponse` includes **`poc_chain_summary`** (media type code, score %, effective threshold %, whether the derivative-redirect path would apply, explicit-outcome flags). Each **`MediaMatch`** includes optional **`similarity_score_percent`** (0–100, same rounding as Move) alongside **`similarity_score`** (0–1 float). Video responses include **`video_attestation`** (visual vs embedded audio), aligned with Move’s **`embedded_audio_only_derivative`**.
+
+**Persistence:** `attribution_records.proof_data` stores **`poc_submission`** (Move args + `move_function`, `resolved_spt_pool_id`, `derivative_redirection_target`, `tx_hash` when submitted), **`poc_chain_summary`**, **`max_similarity_score_u64`**, **`effective_threshold_u64`**, and **`royalty_free_requested`**. Streaming uploads mirror **`poc_submission`** / **`poc_chain_summary`** on Redis completion for WebSocket/HTTP progress clients.
+
+See `env.example` for variable names and `app/config.py` for defaults.
+
 ## 📋 API Endpoints
 
 ### Core Endpoints
@@ -185,7 +212,8 @@ curl -X POST "http://localhost:8000/upload" \
 | Method | Endpoint | Description |
 |--------|----------|-------------|
 | `GET` | `/` | API information |
-| `GET` | `/health` | System health check |
+| `GET` | `/health` | System health check (includes `mysocial` payload when available) |
+| `GET` | `/readyz` | Readiness probe: DB + optional MySocial oracle gate (**503** if not ready) |
 | `POST` | `/upload` | Upload and analyze media |
 | `GET` | `/media/{id}/matches` | Get similarity matches |
 | `GET` | `/stats` | System statistics |
@@ -244,6 +272,35 @@ Implements Shazam-style spectral peak pair hashing:
 4. **Hash Generation** - Frequency pair + time delta hashing
 5. **Matching** - Time offset clustering for robustness
 
+**Pipeline:** Steps **1–4** run together in one analysis pass per audio file (`AudioFingerprinter.fingerprint_audio`). Step **5** is separate: it runs at similarity time when `match_fingerprints` compares the query constellation to unpickled `fingerprint_data` from corpus candidates (`verify_constellation_against_blob` → `find_verified_fingerprint_hits`). **Mel fallback:** If `fingerprint_audio_with_blob` catches an error from that primary pipeline, it stores a coarse mel-hash and an **empty** constellation pickle—steps **2–4** are skipped and step **5** verification cannot run for that artifact until a full fingerprint succeeds.
+
+**Query-time behavior:** Steps **1–4** run on every uploaded or embedded audio track. The oracle stores a composite lookup key (`fp_hash`) plus pickled constellation tuples in `audio_fingerprints.fingerprint_data`. Similarity search loads **candidates** that share that `fp_hash`, then applies **step 5** (`match_fingerprints`): agreeing sub-hashes vote on a time offset, and a corpus hit is recorded only after this verification. Reported fingerprint similarity comes from verified confidence (not from “same fp_hash” alone). PostgreSQL holds authoritative rows and blobs; any Redis fingerprint keys are non-authoritative legacy cache.
+
+| Step | Responsibility |
+|------|----------------|
+| 1–4 (ingest + query audio) | [`app/services/fingerprint.py`](app/services/fingerprint.py) (`AudioFingerprinter`, `fingerprint_audio_with_blob`) |
+| Candidate rows | [`app/core/database.py`](app/core/database.py) `search_fingerprint_rows` |
+| Step 5 verify | [`app/services/fingerprint.py`](app/services/fingerprint.py) (`verify_constellation_against_blob`, `find_verified_fingerprint_hits`, …) |
+
+#### Inspecting `audio_fingerprints` in PostgreSQL
+
+- **`fp_hash`** — Exactly **40 hexadecimal characters** (SHA-1 digest). This is the stable lookup key you compare across rows or logs.
+- **`fingerprint_data`** — **`BYTEA`**: Python **pickle** of constellation tuples. Tools that show BYTEA as hex often display only the first bytes — strings like **`80055D942E`** are typically **pickle protocol framing**, not a second “fingerprint ID”. Ignore short hex previews here; rely on **`fp_hash`** or decode blobs only via [`unpickle_fingerprint_hashes`](app/services/fingerprint.py) in application code.
+
+Sanity check on a row:
+
+```sql
+SELECT fp_hash,
+       length(fp_hash) AS fp_hash_len,
+       octet_length(fingerprint_data) AS blob_octets,
+       encode(substring(fingerprint_data from 1 for 8), 'hex') AS blob_prefix_hex
+FROM audio_fingerprints
+ORDER BY created_at DESC
+LIMIT 5;
+```
+
+Expect **`fp_hash_len = 40`**. **`blob_prefix_hex`** starting with `8005` / `8004` is normal for pickle; it is not meant to equal `fp_hash`.
+
 ### Multi-Modal Processing Pipeline
 
 ```mermaid
@@ -254,11 +311,12 @@ graph TD
     B -->|Video| E[Frame + Audio Extract]
     
     C --> F[Vector Search]
-    D --> G[Hash Lookup]
+    D --> G[Candidate lookup by fp_hash]
+    G --> V[Constellation verify + offset clustering]
+    V --> I[Similarity Matches]
     E --> H[Batch Process]
     
-    F --> I[Similarity Matches]
-    G --> I
+    F --> I
     H --> I
     
     I --> J[Confidence Scoring]

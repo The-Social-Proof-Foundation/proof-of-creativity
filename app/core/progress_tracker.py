@@ -56,7 +56,7 @@ class ProgressTracker:
                 "created_at": time.time(),
                 "updated_at": time.time(),
                 "error": None,
-                "blockchain_tx_hash": None,
+                "tx_hash": None,
                 "matches_found": 0,
                 "attribution_type": None,
             }
@@ -89,7 +89,7 @@ class ProgressTracker:
             progress_percent: Progress percentage (0-100)
             message: Status message
             error: Error message if failed
-            **kwargs: Additional fields (blockchain_tx_hash, matches_found, etc.)
+            **kwargs: Additional fields (tx_hash, matches_found, etc.)
         """
         if not self.redis or not self.redis.enabled:
             return False
@@ -157,18 +157,34 @@ class ProgressTracker:
         storage_uri: str,
         matches_found: int,
         attribution_type: str,
-        blockchain_tx_hash: Optional[str] = None
+        tx_hash: Optional[str] = None,
+        video_attestation: Optional[Dict[str, Any]] = None,
+        poc_submission: Optional[Dict[str, Any]] = None,
+        poc_chain_summary: Optional[Dict[str, Any]] = None,
+        completion_message: Optional[str] = None,
+        chain_submission_error: Optional[str] = None,
     ) -> bool:
-        """Mark upload as complete with final results"""
+        """Mark upload as complete with final results."""
+        extra: Dict[str, Any] = {}
+        if video_attestation is not None:
+            extra["video_attestation"] = video_attestation
+        if poc_submission is not None:
+            extra["poc_submission"] = poc_submission
+        if poc_chain_summary is not None:
+            extra["poc_chain_summary"] = poc_chain_summary
+        if chain_submission_error is not None:
+            extra["chain_submission_error"] = chain_submission_error
+        message = completion_message or "Upload complete!"
         return self.update_progress(
             upload_id=upload_id,
             stage=UploadStage.COMPLETE,
             progress_percent=100,
-            message="Upload complete!",
+            message=message,
             storage_uri=storage_uri,
             matches_found=matches_found,
             attribution_type=attribution_type,
-            blockchain_tx_hash=blockchain_tx_hash
+            tx_hash=tx_hash,
+            **extra,
         )
     
     def mark_failed(self, upload_id: str, error: str, retry: bool = True) -> bool:

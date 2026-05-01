@@ -3,7 +3,7 @@ SQLAlchemy database models - the single source of truth for database schema.
 Similar to Diesel schema in Rust - migrations are auto-generated from these models.
 """
 from sqlalchemy import Column, String, Integer, BigInteger, Float, DateTime, Text, LargeBinary, Index
-from sqlalchemy.dialects.postgresql import UUID, JSONB, INET
+from sqlalchemy.dialects.postgresql import UUID, JSONB
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.sql import func
 from pgvector.sqlalchemy import Vector  # pgvector extension
@@ -23,9 +23,9 @@ class MediaFile(Base):
     storage_uri = Column(Text)
     streaming_uri = Column(Text)  # Cloudflare Stream URI for video streaming (optional, opt-in)
     file_hash = Column(String(128))
-    upload_user_id = Column(String(100))  # Increased for consistency
-    upload_ip = Column(INET)
+    creator_address = Column(String(128))  # MySocial wallet mapped for PoC original_creator lookups
     status = Column(String(20), default='processing')
+
     processing_results = Column(JSONB, default={})
     matches_found = Column(Integer, default=0)  # Number of similarity matches
     processing_time_ms = Column(Float, default=0.0)  # Processing time in milliseconds
@@ -126,8 +126,8 @@ class AttributionRecord(Base):
     
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     media_id = Column(String(100), nullable=False)  # Increased for video frames
-    blockchain_tx_hash = Column(String(128))
-    blockchain_address = Column(String(128))
+    tx_hash = Column(String(128))
+    wallet_address = Column(String(128))
     attribution_type = Column(String(50))  # 'original', 'derivative', 'remix'
     proof_data = Column(JSONB, default={})
     file_hash = Column(String(128))  # SHA-256 hash of file
@@ -140,6 +140,6 @@ class AttributionRecord(Base):
     
     __table_args__ = (
         Index('idx_attribution_records_media', 'media_id', 'created_at'),
-        Index('idx_attribution_records_blockchain', 'blockchain_tx_hash'),
+        Index('idx_attribution_records_blockchain', 'tx_hash'),
     )
 
