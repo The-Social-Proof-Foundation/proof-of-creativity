@@ -38,6 +38,25 @@ def _move_option_vector_string(urls: Optional[List[str]]):
     return [urls]
 
 
+def _normalize_object_id(obj_id: str) -> str:
+    """Pad short object ids (e.g. 0x6) to 32-byte hex for RPC move calls."""
+    raw = obj_id.strip().lower()
+    if not raw.startswith("0x"):
+        raw = f"0x{raw}"
+    hex_part = raw[2:]
+    if len(hex_part) < 64:
+        hex_part = hex_part.zfill(64)
+    return f"0x{hex_part}"
+
+
+def _clock_object_id() -> str:
+    return _normalize_object_id(os.getenv("MYSO_CLOCK_OBJECT_ID", "0x6"))
+
+
+def _similarity_score_u64(score: int) -> str:
+    return str(int(max(0, min(100, score))))
+
+
 def _parse_po_u8(val: Any, default: int = 0) -> int:
     if val is None:
         return default
@@ -323,9 +342,8 @@ class MySocialClient:
         derivative_target = derivative_redirection_target if derivative_redirection_target is not None else self.redirect_target
 
         tail = [
-            post_id,
             media_type,
-            int(max(0, min(100, highest_similarity_score))),
+            _similarity_score_u64(highest_similarity_score),
             _move_option_address(original_creator),
             derivative_target,
             bool(embedded_audio_only_derivative),
@@ -333,6 +351,7 @@ class MySocialClient:
             int(explicit_poc_outcome),
             _move_option_string(reasoning),
             _move_option_vector_string(evidence_urls or None),
+            _clock_object_id(),
         ]
 
         sync_ok = resolved_pool is not None and self.token_registry_id and self.registry_id
@@ -350,7 +369,7 @@ class MySocialClient:
                     self.vault_directory_id,
                     post_id,
                     resolved_pool,
-                    *tail[1:],
+                    *tail,
                 ],
             }
         else:
@@ -369,42 +388,69 @@ class MySocialClient:
                     self.config_id,
                     self.registry_id,
                     self.vault_directory_id,
+                    post_id,
                     *tail,
                 ],
             }
 
-        tx_data = {
-            "kind": "moveCall",
-            "data": data,
-            "sender": self.wallet.get_address(),
-            "gasBudget": os.getenv("MYSO_POC_GAS_BUDGET", "30000000"),
-            "gasPrice": os.getenv("MYSO_POC_GAS_PRICE", "1000"),
-        }
-
-        signature = self.wallet.sign_transaction(json.dumps(tx_data).encode())
-        result = self._submit_transaction(tx_data, signature)
+        result = self._submit_move_call(data)
         result["move_function"] = data["function"]
         result["resolved_spt_pool_id"] = resolved_pool if sync_ok else None
         result["derivative_redirection_target"] = derivative_target
         return result
 
-    def _submit_transaction(self, tx_data: dict, signature: str) -> dict:
+    def _build_unsigned_move_call(self, move_call_data: dict, sender: str) -> dict:
+        rpc_request = {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "unsafe_moveCall",
+            "params": [
+                sender,
+                move_call_data["packageObjectId"],
+                move_call_data["module"],
+                move_call_data["function"],
+                move_call_data.get("typeArguments", []),
+                move_call_data["arguments"],
+                None,
+                os.getenv("MYSO_POC_GAS_BUDGET", "30000000"),
+            ],
+        }
+        response = self.session.post(self.rpc_url, json=rpc_request, timeout=60)
+        response.raise_for_status()
+        result = response.json()
+        if "error" in result:
+            error_msg = result.get("error", {})
+            logger.error("Failed to build unsigned transaction", error=json.dumps(error_msg, indent=2))
+            raise RuntimeError(str(error_msg))
+        return result["result"]
+
+    def _submit_move_call(self, move_call_data: dict, *, wallet: Optional[MySocialWallet] = None) -> dict:
+        signer = wallet or self.wallet
+        built = self._build_unsigned_move_call(move_call_data, signer.get_address())
+        signature_b64 = signer.sign_transaction_block_b64(built["txBytes"])
+        return self._execute_transaction_bytes(built["txBytes"], signature_b64, move_call_data)
+
+    def _execute_transaction_bytes(
+        self,
+        tx_bytes_b64: str,
+        signature_b64: str,
+        move_call_data: dict,
+    ) -> dict:
         rpc_request = {
             "jsonrpc": "2.0",
             "id": 1,
             "method": "myso_executeTransactionBlock",
             "params": [
-                tx_data,
-                [signature],
+                tx_bytes_b64,
+                [signature_b64],
                 {"showInput": True, "showEffects": True, "showEvents": True},
             ],
         }
-        tx_call_data = tx_data.get("data", {})
         logger.info(
             "🚀 SUBMITTING PROOF_OF_CREATIVITY TRANSACTION TO BLOCKCHAIN",
             package_id=self.package_id,
-            module=tx_call_data.get("module"),
-            function=tx_call_data.get("function"),
+            module=move_call_data.get("module"),
+            function=move_call_data.get("function"),
             rpc_endpoint=self.rpc_url,
             oracle_address=self.wallet.get_address(),
         )
@@ -434,6 +480,11 @@ class MySocialClient:
             "status": tx_status,
             "events": tx_result.get("events", []),
         }
+
+    def _submit_transaction(self, tx_data: dict, signature: str | None = None) -> dict:
+        """Submit a move call using the transaction builder + BCS execute path."""
+        move_call_data = tx_data.get("data", tx_data)
+        return self._submit_move_call(move_call_data)
 
     def verify_oracle_authorization(self) -> bool:
         """Check if wallet is oracle in cached PoCConfig."""

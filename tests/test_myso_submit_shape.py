@@ -19,8 +19,8 @@ def poc_env_base(monkeypatch):
 def test_submit_poc_plain_move_call_argument_count(poc_env_base):
     captured = []
 
-    def fake_submit(self, tx_data, signature):
-        captured.append(tx_data)
+    def fake_submit(self, move_call_data):
+        captured.append(move_call_data)
         return {
             "success": True,
             "tx_hash": "0xdigest",
@@ -31,7 +31,7 @@ def test_submit_poc_plain_move_call_argument_count(poc_env_base):
     wallet = MagicMock()
     wallet.get_address.return_value = "0xoracle"
 
-    with patch.object(MySocialClient, "_submit_transaction", fake_submit):
+    with patch.object(MySocialClient, "_submit_move_call", fake_submit):
         with patch.object(MySocialClient, "fetch_post_fields", lambda self, pid: ({}, None)):
             client = MySocialClient(wallet=wallet)
             client.submit_poc_analysis(
@@ -48,18 +48,18 @@ def test_submit_poc_plain_move_call_argument_count(poc_env_base):
                 spt_pool_id=None,
             )
 
-    mc = captured[0]["data"]
+    mc = captured[0]
     assert mc["module"] == "proof_of_creativity"
     assert mc["function"] == "analyze_and_update_post"
-    assert len(mc["arguments"]) == 13
+    assert len(mc["arguments"]) == 14
 
 
 def test_submit_poc_sync_move_call_argument_count(poc_env_base, monkeypatch):
     monkeypatch.setenv("MYSO_TOKEN_REGISTRY_ID", "0xtokenregistry")
     captured = []
 
-    def fake_submit(self, tx_data, signature):
-        captured.append(tx_data)
+    def fake_submit(self, move_call_data):
+        captured.append(move_call_data)
         return {
             "success": True,
             "tx_hash": "0xdigest2",
@@ -70,7 +70,7 @@ def test_submit_poc_sync_move_call_argument_count(poc_env_base, monkeypatch):
     wallet = MagicMock()
     wallet.get_address.return_value = "0xoracle"
 
-    with patch.object(MySocialClient, "_submit_transaction", fake_submit):
+    with patch.object(MySocialClient, "_submit_move_call", fake_submit):
         with patch.object(MySocialClient, "fetch_post_fields", lambda self, pid: ({}, None)):
             client = MySocialClient(wallet=wallet)
             client.submit_poc_analysis(
@@ -81,6 +81,6 @@ def test_submit_poc_sync_move_call_argument_count(poc_env_base, monkeypatch):
                 spt_pool_id="0xpool",
             )
 
-    mc = captured[0]["data"]
+    mc = captured[0]
     assert mc["function"] == "analyze_and_update_post_sync_token_pool"
-    assert len(mc["arguments"]) == 15
+    assert len(mc["arguments"]) == 16

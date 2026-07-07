@@ -1,22 +1,20 @@
-# Multi-stage build for optimized production image
-FROM python:3.10-slim as builder
+# Multi-stage build for PoC oracle (Python 3.10 — matches production/Railway)
+FROM python:3.10-slim AS builder
 
-# Install system dependencies for building packages
-RUN apt-get update && apt-get install -y \
+RUN apt-get update && apt-get install -y --no-install-recommends \
     gcc \
     g++ \
+    libffi-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Python dependencies
 WORKDIR /app
-COPY requirements.txt .
-RUN pip install --no-cache-dir --user -r requirements.txt
+COPY requirements.txt requirements-blockchain.txt ./
+RUN pip install --no-cache-dir --user -r requirements.txt \
+    && pip install --no-cache-dir --user -r requirements-blockchain.txt
 
-# Production stage
 FROM python:3.10-slim
 
-# Install runtime system dependencies
-RUN apt-get update && apt-get install -y \
+RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     libsndfile1 \
     libgl1 \
@@ -25,26 +23,25 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/* \
     && apt-get clean
 
-# Copy Python packages from builder
 COPY --from=builder /root/.local /root/.local
 
-# Create app directory and copy application code
 WORKDIR /app
 COPY . .
 
-# Create necessary directories
 RUN mkdir -p /app/uploads/image /app/uploads/audio /app/uploads/video \
-    && mkdir -p /tmp/proof-of-creativity
+    && mkdir -p /tmp/proof-of-creativity \
+    && mkdir -p /app/data/blobs
 
-# Ensure the PATH includes user site-packages
-ENV PATH=/root/.local/bin:$PATH
+ENV PATH=/root/.local/bin:$PATH \
+    PYTHONPATH=/app \
+    PYTHONUNBUFFERED=1 \
+    API_HOST=0.0.0.0 \
+    API_PORT=8000 \
+    PORT=8000
 
-# Expose port (Railway sets PORT env var)
-EXPOSE 8080
+EXPOSE 8000
 
-# Health check using Python
-HEALTHCHECK --interval=30s --timeout=30s --start-period=5s --retries=3 \
-    CMD python -c "import os, urllib.request; urllib.request.urlopen('http://localhost:' + os.getenv('PORT', '8080') + '/health')" || exit 1
+HEALTHCHECK --interval=30s --timeout=10s --start-period=120s --retries=3 \
+    CMD python -c "import os, urllib.request; urllib.request.urlopen('http://127.0.0.1:' + os.getenv('PORT', '8000') + '/health', timeout=5)" || exit 1
 
-# Start using Python directly (reads PORT from environment in app/main.py)
-CMD ["python", "-m", "app.main"]
+CMD ["python", "scripts/run_api.py"]

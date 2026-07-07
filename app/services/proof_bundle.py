@@ -1,0 +1,69 @@
+"""Proof bundle generation and storage."""
+
+from __future__ import annotations
+
+import json
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+import structlog
+
+from app.network_config import NetworkProfile, ROOT_DIR, load_network_profile
+from app.services.decision_engine import PoCSubmission
+from app.services.analysis.pipeline import AnalysisResult
+
+logger = structlog.get_logger()
+
+
+class ProofBundleService:
+    def __init__(self, network: str) -> None:
+        self.network = network
+        self.profile: NetworkProfile = load_network_profile(network)
+
+    def build_bundle(
+        self,
+        post: dict[str, Any],
+        analysis: AnalysisResult,
+        submission: PoCSubmission,
+        *,
+        tx_digest: str | None = None,
+    ) -> dict[str, Any]:
+        return {
+            "version": 1,
+            "network": self.network,
+            "post_id": analysis.post_id,
+            "media_url": analysis.media_url,
+            "media_type": analysis.media_type,
+            "analysis": {
+                "media_id": analysis.media_id,
+                "highest_similarity_u64": analysis.highest_similarity_u64,
+                "match_count": len(analysis.matches),
+                "off_network": analysis.off_network,
+                "identity_hash": analysis.identity_hash,
+            },
+            "submission": {
+                "highest_similarity_score": submission.highest_similarity_score,
+                "original_creator": submission.original_creator,
+                "derivative_redirection_target": submission.derivative_redirection_target,
+                "embedded_audio_only_derivative": submission.embedded_audio_only_derivative,
+                "reasoning": submission.reasoning,
+            },
+            "tx_digest": tx_digest,
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+    def store(self, bundle: dict[str, Any]) -> str:
+        storage = self.profile.storage
+        base = Path(storage.local_path)
+        if not base.is_absolute():
+            base = ROOT_DIR / base
+        base.mkdir(parents=True, exist_ok=True)
+        name = f"{self.network}_{bundle['post_id']}_{uuid.uuid4().hex[:8]}.json"
+        path = base / name
+        path.write_text(json.dumps(bundle, indent=2), encoding="utf-8")
+        uri = f"file://{path}"
+        if storage.use_walrus and not storage.use_local:
+            logger.info("Walrus upload stub; stored locally", network=self.network, uri=uri)
+        return uri

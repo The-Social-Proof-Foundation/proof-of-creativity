@@ -130,8 +130,10 @@ async def lifespan(app: FastAPI):
             logger.warning("Could not create vector indexes", error=str(e))
         
         # Step 5: Initialize MySocial blockchain client (optional)
+        from app.network_config import bootstrap_active_network_sessions
         from app.services.myso_client import init_myso_client
 
+        bootstrap_active_network_sessions()
         myso_client = init_myso_client()
         if myso_client:
             logger.info("✅ MySocial blockchain integration enabled")
@@ -159,6 +161,16 @@ async def lifespan(app: FastAPI):
             logger.info("Database connection verified")
         else:
             logger.warning("Database connection check failed")
+
+        # Oracle WebSocket event bus → hub fan-out
+        from app.api.ws.hub import ws_hub
+        from app.services.events import event_bus
+
+        async def _forward_to_ws(event_type: str, message: dict) -> None:
+            await ws_hub.broadcast(event_type, message)
+
+        event_bus.subscribe_all(_forward_to_ws)
+        logger.info("✅ Oracle WebSocket event bus wired")
             
     except Exception as e:
         logger.error("Failed to initialize application", error=str(e))
@@ -194,6 +206,12 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+from app.api.rest.routes import router as oracle_rest_router
+from app.api.ws.routes import router as oracle_ws_router
+
+app.include_router(oracle_rest_router)
+app.include_router(oracle_ws_router)
 
 # Configuration constants
 MAX_FILE_SIZE = int(os.getenv("MAX_FILE_SIZE", 100 * 1024 * 1024))  # 100MB default

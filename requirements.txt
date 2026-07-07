@@ -36,12 +36,9 @@ google-cloud-storage>=2.10.0
 boto3>=1.29.0  # For S3-compatible storage
 requests>=2.31.0
 
-# Blockchain/Crypto for MySocial integration (custom derivation paths)
-eth-account>=0.9.0  # secp256k1 signing
-ecdsa>=0.18.0  # secp256r1 (P-256) signing
-bip-utils>=2.9.0  # BIP32/BIP44 HD wallet with MySocial paths
-cryptography>=41.0.0  # Crypto primitives
-pynacl>=1.5.0  # Ed25519 signing
+# Blockchain/Crypto — install separately on Python 3.10–3.13:
+#   pip install -r requirements-blockchain.txt
+# (coincurve/bip-utils do not build on Python 3.14+ yet)
 
 # Development and testing
 pytest>=7.4.3
@@ -54,6 +51,7 @@ python-json-logger>=2.0.7
 
 # Environment management
 python-dotenv>=1.0.0
+pyyaml>=6.0.1
 
 # Additional utilities
 python-multipart>=0.0.6  # For file uploads

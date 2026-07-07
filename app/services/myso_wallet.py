@@ -2,20 +2,24 @@
 MySocial Wallet and Transaction Signing
 Supports MySocial-specific derivation paths and transaction signing
 """
+import base64
 import os
 import hashlib
-import hmac
 import struct
-from typing import Optional, Union
+from typing import Optional
 import structlog
 from eth_account import Account
 from ecdsa import SigningKey, SECP256k1, NIST256p
 from ecdsa.util import sigencode_string
-from bip_utils import Bip32Slip10Secp256k1, Bip32Slip10Nist256p1, Bip32Slip10Ed25519, Bip39SeedGenerator, Bip39MnemonicValidator
+from mnemonic import Mnemonic
 from nacl.signing import SigningKey as Ed25519SigningKey
 from nacl.encoding import RawEncoder
 
+from app.services.myso_bip32 import mysocial_ed25519_path, slip10_ed25519_derive
+
 logger = structlog.get_logger()
+
+_BIP39 = Mnemonic("english")
 
 class MySocialWallet:
     """
@@ -81,52 +85,60 @@ class MySocialWallet:
     
     def _init_from_mnemonic(self, mnemonic: str, account: int = 0, change: int = 0, address_index: int = 0):
         """Initialize wallet from mnemonic with MySocial derivation path"""
-        
-        # Validate mnemonic
-        if not Bip39MnemonicValidator().IsValid(mnemonic):
+        if not _BIP39.check(mnemonic):
             raise ValueError("Invalid BIP39 mnemonic")
-        
-        # Generate seed
-        seed = Bip39SeedGenerator(mnemonic).Generate()
-        
+
+        seed = _BIP39.to_seed(mnemonic)
+
         if self.curve == "ed25519":
-            # MySocial Ed25519 path: m/44'/6976'/{account}'/{change}'/{address}' (all hardened)
-            bip32_ctx = Bip32Slip10Ed25519.FromSeed(seed)
-            
-            # Derive following MySocial path
-            bip32_ctx = bip32_ctx.ChildKey(44 + 0x80000000)  # 44' (hardened)
-            bip32_ctx = bip32_ctx.ChildKey(6976 + 0x80000000)  # 6976' (hardened) - MySocial coin type
-            bip32_ctx = bip32_ctx.ChildKey(account + 0x80000000)  # account' (hardened)
-            bip32_ctx = bip32_ctx.ChildKey(change + 0x80000000)  # change' (hardened)
-            bip32_ctx = bip32_ctx.ChildKey(address_index + 0x80000000)  # address' (hardened)
-            
-        elif self.curve == "secp256k1":
-            # MySocial secp256k1 path: m/54'/6976'/{account}'/{change}/{address}
-            bip32_ctx = Bip32Slip10Secp256k1.FromSeed(seed)
-            
-            # Derive following MySocial path
-            bip32_ctx = bip32_ctx.ChildKey(54 + 0x80000000)  # 54' (hardened)
-            bip32_ctx = bip32_ctx.ChildKey(6976 + 0x80000000)  # 6976' (hardened) - MySocial coin type
-            bip32_ctx = bip32_ctx.ChildKey(account + 0x80000000)  # account' (hardened)
-            bip32_ctx = bip32_ctx.ChildKey(change)  # change (normal)
-            bip32_ctx = bip32_ctx.ChildKey(address_index)  # address (normal)
-            
-        elif self.curve == "secp256r1":
-            # MySocial secp256r1 path: m/74'/6976'/{account}'/{change}/{address}
-            bip32_ctx = Bip32Slip10Nist256p1.FromSeed(seed)
-            
-            # Derive following MySocial path
-            bip32_ctx = bip32_ctx.ChildKey(74 + 0x80000000)  # 74' (hardened)
-            bip32_ctx = bip32_ctx.ChildKey(6976 + 0x80000000)  # 6976' (hardened) - MySocial coin type
-            bip32_ctx = bip32_ctx.ChildKey(account + 0x80000000)  # account' (hardened)
-            bip32_ctx = bip32_ctx.ChildKey(change)  # change (normal)
-            bip32_ctx = bip32_ctx.ChildKey(address_index)  # address (normal)
+            path = mysocial_ed25519_path(account, change, address_index)
+            private_key_bytes = slip10_ed25519_derive(seed, path)
+            self.private_key_hex = "0x" + private_key_bytes.hex()
+        elif self.curve in ("secp256k1", "secp256r1"):
+            self.private_key_hex = self._derive_mnemonic_secp_via_bip_utils(
+                seed, account, change, address_index
+            )
         else:
             raise ValueError(f"Unsupported curve: {self.curve}")
-        
-        # Extract private key
-        self.private_key_hex = bip32_ctx.PrivateKey().Raw().ToHex()
+
         self._derive_address()
+
+    def _derive_mnemonic_secp_via_bip_utils(
+        self,
+        seed: bytes,
+        account: int,
+        change: int,
+        address_index: int,
+    ) -> str:
+        """
+        secp256k1/r1 mnemonic paths still rely on bip-utils (optional extra).
+        Oracle deployments should prefer MYSO_ORACLE_PRIVATE_KEY on Python 3.14+.
+        """
+        try:
+            from bip_utils import Bip32Slip10Nist256p1, Bip32Slip10Secp256k1
+        except ImportError as exc:
+            raise ImportError(
+                "Mnemonic derivation for secp256k1/secp256r1 requires bip-utils "
+                "(Python 3.10–3.13). Set MYSO_ORACLE_PRIVATE_KEY instead, or install "
+                "bip-utils in a Python 3.13 virtualenv."
+            ) from exc
+
+        if self.curve == "secp256k1":
+            bip32_ctx = Bip32Slip10Secp256k1.FromSeed(seed)
+            bip32_ctx = bip32_ctx.ChildKey(54 + 0x80000000)
+            bip32_ctx = bip32_ctx.ChildKey(6976 + 0x80000000)
+            bip32_ctx = bip32_ctx.ChildKey(account + 0x80000000)
+            bip32_ctx = bip32_ctx.ChildKey(change)
+            bip32_ctx = bip32_ctx.ChildKey(address_index)
+        else:
+            bip32_ctx = Bip32Slip10Nist256p1.FromSeed(seed)
+            bip32_ctx = bip32_ctx.ChildKey(74 + 0x80000000)
+            bip32_ctx = bip32_ctx.ChildKey(6976 + 0x80000000)
+            bip32_ctx = bip32_ctx.ChildKey(account + 0x80000000)
+            bip32_ctx = bip32_ctx.ChildKey(change)
+            bip32_ctx = bip32_ctx.ChildKey(address_index)
+
+        return bip32_ctx.PrivateKey().Raw().ToHex()
     
     def _derive_address(self):
         """Derive MySocial address from private key using BLAKE2b-256"""
@@ -185,6 +197,20 @@ class MySocialWallet:
             return self._sign_secp256r1(message)
         else:
             raise ValueError(f"Unsupported curve: {self.curve}")
+
+    def sign_transaction_block_b64(self, tx_bytes_b64: str) -> str:
+        """
+        Sign BCS-serialized transaction bytes for myso_executeTransactionBlock.
+
+        Returns a base64-encoded user signature: flag || signature || public_key.
+        """
+        intent = bytes([0, 0, 0])
+        message = intent + base64.b64decode(tx_bytes_b64)
+        signature_hex = self.sign_transaction(message)
+        signature_bytes = bytes.fromhex(signature_hex)
+        flag = {"ed25519": 0, "secp256k1": 1, "secp256r1": 2}[self.curve]
+        public_key_bytes = bytes.fromhex(self.get_public_key())
+        return base64.b64encode(bytes([flag]) + signature_bytes + public_key_bytes).decode()
     
     def _sign_ed25519(self, message: bytes) -> str:
         """Sign with Ed25519"""
@@ -249,10 +275,8 @@ class MySocialWallet:
     
     @staticmethod
     def generate_mnemonic() -> str:
-        """Generate a new BIP39 mnemonic"""
-        from bip_utils import Bip39MnemonicGenerator, Bip39WordsNum
-        mnemonic = Bip39MnemonicGenerator().FromWordsNumber(Bip39WordsNum.WORDS_NUM_24)
-        return str(mnemonic)
+        """Generate a new BIP39 mnemonic (24 words)."""
+        return _BIP39.generate(strength=256)
 
 
 def load_oracle_wallet() -> MySocialWallet:

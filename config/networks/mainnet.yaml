@@ -1,0 +1,33 @@
+network: mainnet
+rpc_url: https://fullnode.mainnet.mysocial.io
+grpc_url: https://fullnode.mainnet.mysocial.io:443
+grpc_tls: true
+chain_writes_enabled: false
+objects:
+  poc_package: ""
+  poc_config: ""
+  poc_registry: ""
+  poc_vault_directory: ""
+  token_registry: ""
+  username_beneficiary_directory: ""
+  username_beneficiary_shards: []
+  username_registry: ""
+  clock: "0x6"
+storage:
+  use_walrus: true
+  use_gcs: false
+  use_local: false
+  local_path: ./data/blobs
+  walrus_endpoint: https://api.walrus.xyz
+signers:
+  oracle_private_key_env: ORACLE_PRIVATE_KEY_MAINNET
+  admin_private_key_env: POC_ADMIN_PRIVATE_KEY_MAINNET
+grpc_sync:
+  mock_mode: false
+  sync_mode: checkpoint_v2
+  start_checkpoint: null
+  event_stream_id: ""
+  batch_size: 1000
+  poll_interval_seconds: 15
+  max_pagination_iterations: 50
+  checkpoint_catchup_batch_size: 10

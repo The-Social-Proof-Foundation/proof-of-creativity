@@ -1,0 +1,13 @@
+// Copyright (c) Mysten Labs, Inc.
+// Copyright (c) The Social Proof Foundation, LLC.
+// SPDX-License-Identifier: Apache-2.0
+
+syntax = "proto3";
+
+package myso.rpc.v2;
+
+enum ErrorReason {
+  ERROR_REASON_UNKNOWN = 0;
+  FIELD_INVALID = 1;
+  FIELD_MISSING = 2;
+}

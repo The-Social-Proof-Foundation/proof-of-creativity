@@ -137,8 +137,15 @@ async def detect_image_similarity(file_path: str, media_id: str) -> List[MediaMa
                     )
                 )
         else:
-            embedding_vector = image_embedding(file_path)
-            insert_embedding(media_id, "image", embedding_vector, {})
+            try:
+                embedding_vector = image_embedding(file_path)
+                insert_embedding(media_id, "image", embedding_vector, {})
+            except Exception as exc:
+                logger.warning(
+                    "CLIP embedding storage skipped after hash match",
+                    media_id=media_id,
+                    error=str(exc),
+                )
 
         return matches
 

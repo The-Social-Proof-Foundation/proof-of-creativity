@@ -2,9 +2,11 @@
 Alembic environment configuration - similar to Diesel migrations in Rust
 Automatically generates migrations from SQLAlchemy models
 """
+import importlib.util
 import os
 import sys
 from logging.config import fileConfig
+from pathlib import Path
 
 from sqlalchemy import engine_from_config, pool
 from alembic import context
@@ -12,12 +14,32 @@ from alembic import context
 # Add the parent directory to the path to import our models
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 
-# Load environment variables
-from dotenv import load_dotenv
-load_dotenv()
+# Load environment variables (.env optional — only python-dotenv required for migrate extras)
+try:
+    from dotenv import load_dotenv
 
-# Import our models - this is crucial for autogenerate to work
-from app.models.db_models import Base
+    load_dotenv()
+except ImportError:
+    env_file = Path(__file__).resolve().parents[1] / ".env"
+    if env_file.is_file():
+        for line in env_file.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+
+# Import SQLAlchemy Base without pulling app.models (avoids pydantic/torch at migrate time)
+_root = Path(__file__).resolve().parents[1]
+_spec = importlib.util.spec_from_file_location(
+    "app.models.db_models",
+    _root / "app" / "models" / "db_models.py",
+)
+if _spec is None or _spec.loader is None:
+    raise ImportError("Could not load app/models/db_models.py for Alembic")
+_db_models = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_db_models)
+Base = _db_models.Base
 
 # this is the Alembic Config object
 config = context.config

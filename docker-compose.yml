@@ -1,0 +1,113 @@
+# Local dev stack for PoC oracle.
+#
+# Quick infra only (no image build):
+#   docker compose up postgres redis
+#
+# Full stack (first build downloads ML deps — can take 10–20 min):
+#   docker compose --profile app up --build
+#
+# Ensure Docker Desktop is running before `docker compose` (daemon must respond to `docker info`).
+
+name: proof-of-creativity
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: poc
+      POSTGRES_PASSWORD: poc
+      POSTGRES_DB: proof_of_creativity
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - poc_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U poc -d proof_of_creativity"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  api:
+    profiles: ["app"]
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: python scripts/run_api.py
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      DATABASE_URL: postgresql://poc:poc@postgres:5432/proof_of_creativity
+      REDIS_URL: redis://redis:6379/0
+      MYSO_NETWORK: localnet
+      MYSO_INTEGRATION_ENABLED: "${MYSO_INTEGRATION_ENABLED:-false}"
+      MYSOCIAL_RPC_URL: http://host.docker.internal:9000
+      GRAPHQL_URL: http://host.docker.internal:9125/graphql
+      API_HOST: 0.0.0.0
+      API_PORT: "8000"
+      PORT: "8000"
+    ports:
+      - "${API_PORT:-8000}:8000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./data:/app/data
+
+  grpc-sync:
+    profiles: ["app"]
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: python scripts/run_grpc_sync.py
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      DATABASE_URL: postgresql://poc:poc@postgres:5432/proof_of_creativity
+      MYSO_NETWORK: localnet
+      MYSOCIAL_RPC_URL: http://host.docker.internal:9000
+      GRAPHQL_URL: http://host.docker.internal:9125/graphql
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./data:/app/data
+
+  oracle-worker:
+    profiles: ["app"]
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: python scripts/run_oracle_worker.py
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      DATABASE_URL: postgresql://poc:poc@postgres:5432/proof_of_creativity
+      MYSO_NETWORK: localnet
+      MYSO_INTEGRATION_ENABLED: "${MYSO_INTEGRATION_ENABLED:-false}"
+      MYSOCIAL_RPC_URL: http://host.docker.internal:9000
+      GRAPHQL_URL: http://host.docker.internal:9125/graphql
+      ORACLE_WORKER_CONCURRENCY: "2"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./data:/app/data
+
+volumes:
+  poc_pgdata:

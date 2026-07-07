@@ -143,3 +143,133 @@ class AttributionRecord(Base):
         Index('idx_attribution_records_blockchain', 'tx_hash'),
     )
 
+
+# --- Oracle / chain sync tables (network-scoped) ---
+
+
+class ChainPost(Base):
+    __tablename__ = "chain_posts"
+
+    network = Column(String(20), primary_key=True)
+    post_id = Column(String(128), primary_key=True)
+    creator_address = Column(String(128))
+    enable_poc = Column(String(10), default="true")
+    media_urls = Column(JSONB, default=list)
+    media_types = Column(JSONB, default=list)
+    analysis_status = Column(String(32), default="discovered")
+    poc_outcome = Column(Integer)
+    highest_similarity_score = Column(Integer)
+    proof_bundle_uri = Column(Text)
+    tx_digest = Column(String(128))
+    discovered_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+    metadata_json = Column("metadata", JSONB, default=dict)
+
+
+class GrpcSyncCheckpoint(Base):
+    __tablename__ = "grpc_sync_checkpoints"
+
+    network = Column(String(20), primary_key=True)
+    stream_id = Column(String(64), primary_key=True, default="default")
+    checkpoint_sequence = Column(BigInteger, default=0)
+    last_transaction_digest = Column(String(128))
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
+class OracleJob(Base):
+    __tablename__ = "oracle_jobs"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    network = Column(String(20), nullable=False)
+    post_id = Column(String(128), nullable=False)
+    job_type = Column(String(32), nullable=False, default="analyze_post")
+    media_url = Column(Text)
+    media_index = Column(Integer, default=0)
+    media_type = Column(Integer)
+    status = Column(String(32), default="pending")
+    attempts = Column(Integer, default=0)
+    last_error = Column(Text)
+    payload = Column(JSONB, default=dict)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    __table_args__ = (
+        Index("idx_oracle_jobs_status_network", "network", "status", "created_at"),
+        Index("idx_oracle_jobs_post", "network", "post_id"),
+    )
+
+
+class ChainAttestation(Base):
+    __tablename__ = "chain_attestations"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    network = Column(String(20), nullable=False)
+    post_id = Column(String(128), nullable=False)
+    tx_digest = Column(String(128))
+    media_type = Column(Integer)
+    highest_similarity_score = Column(Integer)
+    original_creator = Column(String(128))
+    derivative_redirection_target = Column(Integer)
+    poc_outcome = Column(Integer)
+    reasoning = Column(Text)
+    evidence_urls = Column(JSONB, default=list)
+    status = Column(String(32), default="submitted")
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    __table_args__ = (
+        Index("idx_chain_attestations_post", "network", "post_id", "created_at"),
+    )
+
+
+class MediaPostLink(Base):
+    __tablename__ = "media_post_links"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    network = Column(String(20), nullable=False)
+    post_id = Column(String(128), nullable=False)
+    media_id = Column(String(100), nullable=False)
+    media_url = Column(Text)
+    media_index = Column(Integer, default=0)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    __table_args__ = (
+        Index("idx_media_post_links_post", "network", "post_id"),
+        Index("idx_media_post_links_media", "media_id"),
+    )
+
+
+class UsernameBeneficiary(Base):
+    __tablename__ = "username_beneficiaries"
+
+    network = Column(String(20), primary_key=True)
+    identity_hash = Column(String(128), primary_key=True)
+    username = Column(String(256))
+    beneficiary_address = Column(String(128))
+    vault_object_id = Column(String(128))
+    provision_tx_digest = Column(String(128))
+    claimed = Column(String(10), default="false")
+    claim_tx_digest = Column(String(128))
+    metadata_json = Column("metadata", JSONB, default=dict)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
+class ChainConfigCache(Base):
+    __tablename__ = "chain_config_cache"
+
+    network = Column(String(20), primary_key=True)
+    config_json = Column(JSONB, default=dict)
+    fetched_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
+class ExternalIdentity(Base):
+    __tablename__ = "external_identities"
+
+    network = Column(String(20), primary_key=True)
+    identity_hash = Column(String(128), primary_key=True)
+    platform = Column(String(64))
+    external_id = Column(String(256))
+    display_name = Column(String(256))
+    metadata_json = Column("metadata", JSONB, default=dict)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
