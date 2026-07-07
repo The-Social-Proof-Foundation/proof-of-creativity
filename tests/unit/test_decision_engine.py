@@ -9,9 +9,13 @@ from app.services.decision_engine import DecisionEngine
 from app.services.poc_utils import DERIVATIVE_TARGET_ESCROW, DERIVATIVE_TARGET_WALLET
 
 
+def _cfg():
+    return {"image_threshold": 95, "video_threshold": 95, "audio_threshold": 95}
+
+
 def test_original_when_no_matches(monkeypatch):
     engine = DecisionEngine()
-    monkeypatch.setattr(engine, "_load_config", lambda _n: {"image_threshold": 95, "video_threshold": 95, "audio_threshold": 95})
+    monkeypatch.setattr(engine, "_load_config", lambda _n: _cfg())
     analysis = AnalysisResult(
         network="localnet",
         post_id="0x1",
@@ -29,7 +33,7 @@ def test_original_when_no_matches(monkeypatch):
 
 def test_off_network_forces_escrow(monkeypatch):
     engine = DecisionEngine()
-    monkeypatch.setattr(engine, "_load_config", lambda _n: {"image_threshold": 95, "video_threshold": 95, "audio_threshold": 95})
+    monkeypatch.setattr(engine, "_load_config", lambda _n: _cfg())
     match = MediaMatch(
         media_id="m2",
         match_type=MatchType.PERCEPTUAL_HASH,
@@ -51,3 +55,61 @@ def test_off_network_forces_escrow(monkeypatch):
     )
     submission = engine.build_submission({}, analysis)
     assert submission.derivative_redirection_target == DERIVATIVE_TARGET_ESCROW
+
+
+def test_self_match_bypasses_derivative(monkeypatch):
+    engine = DecisionEngine()
+    monkeypatch.setattr(engine, "_load_config", lambda _n: _cfg())
+    owner = "0xAbc123"
+    match = MediaMatch(
+        media_id="m1",
+        match_type=MatchType.PERCEPTUAL_HASH,
+        similarity_score=1.0,
+        confidence_level=ConfidenceLevel.HIGH,
+    )
+    analysis = AnalysisResult(
+        network="localnet",
+        post_id="0xpost",
+        media_url="https://x/y.jpg",
+        media_index=0,
+        media_type=1,
+        media_id="mid",
+        matches=[match],
+        highest_similarity_u64=100,
+        original_creator=owner,
+        reasoning="top match",
+    )
+    submission = engine.build_submission({"creator_address": owner}, analysis)
+    assert submission.original_creator is None
+    assert submission.highest_similarity_score == 100
+    assert submission.derivative_redirection_target == DERIVATIVE_TARGET_WALLET
+    assert "Self-match" in submission.reasoning
+
+
+def test_different_creator_stays_derivative(monkeypatch):
+    engine = DecisionEngine()
+    monkeypatch.setattr(engine, "_load_config", lambda _n: _cfg())
+    owner = "0xowner"
+    other = "0xother"
+    match = MediaMatch(
+        media_id="m1",
+        match_type=MatchType.PERCEPTUAL_HASH,
+        similarity_score=1.0,
+        confidence_level=ConfidenceLevel.HIGH,
+    )
+    analysis = AnalysisResult(
+        network="localnet",
+        post_id="0xpost",
+        media_url="https://x/y.jpg",
+        media_index=0,
+        media_type=1,
+        media_id="mid",
+        matches=[match],
+        highest_similarity_u64=100,
+        original_creator=other,
+        reasoning="top match",
+    )
+    submission = engine.build_submission({"creator_address": owner}, analysis)
+    assert submission.original_creator == other
+    assert submission.highest_similarity_score == 100
+    assert submission.derivative_redirection_target == DERIVATIVE_TARGET_WALLET

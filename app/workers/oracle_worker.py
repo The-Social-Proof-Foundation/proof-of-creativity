@@ -174,9 +174,57 @@ class OracleWorker:
             payload = json.loads(payload)
         identity_hash = payload.get("identity_hash")
         claimant = payload.get("claimant_address")
+        beneficiary_id = payload.get("beneficiary_id")
         if not identity_hash or not claimant:
             raise ValueError("claim_beneficiary job requires identity_hash and claimant_address")
-        await self.beneficiaries.claim(identity_hash, claimant)
+
+        if not beneficiary_id:
+            from app.services.poc_chain_helpers import resolve_beneficiary_object_for_identity
+
+            beneficiary_id = resolve_beneficiary_object_for_identity(
+                self.profile, str(identity_hash)
+            )
+        if not beneficiary_id:
+            raise ValueError(f"Could not resolve beneficiary object for identity {identity_hash}")
+
+        from app.services.poc_identity import IdentityVerifier
+
+        verifier = IdentityVerifier(self.network)
+        verified = verifier.verify_claim(
+            beneficiary_id=str(beneficiary_id),
+            wallet=str(claimant),
+            identity_hash=str(identity_hash),
+            attested_x_handle=payload.get("attested_x_handle"),
+            oauth_token=payload.get("oauth_token"),
+            mock_headers=payload.get("mock_headers") or {},
+            display_name=str(payload.get("display_name") or ""),
+            bio=str(payload.get("bio") or ""),
+            profile_picture_url=str(payload.get("profile_picture_url") or ""),
+            cover_photo_url=str(payload.get("cover_photo_url") or ""),
+        )
+
+        result = await self.beneficiaries.claim(
+            str(identity_hash),
+            str(claimant),
+            beneficiary_id=str(beneficiary_id),
+            evidence_hash=verified.evidence_hash,
+            attested_x_handle=verified.attested_x_handle,
+            display_name=verified.display_name,
+            bio=verified.bio,
+            profile_picture_url=verified.profile_picture_url,
+            cover_photo_url=verified.cover_photo_url,
+        )
+        tx = result.get("tx_hash")
+        await event_bus.publish(
+            "beneficiary.claim.completed",
+            {
+                "network": self.network,
+                "identity_hash": identity_hash,
+                "claimant_address": claimant,
+                "tx_digest": tx,
+                "verifier": verified.verifier,
+            },
+        )
 
 
 async def run_oracle_workers(networks: list[str]) -> None:

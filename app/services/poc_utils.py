@@ -27,6 +27,19 @@ OFFCHAIN_DEFAULT_POC_CONFIG = {
     "video_embedded_audio_redirect_bps": 3000,
     "max_reasoning_length": 5000,
     "max_evidence_urls": 10,
+    "dispute_cost": 0,
+    "min_vote_stake": 1_000_000_000,
+    "max_vote_stake": 100_000_000_000,
+    "voting_duration_ms": 604_800_000,
+    "max_votes_per_dispute": 10_000,
+    "dispute_governance_registry_id": None,
+    "dispute_quorum_base_stake": 0,
+    "dispute_second_round_fee_multiplier_bps": 10_000,
+    "dispute_second_round_quorum_multiplier_bps": 10_000,
+    "username_beneficiary_join_referral_bps": 500,
+    "max_disputes_per_post": 2,
+    "min_vault_deposit_amount": 1,
+    "version": 0,
 }
 
 

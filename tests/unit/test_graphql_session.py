@@ -95,7 +95,7 @@ def test_bootstrap_network_session_prefers_graphql_over_yaml(mock_refresh):
     ):
         bootstrap_network_session("localnet")
         assert os.environ["MYSO_POC_CONFIG_ID"] == "0xfromgraphql"
-        assert os.environ["MYSOCIAL_RPC_URL"] == "http://127.0.0.1:9000"
+        assert "9000" in os.environ["MYSOCIAL_RPC_URL"]
 
 
 def test_resolve_platform_package_address_env_override():

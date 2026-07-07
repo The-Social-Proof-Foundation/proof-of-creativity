@@ -25,6 +25,10 @@ POC_OBJECT_ALIASES: dict[str, tuple[str, str]] = {
         "MYSO_POC_USERNAME_BENEFICIARY_DIRECTORY_ID",
         "username_beneficiary_directory",
     ),
+    "profileConfig": ("MYSO_PROFILE_CONFIG_ID", "profile_config"),
+    "memoryRegistry": ("MYSO_MEMORY_REGISTRY_ID", "memory_registry"),
+    "aiCreditConfig": ("MYSO_AI_CREDIT_CONFIG_ID", "ai_credit_config"),
+    "pocBeneficiaryAdminCap": ("MYSO_POC_BENEFICIARY_ADMIN_CAP_ID", "poc_beneficiary_admin_cap"),
 }
 
 _MOVE_TYPE_PACKAGE_RE = re.compile(r"^(0x[0-9a-fA-F]+)::")
@@ -54,19 +58,31 @@ def resolve_platform_package_address(profile: NetworkProfile) -> str:
 def build_poc_session_query(platform_package: str) -> str:
     """Build GraphQL query for shared PoC / platform objects (localnet E2E pattern)."""
     pkg = platform_package
-    filters = [
+    shared_filters = [
         ("pocConfig", f"{pkg}::proof_of_creativity::PoCConfig"),
         ("pocRegistry", f"{pkg}::proof_of_creativity::PoCRegistry"),
         ("pocVaultDirectory", f"{pkg}::poc_vault::PoCVaultDirectory"),
         ("tokenRegistry", f"{pkg}::social_proof_tokens::TokenRegistry"),
         ("usernameRegistry", f"{pkg}::profile::UsernameRegistry"),
         ("pocUsernameBeneficiaryDirectory", f"{pkg}::poc_username_beneficiary::PoCUsernameBeneficiaryDirectory"),
+        ("profileConfig", f"{pkg}::profile::ProfileConfig"),
+        ("memoryRegistry", f"{pkg}::memory::MemoryRegistry"),
+        ("aiCreditConfig", f"{pkg}::ai_credit::AiCreditConfig"),
+    ]
+    owned_filters = [
+        ("pocBeneficiaryAdminCap", f"{pkg}::poc_username_beneficiary::PoCBeneficiaryAdminCap"),
     ]
     parts = []
-    for alias, move_type in filters:
+    for alias, move_type in shared_filters:
         parts.append(
             f"{alias}: objects("
             f'filter: {{ type: "{move_type}", ownerKind: SHARED }}, first: 1'
+            f") {{ nodes {{ address }} }}"
+        )
+    for alias, move_type in owned_filters:
+        parts.append(
+            f"{alias}: objects("
+            f'filter: {{ type: "{move_type}" }}, last: 1'
             f") {{ nodes {{ address }} }}"
         )
     return f"query PoCOracleSessionObjects {{ {' '.join(parts)} }}"

@@ -4,6 +4,10 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from app.chain.move_calls import (
+    build_claim_username_beneficiary_call,
+    build_create_username_beneficiary_call,
+)
 from app.services.myso_client import MySocialClient
 
 
@@ -84,3 +88,38 @@ def test_submit_poc_sync_move_call_argument_count(poc_env_base, monkeypatch):
     mc = captured[0]
     assert mc["function"] == "analyze_and_update_post_sync_token_pool"
     assert len(mc["arguments"]) == 16
+
+
+def test_move_call_builders_argument_counts():
+    create_mc = build_create_username_beneficiary_call(
+        package_id="0xpackage",
+        admin_cap_id="0xadmin",
+        directory_id="0xdir",
+        shard_id="0xshard",
+        vault_directory_id="0xvaultdir",
+        username_registry_id="0xur",
+        username="user",
+        identity_hash="0xdead",
+        clock_id="0x6",
+    )
+    claim_mc = build_claim_username_beneficiary_call(
+        package_id="0xpackage",
+        poc_config_id="0xconfig",
+        profile_config_id="0xpcfg",
+        directory_id="0xdir",
+        shard_id="0xshard",
+        username_registry_id="0xur",
+        memory_registry_id="0xmr",
+        ai_credit_config_id="0xaic",
+        beneficiary_id="0xben",
+        evidence_hash=b"",
+        attested_x_handle="user",
+        display_name="",
+        bio="",
+        profile_picture_url="",
+        cover_photo_url="",
+        wallet="0xwallet",
+        clock_id="0x6",
+    )
+    assert len(create_mc["arguments"]) == 10
+    assert len(claim_mc["arguments"]) == 16

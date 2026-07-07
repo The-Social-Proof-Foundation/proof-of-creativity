@@ -10,13 +10,13 @@ import structlog
 
 from app.core.database import lookup_mysocial_creator_for_media_ids
 from app.core.utils import cleanup_temp_file, new_media_id
-from app.db.oracle_repository import MediaPostLinkRepository
+from app.db.oracle_repository import ConfigCacheRepository, MediaPostLinkRepository
 from app.models.similarity import MediaMatch
 from app.services.analysis.media_fetcher import download_media
 from app.services.analysis.scoring import similarity_float_to_u64_percent
 from app.services.events import event_bus
 from app.services.media_similarity import detect_audio_similarity, detect_image_similarity
-from app.services.poc_utils import MEDIA_TYPE_AUDIO, MEDIA_TYPE_IMAGE, MEDIA_TYPE_VIDEO
+from app.services.poc_utils import MEDIA_TYPE_AUDIO, MEDIA_TYPE_IMAGE, MEDIA_TYPE_VIDEO, OFFCHAIN_DEFAULT_POC_CONFIG
 from app.services.poc_video import analyze_video_similarity
 
 logger = structlog.get_logger()
@@ -43,6 +43,18 @@ class AnalysisResult:
 class AnalysisService:
     def __init__(self) -> None:
         self.links = MediaPostLinkRepository()
+        self.config_repo = ConfigCacheRepository()
+
+    def _load_thresholds(self, network: str) -> tuple[int, int, int]:
+        try:
+            cfg = self.config_repo.get(network) or OFFCHAIN_DEFAULT_POC_CONFIG
+        except Exception:
+            cfg = OFFCHAIN_DEFAULT_POC_CONFIG
+        return (
+            int(cfg.get("image_threshold") or 95),
+            int(cfg.get("video_threshold") or 95),
+            int(cfg.get("audio_threshold") or 95),
+        )
 
     async def analyze(
         self,
@@ -84,8 +96,9 @@ class AnalysisService:
                 matches = video_analysis.matches
                 from app.services.poc_video_types import decide_video_poc_for_chain
 
+                _img_thr, video_thr, audio_thr = self._load_thresholds(network)
                 dec = decide_video_poc_for_chain(
-                    video_analysis, 95, 95, None, None
+                    video_analysis, video_thr, audio_thr, None, None
                 )
                 embedded_audio_only = dec.embedded_audio_only_derivative
             else:

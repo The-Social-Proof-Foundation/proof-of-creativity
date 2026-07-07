@@ -2,20 +2,14 @@
 
 from __future__ import annotations
 
-import hashlib
-
 import structlog
 
+from app.chain.move_address import derive_beneficiary_address
 from app.chain.rpc_client import TransactionSubmitter
 from app.db.oracle_repository import UsernameBeneficiaryRepository
 from app.services.events import event_bus
 
 logger = structlog.get_logger()
-
-
-def derive_beneficiary_address(identity_hash: str, network: str) -> str:
-    digest = hashlib.sha256(f"{network}:beneficiary:{identity_hash}".encode()).hexdigest()
-    return "0x" + digest[:64]
 
 
 class UsernameBeneficiaryService:
@@ -28,7 +22,7 @@ class UsernameBeneficiaryService:
         existing = self.repo.get(self.network, identity_hash)
         if existing and existing.get("beneficiary_address"):
             return existing
-        address = derive_beneficiary_address(identity_hash, self.network)
+        address = derive_beneficiary_address(identity_hash)
         self.repo.upsert(
             self.network,
             identity_hash,
@@ -45,7 +39,7 @@ class UsernameBeneficiaryService:
         username: str | None = None,
     ) -> str:
         record = self.get_or_compute(identity_hash, username=username)
-        address = record.get("beneficiary_address") or derive_beneficiary_address(identity_hash, self.network)
+        address = record.get("beneficiary_address") or derive_beneficiary_address(identity_hash)
         if record.get("provision_tx_digest"):
             return str(address)
 
@@ -73,10 +67,29 @@ class UsernameBeneficiaryService:
         )
         return str(address)
 
-    async def claim(self, identity_hash: str, claimant_address: str) -> dict:
+    async def claim(
+        self,
+        identity_hash: str,
+        claimant_address: str,
+        *,
+        beneficiary_id: str | None = None,
+        evidence_hash: bytes | None = None,
+        attested_x_handle: str | None = None,
+        display_name: str = "",
+        bio: str = "",
+        profile_picture_url: str = "",
+        cover_photo_url: str = "",
+    ) -> dict:
         result = self.submitter.claim_username_beneficiary(
             identity_hash=identity_hash,
             claimant_address=claimant_address,
+            beneficiary_id=beneficiary_id,
+            evidence_hash=evidence_hash,
+            attested_x_handle=attested_x_handle,
+            display_name=display_name,
+            bio=bio,
+            profile_picture_url=profile_picture_url,
+            cover_photo_url=cover_photo_url,
         )
         tx = result.get("tx_hash")
         if tx:

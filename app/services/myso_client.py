@@ -140,6 +140,9 @@ class MySocialClient:
             return dict(parsed)
 
     def _normalize_poc_config(self, fields: Dict[str, Any]) -> Dict[str, Any]:
+        gov_id = fields.get("dispute_governance_registry_id")
+        if isinstance(gov_id, dict):
+            gov_id = gov_id.get("id") or gov_id.get("bytes")
         return {
             "oracle_address": fields.get("oracle_address"),
             "image_threshold": _parse_po_u8(fields.get("image_threshold"), 95),
@@ -152,6 +155,11 @@ class MySocialClient:
             "max_reasoning_length": _parse_po_u8(fields.get("max_reasoning_length"), 5000),
             "max_evidence_urls": _parse_po_u8(fields.get("max_evidence_urls"), 10),
             "dispute_cost": _parse_po_u8(fields.get("dispute_cost"), 0),
+            "min_vote_stake": _parse_po_u8(fields.get("min_vote_stake"), 1_000_000_000),
+            "max_vote_stake": _parse_po_u8(fields.get("max_vote_stake"), 100_000_000_000),
+            "voting_duration_ms": _parse_po_u8(fields.get("voting_duration_ms"), 604_800_000),
+            "max_votes_per_dispute": _parse_po_u8(fields.get("max_votes_per_dispute"), 10_000),
+            "dispute_governance_registry_id": str(gov_id) if gov_id else None,
             "dispute_quorum_base_stake": _parse_po_u8(fields.get("dispute_quorum_base_stake"), 0),
             "dispute_second_round_fee_multiplier_bps": _parse_po_u8(
                 fields.get("dispute_second_round_fee_multiplier_bps"), 10000
@@ -159,6 +167,11 @@ class MySocialClient:
             "dispute_second_round_quorum_multiplier_bps": _parse_po_u8(
                 fields.get("dispute_second_round_quorum_multiplier_bps"), 10000
             ),
+            "username_beneficiary_join_referral_bps": _parse_po_u8(
+                fields.get("username_beneficiary_join_referral_bps"), 500
+            ),
+            "max_disputes_per_post": _parse_po_u8(fields.get("max_disputes_per_post"), 2),
+            "min_vault_deposit_amount": _parse_po_u8(fields.get("min_vault_deposit_amount"), 1),
             "version": _parse_po_u8(fields.get("version"), 0),
         }
 

@@ -272,3 +272,16 @@ def test_myso_post_active_poc_outcome():
         "poc_badge_object_id": None,
     }
     assert MySocialClient.post_has_active_poc(blank) is False
+
+
+def test_check_post_already_analyzed_allows_resubmit_after_overturn_clear():
+    from app.services.myso_client import MySocialClient, POC_OUTCOME_NONE
+
+    cleared_fields = {
+        "poc_outcome": str(POC_OUTCOME_NONE),
+        "revenue_redirect_to": None,
+        "poc_badge_snapshot": None,
+        "poc_badge_object_id": None,
+        "poc_disputes_submitted": "1",
+    }
+    assert MySocialClient.post_has_active_poc(cleared_fields) is False

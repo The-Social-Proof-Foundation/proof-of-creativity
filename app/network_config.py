@@ -129,6 +129,12 @@ def apply_profile_to_env(profile: NetworkProfile) -> None:
         "MYSO_POC_REGISTRY_ID": objs.get("poc_registry"),
         "MYSO_POC_VAULT_DIRECTORY_ID": objs.get("poc_vault_directory"),
         "MYSO_TOKEN_REGISTRY_ID": objs.get("token_registry"),
+        "MYSO_USERNAME_REGISTRY_ID": objs.get("username_registry"),
+        "MYSO_POC_USERNAME_BENEFICIARY_DIRECTORY_ID": objs.get("username_beneficiary_directory"),
+        "MYSO_PROFILE_CONFIG_ID": objs.get("profile_config"),
+        "MYSO_MEMORY_REGISTRY_ID": objs.get("memory_registry"),
+        "MYSO_AI_CREDIT_CONFIG_ID": objs.get("ai_credit_config"),
+        "MYSO_POC_BENEFICIARY_ADMIN_CAP_ID": objs.get("poc_beneficiary_admin_cap"),
         "MYSO_CLOCK_OBJECT_ID": objs.get("clock"),
     }
     for key, val in mapping.items():

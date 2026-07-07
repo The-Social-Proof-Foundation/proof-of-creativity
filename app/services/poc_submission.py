@@ -176,6 +176,38 @@ def build_poc_submission_snapshot(bundle: Dict[str, Any], rpc_result: Optional[D
     return snap
 
 
+def compose_e2e_submission_bundle(
+    *,
+    media_type_code: int,
+    score: int,
+    original_creator: str | None,
+    derivative_target: int,
+    poc_config: Dict[str, Any],
+    royalty_free: bool = False,
+) -> Dict[str, Any]:
+    """Localnet/e2e override path for runnable scripts (explicit Move args via upload)."""
+    mr = int(poc_config.get("max_reasoning_length") or 5000)
+    reason = truncate_reasoning(
+        f"E2E submission override score={score} creator={original_creator} target={derivative_target}",
+        mr,
+    )
+    bundle: Dict[str, Any] = {
+        "media_type": media_type_code,
+        "highest_similarity_score": max(0, min(100, int(score))),
+        "original_creator": original_creator,
+        "derivative_redirection_target": int(derivative_target),
+        "embedded_audio_only_derivative": False,
+        "reasoning": reason,
+        "evidence_urls": truncate_evidence_urls(["e2e:override"], int(poc_config.get("max_evidence_urls") or 10)),
+        "apply_explicit_outcome": False,
+        "explicit_poc_outcome": 0,
+    }
+    if royalty_free:
+        bundle["apply_explicit_outcome"] = True
+        bundle["explicit_poc_outcome"] = OUTCOME_ROYALTY_FREE
+    return bundle
+
+
 def compose_submission_bundle(
     *,
     media_kind: str,
@@ -351,6 +383,7 @@ def attempt_proof_of_creativity_submission(
     video_analysis: Optional["VideoSimilarityAnalysis"],
     spt_pool_id: Optional[str],
     royalty_free: bool = False,
+    e2e_override: Optional[Dict[str, Any]] = None,
 ) -> Tuple[Dict[str, Any], Optional[VideoTrackAttestation], Dict[str, Any], PocChainSummary]:
     """Fetch PoC config, compose Move args, submit RPC transaction, return RPC + audit snapshot."""
 
@@ -360,15 +393,25 @@ def attempt_proof_of_creativity_submission(
         return lookup_mysocial_creator_for_media_ids(media_ids)
 
     cfg = myso_client.get_poc_config()
-    bundle = compose_submission_bundle(
-        media_kind=media_cat,
-        media_type_code=media_type_code,
-        matches=matches,
-        video_analysis=video_analysis,
-        poc_config=cfg,
-        resolve_creator=resolve_creator,
-        royalty_free=royalty_free,
-    )
+    if e2e_override:
+        bundle = compose_e2e_submission_bundle(
+            media_type_code=int(e2e_override.get("media_type") or media_type_code),
+            score=int(e2e_override["score"]),
+            original_creator=e2e_override.get("original_creator"),
+            derivative_target=int(e2e_override.get("derivative_target") or 0),
+            poc_config=cfg,
+            royalty_free=bool(e2e_override.get("royalty_free") or royalty_free),
+        )
+    else:
+        bundle = compose_submission_bundle(
+            media_kind=media_cat,
+            media_type_code=media_type_code,
+            matches=matches,
+            video_analysis=video_analysis,
+            poc_config=cfg,
+            resolve_creator=resolve_creator,
+            royalty_free=royalty_free,
+        )
     summary = build_poc_chain_summary(bundle, cfg)
     video_att: Optional[VideoTrackAttestation] = None
     if media_cat == "video" and video_analysis is not None:

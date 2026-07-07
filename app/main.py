@@ -537,6 +537,18 @@ async def upload_media(
         False,
         description="With post_id + MySocial: submit explicit royalty-free PoC outcome (on-chain outcome 4)",
     ),
+    e2e_score: Optional[int] = Query(
+        None,
+        description="Localnet e2e: override similarity score when POC_E2E_SUBMIT_OVERRIDE=1",
+    ),
+    e2e_original_creator: Optional[str] = Query(
+        None,
+        description="Localnet e2e: override original_creator address",
+    ),
+    e2e_derivative_target: Optional[int] = Query(
+        None,
+        description="Localnet e2e: override derivative_redirection_target (0=wallet, 1=escrow)",
+    ),
     upload_to_stream: bool = False,
     _rate_limit: None = Depends(check_rate_limit),
 ):
@@ -687,6 +699,23 @@ async def upload_media(
 
         if post_id and myso_client:
             try:
+                e2e_override = None
+                if (
+                    os.getenv("POC_E2E_SUBMIT_OVERRIDE", "").strip().lower() in ("1", "true", "yes")
+                    and e2e_score is not None
+                ):
+                    creator_override = e2e_original_creator
+                    if creator_override and creator_override.lower() in ("none", "null"):
+                        creator_override = None
+                    elif creator_override and creator_override.startswith("some("):
+                        creator_override = creator_override[5:-1]
+                    e2e_override = {
+                        "media_type": media_type_code,
+                        "score": e2e_score,
+                        "original_creator": creator_override,
+                        "derivative_target": e2e_derivative_target if e2e_derivative_target is not None else 0,
+                        "royalty_free": royalty_free,
+                    }
                 myso_result, video_attestation_model, poc_submission_snap, summary = attempt_proof_of_creativity_submission(
                     myso_client=myso_client,
                     post_id=post_id,
@@ -696,6 +725,7 @@ async def upload_media(
                     video_analysis=video_analysis,
                     spt_pool_id=spt_pool_id,
                     royalty_free=royalty_free,
+                    e2e_override=e2e_override,
                 )
                 tx_hash = myso_result.get("tx_hash")
                 if poc_require_tx_when_post_id_from_env() and not tx_hash:

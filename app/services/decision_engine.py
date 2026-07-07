@@ -17,6 +17,44 @@ from app.services.poc_utils import (
 
 DEFAULT_CONFIG = dict(OFFCHAIN_DEFAULT_POC_CONFIG)
 
+SELF_MATCH_REASONING_SUFFIX = (
+    " Self-match: poster equals matched creator; treating as original (no redirect/vault)."
+)
+
+
+def normalize_address(addr: str | None) -> str | None:
+    if not addr:
+        return None
+    normalized = str(addr).strip().lower()
+    if normalized.startswith("0x"):
+        normalized = normalized[2:]
+    return normalized or None
+
+
+def addresses_equal(a: str | None, b: str | None) -> bool:
+    left = normalize_address(a)
+    right = normalize_address(b)
+    return left is not None and right is not None and left == right
+
+
+def post_owner(post: dict) -> str | None:
+    owner = post.get("creator_address") or post.get("owner")
+    if owner:
+        return str(owner).strip()
+    return None
+
+
+def apply_self_match_short_circuit(
+    *,
+    derivative: bool,
+    creator: str | None,
+    post_owner_addr: str | None,
+    reasoning: str,
+) -> tuple[bool, str | None, str]:
+    if derivative and creator and post_owner_addr and addresses_equal(creator, post_owner_addr):
+        return False, None, reasoning + SELF_MATCH_REASONING_SUFFIX
+    return derivative, creator, reasoning
+
 
 @dataclass
 class PoCSubmission:
@@ -93,6 +131,13 @@ class DecisionEngine:
         ):
             off_network_derivative = True
             derivative = True
+
+        derivative, creator, reasoning = apply_self_match_short_circuit(
+            derivative=derivative,
+            creator=creator,
+            post_owner_addr=post_owner(post),
+            reasoning=reasoning,
+        )
 
         redirect = DERIVATIVE_TARGET_WALLET
         if derivative:

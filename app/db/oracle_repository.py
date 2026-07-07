@@ -234,6 +234,13 @@ class JobRepository:
                 row = cur.fetchone()
                 return int(row[0]) if row else 0
 
+    def get(self, job_id: str) -> dict | None:
+        with get_db_connection() as conn:
+            with conn.cursor(cursor_factory=extras.RealDictCursor) as cur:
+                cur.execute("SELECT * FROM oracle_jobs WHERE id = %s", (job_id,))
+                row = cur.fetchone()
+                return dict(row) if row else None
+
 
 class AttestationRepository:
     def insert(self, record: dict) -> str:
