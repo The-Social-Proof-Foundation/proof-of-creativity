@@ -3,23 +3,39 @@
 from __future__ import annotations
 
 import os
-import uuid
 from dataclasses import dataclass, field
 
 import structlog
 
 from app.core.database import lookup_mysocial_creator_for_media_ids
 from app.core.utils import cleanup_temp_file, new_media_id
+from app.db.discovery_repository import ProvenanceHitRepository
 from app.db.oracle_repository import ConfigCacheRepository, MediaPostLinkRepository
 from app.models.similarity import MediaMatch
 from app.services.analysis.media_fetcher import download_media
 from app.services.analysis.scoring import similarity_float_to_u64_percent
+from app.services.discovery_client import DiscoveryClient
 from app.services.events import event_bus
 from app.services.media_similarity import detect_audio_similarity, detect_image_similarity
 from app.services.poc_utils import MEDIA_TYPE_AUDIO, MEDIA_TYPE_IMAGE, MEDIA_TYPE_VIDEO, OFFCHAIN_DEFAULT_POC_CONFIG
 from app.services.poc_video import analyze_video_similarity
 
 logger = structlog.get_logger()
+
+
+def _creator_confidence_threshold() -> float:
+    return float(os.getenv("DISCOVERY_X_HANDLE_CONFIDENCE_THRESHOLD", "0.85"))
+
+
+def _select_discovered_match(matches: list[MediaMatch]) -> MediaMatch | None:
+    discovered = [
+        m
+        for m in matches
+        if (m.match_details or {}).get("corpus_scope") == "discovered"
+    ]
+    if not discovered:
+        return None
+    return max(discovered, key=lambda m: m.similarity_score)
 
 
 @dataclass
@@ -38,12 +54,18 @@ class AnalysisResult:
     needs_review: bool = False
     reasoning: str = ""
     embedded_audio_only_derivative: bool = False
+    work_confidence: float = 0.0
+    creator_confidence: float = 0.0
+    discovery_asset_id: str | None = None
+    matched_x_handle: str | None = None
 
 
 class AnalysisService:
     def __init__(self) -> None:
         self.links = MediaPostLinkRepository()
         self.config_repo = ConfigCacheRepository()
+        self.provenance = ProvenanceHitRepository()
+        self.discovery = DiscoveryClient()
 
     def _load_thresholds(self, network: str) -> tuple[int, int, int]:
         try:
@@ -113,15 +135,49 @@ class AnalysisService:
             identity_hash = None
             off_network = False
             needs_review = False
+            work_confidence = 0.0
+            creator_confidence = 0.0
+            discovery_asset_id = None
+            matched_x_handle = None
+
+            discovered_match = _select_discovered_match(matches)
+            if discovered_match and discovered_match.match_details:
+                details = discovered_match.match_details
+                work_confidence = float(details.get("work_confidence") or discovered_match.similarity_score)
+                creator_confidence = float(details.get("creator_confidence") or 0.0)
+                discovery_asset_id = details.get("discovery_asset_id")
+                matched_x_handle = details.get("creator_x_handle")
+                identity_hash = details.get("identity_hash")
+
             if highest > 0 and not creator:
-                payload_match = next(iter(matches), None)
-                if payload_match and payload_match.match_details:
-                    identity_hash = payload_match.match_details.get("identity_hash")
-                    off_network = bool(identity_hash)
-                    if off_network:
-                        needs_review = False
-                    else:
-                        needs_review = True
+                if identity_hash and creator_confidence >= _creator_confidence_threshold():
+                    off_network = True
+                    needs_review = False
+                    decision = "redirect_escrow"
+                elif discovered_match:
+                    needs_review = True
+                    decision = "needs_review"
+                elif matches:
+                    needs_review = True
+                    decision = "needs_review"
+                else:
+                    decision = "below_threshold"
+
+                if discovered_match:
+                    self.provenance.record(
+                        network=network,
+                        post_id=post_id,
+                        query_media_id=media_id,
+                        discovery_asset_id=str(discovery_asset_id) if discovery_asset_id else None,
+                        creator_candidate_id=None,
+                        similarity_score=float(discovered_match.similarity_score),
+                        match_type=str(discovered_match.match_type),
+                        work_confidence=work_confidence,
+                        creator_confidence=creator_confidence,
+                        decision=decision,
+                    )
+                    if discovery_asset_id and off_network:
+                        await self.discovery.lifecycle_event(str(discovery_asset_id), "match_detected")
 
             reasoning = f"Analyzed {media_url}; matches={len(matches)}; top_score_u64={highest}."
             result = AnalysisResult(
@@ -139,6 +195,10 @@ class AnalysisService:
                 needs_review=needs_review,
                 reasoning=reasoning,
                 embedded_audio_only_derivative=embedded_audio_only,
+                work_confidence=work_confidence,
+                creator_confidence=creator_confidence,
+                discovery_asset_id=str(discovery_asset_id) if discovery_asset_id else None,
+                matched_x_handle=matched_x_handle,
             )
             if needs_review:
                 await event_bus.publish(

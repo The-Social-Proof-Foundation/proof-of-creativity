@@ -17,6 +17,7 @@ from app.network_config import get_settings, load_network_profile
 from app.services.analysis.pipeline import AnalysisService
 from app.services.decision_engine import DecisionEngine
 from app.services.events import event_bus
+from app.services.discovery_client import DiscoveryClient
 from app.services.proof_bundle import ProofBundleService
 from app.services.username_beneficiary import UsernameBeneficiaryService
 from app.services.poc_utils import truncate_evidence_urls, truncate_reasoning
@@ -94,12 +95,32 @@ class OracleWorker:
             return
 
         original_creator = submission.original_creator
+        vault_provisioned = False
         if submission.off_network and submission.identity_hash and submission.original_creator is None:
             if submission.derivative_redirection_target == 1:
                 original_creator = await self.beneficiaries.ensure_provisioned(
                     post_id=post_id,
                     identity_hash=submission.identity_hash,
+                    username=analysis.matched_x_handle,
                 )
+                vault_provisioned = True
+                if analysis.discovery_asset_id:
+                    discovery = DiscoveryClient()
+                    await discovery.lifecycle_event(analysis.discovery_asset_id, "vault_created")
+                    await discovery.record_provenance_hit(
+                        {
+                            "network": self.network,
+                            "post_id": post_id,
+                            "query_media_id": analysis.media_id,
+                            "discovery_asset_id": analysis.discovery_asset_id,
+                            "similarity_score": analysis.highest_similarity_u64 / 100.0,
+                            "work_confidence": analysis.work_confidence,
+                            "creator_confidence": analysis.creator_confidence,
+                            "decision": "redirect_escrow",
+                            "vault_provisioned": True,
+                            "vault_identity_hash": submission.identity_hash,
+                        }
+                    )
 
         cfg = self.submitter.get_poc_config()
         self.config_cache.set(self.network, cfg)

@@ -57,6 +57,9 @@ services:
       API_HOST: 0.0.0.0
       API_PORT: "8000"
       PORT: "8000"
+      DISCOVERY_EMBED_SECRET: "${DISCOVERY_EMBED_SECRET:-}"
+      DISCOVERY_ACTIVE_EMBEDDING_VERSION: "${DISCOVERY_ACTIVE_EMBEDDING_VERSION:-clip-vit-b32-v1}"
+      DISCOVERY_SERVICE_URL: "${DISCOVERY_SERVICE_URL:-http://host.docker.internal:8096}"
     ports:
       - "${API_PORT:-8000}:8000"
     depends_on:
@@ -103,6 +106,9 @@ services:
       MYSOCIAL_RPC_URL: http://host.docker.internal:9000
       GRAPHQL_URL: http://host.docker.internal:9125/graphql
       ORACLE_WORKER_CONCURRENCY: "2"
+      DISCOVERY_ENABLED: "${DISCOVERY_ENABLED:-false}"
+      DISCOVERY_SERVICE_URL: "${DISCOVERY_SERVICE_URL:-http://host.docker.internal:8096}"
+      DISCOVERY_X_HANDLE_CONFIDENCE_THRESHOLD: "${DISCOVERY_X_HANDLE_CONFIDENCE_THRESHOLD:-0.85}"
     depends_on:
       postgres:
         condition: service_healthy

@@ -99,20 +99,69 @@ def get_conn():
     return psycopg2.connect(DB_DSN)
 
 # Embedding management with pgvector
-def insert_embedding(media_id: str, kind: str, embedding: List[float], metadata: Dict[str, Any]):
+def _corpus_filter_clause(
+    corpus_scopes: Optional[List[str]] = None,
+    active_embedding_version: Optional[str] = None,
+) -> tuple[str, list]:
+    clause = ""
+    params: list = []
+    if corpus_scopes:
+        clause += " AND corpus_scope = ANY(%s)"
+        params.append(corpus_scopes)
+    if active_embedding_version:
+        clause += " AND (embedding_version IS NULL OR embedding_version = %s)"
+        params.append(active_embedding_version)
+    return clause, params
+
+
+def insert_embedding(
+    media_id: str,
+    kind: str,
+    embedding: List[float],
+    metadata: Dict[str, Any],
+    *,
+    corpus_scope: str = "platform",
+    discovery_asset_id: Optional[str] = None,
+    embedding_model: Optional[str] = None,
+    embedding_version: Optional[str] = None,
+    embedding_dimension: Optional[int] = None,
+    embedding_created_at=None,
+):
     """Insert a new embedding with vector indexing."""
+    from datetime import datetime, timezone
+
+    created_at = embedding_created_at or datetime.now(timezone.utc)
     sql = """
-    INSERT INTO media_embeddings (id, media_id, kind, embedding, metadata)
-    VALUES (gen_random_uuid(), %s, %s, %s, %s)
+    INSERT INTO media_embeddings (
+        id, media_id, kind, embedding, metadata,
+        corpus_scope, discovery_asset_id, embedding_model, embedding_version,
+        embedding_dimension, embedding_created_at
+    )
+    VALUES (gen_random_uuid(), %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
     """
     try:
         with get_db_connection() as conn:
             with conn.cursor() as cur:
-                cur.execute(sql, (media_id, kind, embedding, extras.Json(metadata)))
+                cur.execute(
+                    sql,
+                    (
+                        media_id,
+                        kind,
+                        embedding,
+                        extras.Json(metadata),
+                        corpus_scope,
+                        discovery_asset_id,
+                        embedding_model,
+                        embedding_version,
+                        embedding_dimension or len(embedding),
+                        created_at,
+                    ),
+                )
                 conn.commit()
         
         logger.debug("Embedding inserted successfully", 
-                    media_id=media_id, kind=kind, embedding_dim=len(embedding))
+                    media_id=media_id, kind=kind, embedding_dim=len(embedding),
+                    corpus_scope=corpus_scope)
                     
     except Exception as e:
         logger.error("Failed to insert embedding", 
@@ -124,7 +173,9 @@ def search_embedding_with_timescale_ai(
     top_k: int = 5, 
     kind_filter: Optional[str] = None,
     time_filter_hours: Optional[int] = None,
-    similarity_threshold: float = 0.7
+    similarity_threshold: float = 0.7,
+    corpus_scopes: Optional[List[str]] = None,
+    active_embedding_version: Optional[str] = None,
 ) -> List[Tuple]:
     """
     Vector similarity search using PostgreSQL + pgvector.
@@ -155,6 +206,10 @@ def search_embedding_with_timescale_ai(
     if kind_filter:
         base_sql += " AND kind = %s"
         params.append(kind_filter)
+    
+    corpus_clause, corpus_params = _corpus_filter_clause(corpus_scopes, active_embedding_version)
+    base_sql += corpus_clause
+    params.extend(corpus_params)
     
     if time_filter_hours:
         base_sql += " AND uploaded_at > NOW() - INTERVAL '%s hours'"
@@ -215,20 +270,52 @@ def get_embedding_by_media_id(media_id: str) -> Optional[Tuple]:
         raise
 
 # Audio fingerprint management functions
-def insert_fingerprint(fp_hash: str, media_id: str, offset_seconds: float, fingerprint_data: Optional[bytes] = None):
+def insert_fingerprint(
+    fp_hash: str,
+    media_id: str,
+    offset_seconds: float,
+    fingerprint_data: Optional[bytes] = None,
+    *,
+    corpus_scope: str = "platform",
+    discovery_asset_id: Optional[str] = None,
+    embedding_model: Optional[str] = None,
+    embedding_version: Optional[str] = None,
+    embedding_dimension: Optional[int] = None,
+    embedding_created_at=None,
+):
     """Insert audio fingerprint; fingerprint_data is optional pickled constellation hashes (see fingerprint_audio_with_blob)."""
+    from datetime import datetime, timezone
     from app.services.fingerprint import normalize_audio_fp_hash
 
     fp_hash = normalize_audio_fp_hash(fp_hash)
     blob_octets = len(fingerprint_data) if fingerprint_data else 0
+    created_at = embedding_created_at or datetime.now(timezone.utc)
     sql = """
-    INSERT INTO audio_fingerprints (id, fp_hash, media_id, offset_seconds, fingerprint_data)
-    VALUES (gen_random_uuid(), %s, %s, %s, %s)
+    INSERT INTO audio_fingerprints (
+        id, fp_hash, media_id, offset_seconds, fingerprint_data,
+        corpus_scope, discovery_asset_id, embedding_model, embedding_version,
+        embedding_dimension, embedding_created_at
+    )
+    VALUES (gen_random_uuid(), %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
     """
     try:
         with get_db_connection() as conn:
             with conn.cursor() as cur:
-                cur.execute(sql, (fp_hash, media_id, offset_seconds, fingerprint_data))
+                cur.execute(
+                    sql,
+                    (
+                        fp_hash,
+                        media_id,
+                        offset_seconds,
+                        fingerprint_data,
+                        corpus_scope,
+                        discovery_asset_id,
+                        embedding_model,
+                        embedding_version,
+                        embedding_dimension,
+                        created_at,
+                    ),
+                )
                 conn.commit()
 
         logger.debug(
@@ -245,7 +332,12 @@ def insert_fingerprint(fp_hash: str, media_id: str, offset_seconds: float, finge
                     fp_hash=fp_hash, media_id=media_id, error=str(e))
         raise
 
-def search_fingerprint_rows(fp_hash: str) -> List[Tuple[str, float, Optional[bytes]]]:
+def search_fingerprint_rows(
+    fp_hash: str,
+    *,
+    corpus_scopes: Optional[List[str]] = None,
+    active_embedding_version: Optional[str] = None,
+) -> List[Tuple[str, float, Optional[bytes]]]:
     """
     Corpus candidates for audio similarity: latest row per media_id (handles retries).
     Includes fingerprint_data for README step 5 (constellation verification).
@@ -258,12 +350,18 @@ def search_fingerprint_rows(fp_hash: str) -> List[Tuple[str, float, Optional[byt
     SELECT DISTINCT ON (media_id) media_id, offset_seconds, fingerprint_data
     FROM audio_fingerprints
     WHERE fp_hash = %s
+    """
+    params: list = [fp_hash]
+    corpus_clause, corpus_params = _corpus_filter_clause(corpus_scopes, active_embedding_version)
+    sql += corpus_clause
+    params.extend(corpus_params)
+    sql += """
     ORDER BY media_id, created_at DESC
     """
     try:
         with get_db_connection() as conn:
             with conn.cursor() as cur:
-                cur.execute(sql, (fp_hash,))
+                cur.execute(sql, params)
                 results = cur.fetchall()
         logger.debug(
             "Fingerprint candidate rows loaded",
@@ -282,11 +380,28 @@ def search_fingerprint(fp_hash: str) -> List[Tuple]:
     return [(mid, off) for mid, off, _blob in rows]
 
 # Image perceptual hash management functions
-def insert_image_hashes(media_id: str, hashes: dict) -> None:
+def insert_image_hashes(
+    media_id: str,
+    hashes: dict,
+    *,
+    corpus_scope: str = "platform",
+    discovery_asset_id: Optional[str] = None,
+    embedding_model: Optional[str] = None,
+    embedding_version: Optional[str] = None,
+    embedding_dimension: Optional[int] = None,
+    embedding_created_at=None,
+) -> None:
     """Insert image perceptual hashes into database (delete-then-insert; works without UNIQUE)."""
+    from datetime import datetime, timezone
+
+    created_at = embedding_created_at or datetime.now(timezone.utc)
     sql_insert = """
-    INSERT INTO image_hashes (id, media_id, dhash, phash, ahash, dhash_16, phash_16)
-    VALUES (gen_random_uuid(), %s, %s, %s, %s, %s, %s)
+    INSERT INTO image_hashes (
+        id, media_id, dhash, phash, ahash, dhash_16, phash_16,
+        corpus_scope, discovery_asset_id, embedding_model, embedding_version,
+        embedding_dimension, embedding_created_at
+    )
+    VALUES (gen_random_uuid(), %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
     """
     try:
         with get_db_connection() as conn:
@@ -301,6 +416,12 @@ def insert_image_hashes(media_id: str, hashes: dict) -> None:
                         hashes.get("ahash"),
                         hashes.get("dhash_16"),
                         hashes.get("phash_16"),
+                        corpus_scope,
+                        discovery_asset_id,
+                        embedding_model,
+                        embedding_version,
+                        embedding_dimension,
+                        created_at,
                     ),
                 )
                 conn.commit()
@@ -311,7 +432,13 @@ def insert_image_hashes(media_id: str, hashes: dict) -> None:
         logger.error("Failed to insert image hashes", media_id=media_id, error=str(e))
         raise
 
-def search_similar_image_hashes(hashes: dict, exclude_media_id: Optional[str] = None) -> List[Tuple]:
+def search_similar_image_hashes(
+    hashes: dict,
+    exclude_media_id: Optional[str] = None,
+    *,
+    corpus_scopes: Optional[List[str]] = None,
+    active_embedding_version: Optional[str] = None,
+) -> List[Tuple]:
     """Search for similar image hashes in database."""
     # Search for exact matches first (fastest)
     sql = """
@@ -330,6 +457,10 @@ def search_similar_image_hashes(hashes: dict, exclude_media_id: Optional[str] = 
     if exclude_media_id:
         sql += " AND media_id != %s"
         params.append(exclude_media_id)
+
+    corpus_clause, corpus_params = _corpus_filter_clause(corpus_scopes, active_embedding_version)
+    sql += corpus_clause
+    params.extend(corpus_params)
     
     sql += " ORDER BY created_at DESC"
     

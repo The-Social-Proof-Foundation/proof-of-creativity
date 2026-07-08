@@ -2,7 +2,7 @@
 SQLAlchemy database models - the single source of truth for database schema.
 Similar to Diesel schema in Rust - migrations are auto-generated from these models.
 """
-from sqlalchemy import Column, String, Integer, BigInteger, Float, DateTime, Text, LargeBinary, Index
+from sqlalchemy import Column, String, Integer, BigInteger, Float, DateTime, Text, LargeBinary, Index, Boolean
 from sqlalchemy.dialects.postgresql import UUID, JSONB
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.sql import func
@@ -44,10 +44,16 @@ class MediaEmbedding(Base):
     __tablename__ = 'media_embeddings'
     
     id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    media_id = Column(String(100), nullable=False)  # Increased for video frames: uuid_frame_idx
-    kind = Column(String(50), nullable=False)  # 'image', 'video_frame', 'audio'
-    embedding = Column(Vector(512), nullable=False)  # pgvector type
-    meta = Column('metadata', JSONB, default={})  # renamed 'metadata' -> 'meta' (reserved word)
+    media_id = Column(String(100), nullable=False)
+    kind = Column(String(50), nullable=False)
+    embedding = Column(Vector(512), nullable=False)
+    meta = Column('metadata', JSONB, default={})
+    corpus_scope = Column(String(32), default='platform')
+    discovery_asset_id = Column(UUID(as_uuid=True))
+    embedding_model = Column(String(128))
+    embedding_version = Column(String(64))
+    embedding_dimension = Column(Integer)
+    embedding_created_at = Column(DateTime(timezone=True))
     uploaded_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
@@ -56,7 +62,7 @@ class MediaEmbedding(Base):
         Index('idx_media_embeddings_media_id', 'media_id'),
         Index('idx_media_embeddings_kind', 'kind'),
         Index('idx_media_embeddings_uploaded_at', 'uploaded_at'),
-        # Vector index created separately via raw SQL (pgvector specific)
+        Index('idx_media_embeddings_corpus_scope', 'corpus_scope'),
     )
 
 class AudioFingerprint(Base):
@@ -68,6 +74,12 @@ class AudioFingerprint(Base):
     media_id = Column(String(100), nullable=False)  # Increased for video frames
     offset_seconds = Column(Float, default=0.0)
     fingerprint_data = Column(LargeBinary)
+    corpus_scope = Column(String(32), default='platform')
+    discovery_asset_id = Column(UUID(as_uuid=True))
+    embedding_model = Column(String(128))
+    embedding_version = Column(String(64))
+    embedding_dimension = Column(Integer)
+    embedding_created_at = Column(DateTime(timezone=True))
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
     
@@ -88,6 +100,12 @@ class ImageHash(Base):
     ahash = Column(String(64))
     dhash_16 = Column(String(256))
     phash_16 = Column(String(256))
+    corpus_scope = Column(String(32), default='platform')
+    discovery_asset_id = Column(UUID(as_uuid=True))
+    embedding_model = Column(String(128))
+    embedding_version = Column(String(64))
+    embedding_dimension = Column(Integer)
+    embedding_created_at = Column(DateTime(timezone=True))
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
     
@@ -272,4 +290,27 @@ class ExternalIdentity(Base):
     display_name = Column(String(256))
     metadata_json = Column("metadata", JSONB, default=dict)
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+
+class ProvenanceHit(Base):
+    __tablename__ = "provenance_hits"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    network = Column(String(20), nullable=False)
+    post_id = Column(String(128), nullable=False)
+    query_media_id = Column(String(100))
+    discovery_asset_id = Column(UUID(as_uuid=True))
+    creator_candidate_id = Column(UUID(as_uuid=True))
+    similarity_score = Column(Float, default=0.0)
+    match_type = Column(String(50))
+    work_confidence = Column(Float, default=0.0)
+    creator_confidence = Column(Float, default=0.0)
+    decision = Column(String(32), default="pending")
+    vault_provisioned = Column(Boolean, default=False)
+    vault_identity_hash = Column(String(128))
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    __table_args__ = (
+        Index("idx_provenance_hits_post", "network", "post_id", "created_at"),
+    )
 

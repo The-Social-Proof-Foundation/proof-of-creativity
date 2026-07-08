@@ -208,9 +208,11 @@ app.add_middleware(
 )
 
 from app.api.rest.routes import router as oracle_rest_router
+from app.api.rest.discovery_internal import router as discovery_internal_router
 from app.api.ws.routes import router as oracle_ws_router
 
 app.include_router(oracle_rest_router)
+app.include_router(discovery_internal_router)
 app.include_router(oracle_ws_router)
 
 # Configuration constants

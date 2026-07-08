@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -30,19 +31,29 @@ class ProofBundleService:
         *,
         tx_digest: str | None = None,
     ) -> dict[str, Any]:
+        expose_sources = os.getenv("DISCOVERY_EXPOSE_SOURCE_IN_EVIDENCE", "false").lower() in (
+            "1",
+            "true",
+            "yes",
+        )
+        redacted_analysis = {
+            "media_id": analysis.media_id,
+            "highest_similarity_u64": analysis.highest_similarity_u64,
+            "match_count": len(analysis.matches),
+            "off_network": analysis.off_network,
+            "identity_hash": analysis.identity_hash,
+            "work_confidence": analysis.work_confidence,
+            "creator_confidence": analysis.creator_confidence,
+        }
+        if expose_sources and analysis.discovery_asset_id:
+            redacted_analysis["discovery_asset_id"] = analysis.discovery_asset_id
         return {
             "version": 1,
             "network": self.network,
             "post_id": analysis.post_id,
-            "media_url": analysis.media_url,
+            "media_url": analysis.media_url if expose_sources else "[redacted]",
             "media_type": analysis.media_type,
-            "analysis": {
-                "media_id": analysis.media_id,
-                "highest_similarity_u64": analysis.highest_similarity_u64,
-                "match_count": len(analysis.matches),
-                "off_network": analysis.off_network,
-                "identity_hash": analysis.identity_hash,
-            },
+            "analysis": redacted_analysis,
             "submission": {
                 "highest_similarity_score": submission.highest_similarity_score,
                 "original_creator": submission.original_creator,

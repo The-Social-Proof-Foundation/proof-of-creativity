@@ -19,6 +19,7 @@ from app.services.fingerprint import (
     find_verified_fingerprint_hits,
     unpickle_fingerprint_hashes,
 )
+from app.services.media_similarity import corpus_search_kwargs, insert_kwargs_from_context
 from app.core.database import (
     insert_embedding,
     insert_fingerprint,
@@ -37,12 +38,16 @@ def analyze_video_similarity(temp_file_path: str, query_media_id: str) -> VideoS
     audio_similarity = 0.0
     audio_hit = False
 
+    search_kwargs = corpus_search_kwargs()
+    insert_kwargs = insert_kwargs_from_context()
+
     for idx, frame_embedding in enumerate(frame_embeddings):
         similar_embeddings = search_embedding_with_timescale_ai(
             vector=frame_embedding,
             top_k=5,
             kind_filter="video_frame",
             similarity_threshold=0.7,
+            **search_kwargs,
         )
         frame_media_id = f"{query_media_id}_frame_{idx}"
         insert_embedding(
@@ -50,6 +55,7 @@ def analyze_video_similarity(temp_file_path: str, query_media_id: str) -> VideoS
             "video_frame",
             frame_embedding,
             {"parent_media_id": query_media_id, "frame_index": idx},
+            **insert_kwargs,
         )
         for match in similar_embeddings:
             match_media_id, kind, metadata, uploaded_at, similarity_score, distance = match
@@ -83,14 +89,14 @@ def analyze_video_similarity(temp_file_path: str, query_media_id: str) -> VideoS
             )
 
     if audio_fp_hash:
-        candidate_rows = search_fingerprint_rows(audio_fp_hash)
+        candidate_rows = search_fingerprint_rows(audio_fp_hash, **search_kwargs)
         query_hashes = unpickle_fingerprint_hashes(audio_fp_blob)
         verified_hits = find_verified_fingerprint_hits(
             query_hashes=query_hashes,
             candidate_rows=candidate_rows,
             query_media_id=query_media_id,
         )
-        insert_fingerprint(audio_fp_hash, query_media_id, 0.0, audio_fp_blob)
+        insert_fingerprint(audio_fp_hash, query_media_id, 0.0, audio_fp_blob, **insert_kwargs)
         audio_hit, audio_similarity = audio_embedded_similarity_flags(verified_hits)
         for hit in verified_hits:
             v = hit.verdict

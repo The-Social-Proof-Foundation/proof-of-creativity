@@ -1,0 +1,6 @@
+- id: local-curated
+  adapter_type: manual_curated
+  domain: creative
+  trust_score: 0.95
+  enabled: true
+  entries: []

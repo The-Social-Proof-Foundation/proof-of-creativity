@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 
 from app.db.oracle_repository import ConfigCacheRepository
@@ -126,8 +127,15 @@ class DecisionEngine:
             )
 
         off_network_derivative = False
-        if analysis.off_network and analysis.identity_hash and score >= (
+        if (
+            analysis.off_network
+            and analysis.identity_hash
+            and analysis.creator_confidence
+            >= float(os.getenv("DISCOVERY_X_HANDLE_CONFIDENCE_THRESHOLD", "0.85"))
+            and score
+            >= (
             audio_thr if analysis.media_type == 3 else video_thr if analysis.media_type == 2 else image_thr
+            )
         ):
             off_network_derivative = True
             derivative = True
