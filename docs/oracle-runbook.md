@@ -46,11 +46,20 @@ On startup, each oracle process calls **session refresh** (when `MYSO_REFRESH_SE
 
 Docker Compose sets `GRAPHQL_URL=http://host.docker.internal:9125/graphql` so containers reach the host indexer.
 
-## Localnet mock sync
+## Localnet gRPC sync
 
-Localnet uses `grpc_sync.mock_mode: true` and replays fixtures from `data/fixtures/post_created_events.json`.
+`config/networks/localnet.yaml` sets **`grpc_sync.mock_mode: false`** for live localnet with `myso start --with-poc` (checkpoint sync against the host fullnode at `http://host.docker.internal:9000`).
 
-Set `grpc_sync.mock_mode: false` to ingest live `PostCreatedEvent` entries from a local fullnode via gRPC.
+To replay fixtures offline instead of ingesting live `PostCreatedEvent` entries, explicitly set `grpc_sync.mock_mode: true` and point `fixture_path` at `data/fixtures/post_created_events.json`. Mock replay is **not** the default for localnet.
+
+**Recommended E2E validation** after starting the stack:
+
+```bash
+# From myso-core (sibling proof-of-creativity repo required)
+ASSUME_YES=1 ./scripts/poc-e2e-runnable.sh --run-all
+```
+
+This script syncs the on-chain oracle address, creates a PoC+SPT post, waits for grpc-sync + worker attestation, asserts Move events via `myso client tx-block`, and runs discovery embed + mock username claim legs.
 
 ## Production gRPC sync (default: checkpoint_v2)
 

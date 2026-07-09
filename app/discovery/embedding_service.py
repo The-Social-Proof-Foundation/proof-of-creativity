@@ -7,9 +7,11 @@ import uuid
 from dataclasses import dataclass
 
 import structlog
+from fastapi import HTTPException
 
-from app.core.utils import cleanup_temp_file, new_media_id
+from app.core.utils import cleanup_temp_file
 from app.discovery.context import discovered_context
+from app.discovery.confidence import cold_start_work_confidence
 from app.discovery.identity import resolve_identity_hash
 from app.services.analysis.media_fetcher import download_media
 from app.services.media_similarity import (
@@ -22,6 +24,8 @@ from app.services.poc_video import analyze_video_similarity
 
 logger = structlog.get_logger()
 
+_ALLOWED_MEDIA_TYPES = frozenset({"image", "audio", "video", "1", "2", "3"})
+
 
 @dataclass
 class EmbedResult:
@@ -32,13 +36,59 @@ class EmbedResult:
     identity_hash: str | None = None
 
 
+def _normalize_media_type(media_type: str) -> str:
+    return media_type.strip().lower().split(";", 1)[0].strip()
+
+
+def validate_embed_media_type(media_type: str) -> str:
+    """Return normalized media type or raise HTTP 400 for non-media."""
+    normalized = _normalize_media_type(media_type)
+    # Accept MIME prefixes from misconfigured clients, map to PoC codes.
+    if normalized.startswith("image/"):
+        return "image"
+    if normalized.startswith("video/"):
+        return "video"
+    if normalized.startswith("audio/"):
+        return "audio"
+    if normalized not in _ALLOWED_MEDIA_TYPES:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "media_type must be one of image, audio, video "
+                f"(got {media_type!r}); factual text/JSON is not embeddable"
+            ),
+        )
+    if normalized in ("1",):
+        return "image"
+    if normalized in ("2",):
+        return "video"
+    if normalized in ("3",):
+        return "audio"
+    return normalized
+
+
 def _media_type_code(media_type: str) -> int:
-    normalized = media_type.strip().lower()
-    if normalized in ("audio", "3"):
+    normalized = validate_embed_media_type(media_type)
+    if normalized == "audio":
         return MEDIA_TYPE_AUDIO
-    if normalized in ("video", "2"):
+    if normalized == "video":
         return MEDIA_TYPE_VIDEO
     return MEDIA_TYPE_IMAGE
+
+
+def _is_unreadable_media_error(exc: BaseException) -> bool:
+    msg = str(exc).lower()
+    needles = (
+        "cannot identify image file",
+        "unidentifiedimageerror",
+        "unsupported media",
+        "invalid data found when processing input",
+        "does not look like",
+        "not a valid",
+        "no such file",
+        "failed to open",
+    )
+    return any(n in msg for n in needles)
 
 
 async def embed_discovered_asset(
@@ -49,7 +99,10 @@ async def embed_discovered_asset(
     embedding_version: str | None = None,
     creator_x_handle: str | None = None,
     creator_confidence: float = 0.0,
+    creator_candidate_id: str | None = None,
 ) -> EmbedResult:
+    # Fail fast before download when media_type is not PoC-embeddable.
+    code = _media_type_code(media_type)
     identity_hash = resolve_identity_hash(creator_x_handle)
     ctx = discovered_context(
         discovery_asset_id=discovery_asset_id,
@@ -57,24 +110,38 @@ async def embed_discovered_asset(
         creator_x_handle=creator_x_handle,
         creator_confidence=creator_confidence,
         identity_hash=identity_hash,
+        creator_candidate_id=creator_candidate_id,
     )
     media_id = f"disc_{uuid.uuid4()}"
     path, _content_type = await download_media(external_source_url)
     try:
         set_active_embedding_context(ctx)
-        code = _media_type_code(media_type)
         matches = []
-        if code == MEDIA_TYPE_IMAGE:
-            matches = await detect_image_similarity(path, media_id)
-        elif code == MEDIA_TYPE_AUDIO:
-            matches = await detect_audio_similarity(path, media_id)
-        elif code == MEDIA_TYPE_VIDEO:
-            analysis = await analyze_video_similarity(path, media_id)
-            matches = analysis.matches
-        else:
-            matches = await detect_image_similarity(path, media_id)
+        try:
+            if code == MEDIA_TYPE_IMAGE:
+                matches = await detect_image_similarity(path, media_id)
+            elif code == MEDIA_TYPE_AUDIO:
+                matches = await detect_audio_similarity(path, media_id)
+            elif code == MEDIA_TYPE_VIDEO:
+                analysis = await analyze_video_similarity(path, media_id)
+                matches = analysis.matches
+            else:
+                matches = await detect_image_similarity(path, media_id)
+        except Exception as exc:
+            if _is_unreadable_media_error(exc):
+                logger.warning(
+                    "Unsupported media for discovery embed",
+                    discovery_asset_id=discovery_asset_id,
+                    media_type=media_type,
+                    error=str(exc),
+                )
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"unsupported media: downloaded bytes are not valid {media_type}",
+                ) from exc
+            raise
 
-        work_confidence = max((m.similarity_score for m in matches), default=0.95)
+        work_confidence = max((m.similarity_score for m in matches), default=cold_start_work_confidence())
         ctx.work_confidence = work_confidence
         logger.info(
             "Discovered asset embedded",

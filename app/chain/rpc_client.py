@@ -212,6 +212,55 @@ class TransactionSubmitter:
         )
         return self._execute_move_call(data)
 
+    def reserve_towards_post(
+        self,
+        *,
+        post_id: str,
+        beneficiary_vault_id: str,
+        amount: int,
+        reservation_pool_object_id: str,
+        platform_id: str,
+        min_vault_deposit_amount: int = 0,
+    ) -> dict:
+        if os.getenv("POC_RESERVATION_ENABLED", "").lower() not in ("1", "true", "yes"):
+            raise RuntimeError("POC_RESERVATION_ENABLED is not set")
+        if not self.writes_enabled:
+            return self._mock_tx(
+                "reserve_towards_post_with_platform",
+                {"post_id": post_id, "amount": amount},
+            )
+        from app.chain.move_calls import build_reserve_towards_post_with_platform_call
+
+        package_id = self.client.package_id if self.client else None
+        if not package_id:
+            raise RuntimeError("Package id not configured for reservation")
+        data = build_reserve_towards_post_with_platform_call(
+            package_id=str(package_id),
+            token_registry_id=_require_object_id(
+                self.profile, "MYSO_TOKEN_REGISTRY_ID", "token_registry", "TokenRegistry"
+            ),
+            spt_config_id=_require_object_id(
+                self.profile, "MYSO_SPT_CONFIG_ID", "spt_config", "SocialProofTokensConfig"
+            ),
+            min_vault_deposit_amount=min_vault_deposit_amount,
+            reservation_pool_object_id=reservation_pool_object_id,
+            treasury_id=_require_object_id(
+                self.profile, "MYSO_ECOSYSTEM_TREASURY_ID", "ecosystem_treasury", "EcosystemTreasury"
+            ),
+            platform_registry_id=_require_object_id(
+                self.profile, "MYSO_PLATFORM_REGISTRY_ID", "platform_registry", "PlatformRegistry"
+            ),
+            platform_id=platform_id,
+            block_list_registry_id=_require_object_id(
+                self.profile, "MYSO_BLOCK_LIST_REGISTRY_ID", "block_list_registry", "BlockListRegistry"
+            ),
+            post_id=post_id,
+            beneficiary_vault_id=beneficiary_vault_id,
+            amount=amount,
+            clock_id=_require_object_id(self.profile, "MYSO_CLOCK_OBJECT_ID", "clock", "Clock"),
+        )
+        return self._execute_move_call(data)
+
     def _submit_admin_move_call(self, data: dict) -> dict:
         admin_key = os.getenv("POC_ADMIN_PRIVATE_KEY") or os.getenv(
             self.profile.signers.admin_private_key_env, ""

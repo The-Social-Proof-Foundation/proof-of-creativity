@@ -16,12 +16,20 @@ Cross-repo map for the Proof of Creativity discovery platform and hidden provena
 2. **Lazy vaults** — `UsernameBeneficiaryService.ensure_provisioned` runs only from `oracle_worker` on off-network derivative matches.
 3. **No raw external media persistence** — temp fetch → embed → delete; store embeddings, hashes, metadata, source URLs only.
 4. **Hidden by default** — discovered creators and source URLs are internal; no public PoC badges for unverified creators.
+5. **PoC embed is creative media only** — `media_type` must be `image` / `audio` / `video` (or `1`/`2`/`3`). Factual RSS/JSON is SPoT’s lane; non-media requests get **400**, unreadable downloads get **422**.
+
+## Two corpora
+
+| Corpus | Owner | Config (myso-core) |
+|--------|-------|--------------------|
+| Creative media → PoC embed | discovery-service + PoC | `sources.media.localnet.yaml` |
+| Factual text → SPoT settlement | spot-oracle `TrustedSource` | `sources.factual.localnet.yaml` / spot YAML |
 
 ## Data flow
 
 ```
-DiscoverySource adapters (Rust)
-  → normalize → lifecycle FSM → discovery_jobs queue
+DiscoverySource (creative media only for embed)
+  → normalize (content_kind=media) → lifecycle FSM → discovery_jobs
   → embed_client → POST /internal/discovery/embed (PoC)
   → pgvector corpus (corpus_scope=discovered, disc_* media_id)
   → oracle_worker similarity search (platform + discovered)
@@ -53,9 +61,10 @@ Vault provisioning requires both passing configured thresholds plus resolvable `
 
 ## SPoT alignment
 
-Discovery adapters mirror the SPoT oracle `TrustedSource` registry pattern (`DiscoverySource` trait). Factual adapters register disabled for future Social Proof of Truth consumption.
+SPoT uses shared YAML/`HttpFetchClient` from `myso-discovery-service-core` and its own `TrustedSource` adapters for **factual text/price/events**. It does **not** consume the PoC media embed corpus or `discovery_assets`.
 
 ## Related docs
 
 - Oracle runbook: `docs/oracle-runbook.md`
-- SPoT oracle plan: `myso-core/.cursor/plans/spot_oracle_server_v1_17a97a27.plan.md`
+- Discovery runbook: `docs/discovery-runbook.md`
+- myso-core discovery ARCHITECTURE: `myso-core/crates/myso-discovery-service/docs/ARCHITECTURE.md`

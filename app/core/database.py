@@ -168,6 +168,36 @@ def insert_embedding(
                     media_id=media_id, kind=kind, error=str(e))
         raise
 
+def insert_provenance_metadata(
+    media_id: str,
+    kind: str,
+    metadata: Dict[str, Any],
+    *,
+    corpus_scope: str = "platform",
+    discovery_asset_id: Optional[str] = None,
+    embedding_model: Optional[str] = None,
+    embedding_version: Optional[str] = None,
+    embedding_dimension: Optional[int] = None,
+    embedding_created_at=None,
+):
+    """Store discovery provenance metadata without a searchable embedding vector."""
+    from datetime import datetime, timezone
+
+    dim = embedding_dimension or int(os.getenv("EMBEDDING_DIMENSION", "512"))
+    zero_vector = [0.0] * dim
+    insert_embedding(
+        media_id,
+        kind,
+        zero_vector,
+        metadata,
+        corpus_scope=corpus_scope,
+        discovery_asset_id=discovery_asset_id,
+        embedding_model=embedding_model,
+        embedding_version=embedding_version,
+        embedding_dimension=dim,
+        embedding_created_at=embedding_created_at,
+    )
+
 def search_embedding_with_timescale_ai(
     vector: List[float], 
     top_k: int = 5, 

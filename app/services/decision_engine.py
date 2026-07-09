@@ -6,6 +6,7 @@ import os
 from dataclasses import dataclass
 
 from app.db.oracle_repository import ConfigCacheRepository
+from app.discovery.confidence import passes_off_network_thresholds
 from app.network_config import get_settings
 from app.services.analysis.pipeline import AnalysisResult
 from app.services.poc_submission import build_image_or_audio_submission
@@ -129,9 +130,11 @@ class DecisionEngine:
         off_network_derivative = False
         if (
             analysis.off_network
-            and analysis.identity_hash
-            and analysis.creator_confidence
-            >= float(os.getenv("DISCOVERY_X_HANDLE_CONFIDENCE_THRESHOLD", "0.85"))
+            and passes_off_network_thresholds(
+                identity_hash=analysis.identity_hash,
+                creator_confidence=analysis.creator_confidence,
+                work_confidence=analysis.work_confidence,
+            )
             and score
             >= (
             audio_thr if analysis.media_type == 3 else video_thr if analysis.media_type == 2 else image_thr

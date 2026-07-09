@@ -99,6 +99,58 @@ class ChainPostRepository:
                 )
                 conn.commit()
 
+    def list_needs_review(
+        self,
+        network: str,
+        *,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> list[dict]:
+        with get_db_connection() as conn:
+            with conn.cursor(cursor_factory=extras.RealDictCursor) as cur:
+                cur.execute(
+                    """
+                    SELECT * FROM chain_posts
+                    WHERE network = %s AND analysis_status = 'needs_review'
+                    ORDER BY updated_at DESC
+                    LIMIT %s OFFSET %s
+                    """,
+                    (network, limit, offset),
+                )
+                return [dict(r) for r in cur.fetchall()]
+
+    def resolve_review(
+        self,
+        network: str,
+        post_id: str,
+        *,
+        action: str,
+        resolved_by: str | None = None,
+        notes: str | None = None,
+    ) -> None:
+        status_map = {
+            "approve_escrow": "pending_reanalysis",
+            "reject": "rejected",
+            "requeue": "discovered",
+        }
+        new_status = status_map.get(action, "needs_review")
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE chain_posts
+                    SET analysis_status = %s,
+                        review_resolution = %s,
+                        review_resolved_by = %s,
+                        review_notes = %s,
+                        review_resolved_at = NOW(),
+                        updated_at = NOW()
+                    WHERE network = %s AND post_id = %s
+                    """,
+                    (new_status, action, resolved_by, notes, network, post_id),
+                )
+                conn.commit()
+
 
 class CheckpointRepository:
     def get(self, network: str, stream_id: str = "default") -> dict | None:
@@ -283,6 +335,33 @@ class AttestationRepository:
                     ORDER BY created_at DESC
                     """,
                     (network, post_id),
+                )
+                return [dict(r) for r in cur.fetchall()]
+
+    def mark_confirmed(self, network: str, tx_digest: str) -> None:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE chain_attestations
+                    SET status = 'confirmed'
+                    WHERE network = %s AND tx_digest = %s
+                    """,
+                    (network, tx_digest),
+                )
+                conn.commit()
+
+    def list_submitted(self, network: str, limit: int = 20) -> list[dict]:
+        with get_db_connection() as conn:
+            with conn.cursor(cursor_factory=extras.RealDictCursor) as cur:
+                cur.execute(
+                    """
+                    SELECT * FROM chain_attestations
+                    WHERE network = %s AND status = 'submitted' AND tx_digest IS NOT NULL
+                    ORDER BY created_at ASC
+                    LIMIT %s
+                    """,
+                    (network, limit),
                 )
                 return [dict(r) for r in cur.fetchall()]
 

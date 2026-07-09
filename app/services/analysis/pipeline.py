@@ -11,6 +11,7 @@ from app.core.database import lookup_mysocial_creator_for_media_ids
 from app.core.utils import cleanup_temp_file, new_media_id
 from app.db.discovery_repository import ProvenanceHitRepository
 from app.db.oracle_repository import ConfigCacheRepository, MediaPostLinkRepository
+from app.discovery.confidence import passes_off_network_thresholds
 from app.models.similarity import MediaMatch
 from app.services.analysis.media_fetcher import download_media
 from app.services.analysis.scoring import similarity_float_to_u64_percent
@@ -21,10 +22,6 @@ from app.services.poc_utils import MEDIA_TYPE_AUDIO, MEDIA_TYPE_IMAGE, MEDIA_TYP
 from app.services.poc_video import analyze_video_similarity
 
 logger = structlog.get_logger()
-
-
-def _creator_confidence_threshold() -> float:
-    return float(os.getenv("DISCOVERY_X_HANDLE_CONFIDENCE_THRESHOLD", "0.85"))
 
 
 def _select_discovered_match(matches: list[MediaMatch]) -> MediaMatch | None:
@@ -141,16 +138,22 @@ class AnalysisService:
             matched_x_handle = None
 
             discovered_match = _select_discovered_match(matches)
-            if discovered_match and discovered_match.match_details:
-                details = discovered_match.match_details
+            details = (discovered_match.match_details or {}) if discovered_match else {}
+            if discovered_match and details:
                 work_confidence = float(details.get("work_confidence") or discovered_match.similarity_score)
                 creator_confidence = float(details.get("creator_confidence") or 0.0)
                 discovery_asset_id = details.get("discovery_asset_id")
                 matched_x_handle = details.get("creator_x_handle")
                 identity_hash = details.get("identity_hash")
 
+            creator_candidate_id = details.get("creator_candidate_id")
+
             if highest > 0 and not creator:
-                if identity_hash and creator_confidence >= _creator_confidence_threshold():
+                if passes_off_network_thresholds(
+                    identity_hash=identity_hash,
+                    creator_confidence=creator_confidence,
+                    work_confidence=work_confidence,
+                ):
                     off_network = True
                     needs_review = False
                     decision = "redirect_escrow"
@@ -169,7 +172,7 @@ class AnalysisService:
                         post_id=post_id,
                         query_media_id=media_id,
                         discovery_asset_id=str(discovery_asset_id) if discovery_asset_id else None,
-                        creator_candidate_id=None,
+                        creator_candidate_id=str(creator_candidate_id) if creator_candidate_id else None,
                         similarity_score=float(discovered_match.similarity_score),
                         match_type=str(discovered_match.match_type),
                         work_confidence=work_confidence,
@@ -178,6 +181,21 @@ class AnalysisService:
                     )
                     if discovery_asset_id and off_network:
                         await self.discovery.lifecycle_event(str(discovery_asset_id), "match_detected")
+                    if needs_review and discovery_asset_id:
+                        await self.discovery.lifecycle_event(str(discovery_asset_id), "needs_review")
+                        await self.discovery.record_provenance_hit(
+                            {
+                                "network": network,
+                                "post_id": post_id,
+                                "query_media_id": media_id,
+                                "discovery_asset_id": discovery_asset_id,
+                                "similarity_score": float(discovered_match.similarity_score),
+                                "work_confidence": work_confidence,
+                                "creator_confidence": creator_confidence,
+                                "decision": "needs_review",
+                                "vault_provisioned": False,
+                            }
+                        )
 
             reasoning = f"Analyzed {media_url}; matches={len(matches)}; top_score_u64={highest}."
             result = AnalysisResult(
@@ -203,7 +221,14 @@ class AnalysisService:
             if needs_review:
                 await event_bus.publish(
                     "post.analysis.needs_review",
-                    {"network": network, "post_id": post_id, "reason": "unresolvable_creator"},
+                    {
+                        "network": network,
+                        "post_id": post_id,
+                        "reason": "unresolvable_creator",
+                        "discovery_asset_id": discovery_asset_id,
+                        "work_confidence": work_confidence,
+                        "creator_confidence": creator_confidence,
+                    },
                 )
             await event_bus.publish(
                 "post.analysis.complete",

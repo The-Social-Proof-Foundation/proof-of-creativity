@@ -14,6 +14,7 @@ import structlog
 
 from app.chain.move_address import canonical_registry_username, parse_identity_hash
 from app.network_config import NetworkProfile, load_network_profile
+from app.services.identity_verification_client import IdentityVerificationClient
 from app.services.poc_chain_helpers import fetch_username_beneficiary_fields
 
 logger = structlog.get_logger()
@@ -40,6 +41,10 @@ def compute_evidence_hash_v1(payload: dict[str, Any]) -> bytes:
     return hashlib.blake2b(canonical.encode("utf-8"), digest_size=32).digest()
 
 
+def evidence_hash_hex(digest: bytes) -> str:
+    return "0x" + digest.hex()
+
+
 def _mock_verifier_allowed(profile: NetworkProfile) -> bool:
     if os.getenv("POC_IDENTITY_VERIFIER", "").strip().lower() != "mock":
         return False
@@ -48,13 +53,19 @@ def _mock_verifier_allowed(profile: NetworkProfile) -> bool:
     return profile.network == "localnet" and profile.chain_writes_enabled
 
 
+def _legacy_oauth_allowed(profile: NetworkProfile) -> bool:
+    if profile.network not in ("testnet", "mainnet"):
+        return True
+    return os.getenv("ALLOW_LEGACY_OAUTH_TOKEN", "").strip().lower() in ("1", "true", "yes")
+
+
 def resolve_identity_verifier_mode(network: str) -> str:
     explicit = os.getenv("POC_IDENTITY_VERIFIER", "").strip().lower()
     if explicit:
         return explicit
     profile = load_network_profile(network)
     if profile.network in ("testnet", "mainnet"):
-        return "x-oauth"
+        return "myso-identity"
     return "mock"
 
 
@@ -63,6 +74,7 @@ class IdentityVerifier:
         self.network = network
         self.profile = load_network_profile(network)
         self.mode = resolve_identity_verifier_mode(network)
+        self.identity_client = IdentityVerificationClient()
 
     def verify_claim(
         self,
@@ -72,6 +84,7 @@ class IdentityVerifier:
         identity_hash: str | bytes,
         attested_x_handle: str | None = None,
         oauth_token: str | None = None,
+        session_jwt: str | None = None,
         mock_headers: dict[str, str] | None = None,
         display_name: str = "",
         bio: str = "",
@@ -111,7 +124,43 @@ class IdentityVerifier:
                     f"attested_x_handle {handle!r} does not match required_x_handle {required_handle!r}"
                 )
             verifier = "mock"
+            evidence_payload = {
+                "v": EVIDENCE_VERSION,
+                "beneficiary_id": beneficiary_id,
+                "identity_source": 1,
+                "identity_hash": "0x" + ih_bytes.hex(),
+                "attested_x_handle": handle,
+                "wallet": wallet,
+                "verified_at": int(time.time()),
+                "verifier": verifier,
+            }
+            evidence_hash = compute_evidence_hash_v1(evidence_payload)
+        elif self.mode in ("myso-identity", "myso_identity", "identity-verification"):
+            if oauth_token and not _legacy_oauth_allowed(self.profile):
+                raise ValueError(
+                    "raw oauth_token is disabled in production; use session JWT with myso-identity-verification"
+                )
+            if not session_jwt and not self.identity_client.service_secret:
+                raise ValueError("session JWT or service secret required for myso-identity verification")
+            attestation = self.identity_client.attest_for_claim_sync(
+                identity_hash="0x" + ih_bytes.hex(),
+                beneficiary_id=beneficiary_id,
+                wallet=wallet,
+                session_jwt=session_jwt,
+            )
+            handle = canonical_registry_username(attestation.attested_x_handle.strip().lstrip("@"))
+            if required_handle and handle != required_handle:
+                raise ValueError(
+                    f"OAuth username {handle!r} does not match required_x_handle {required_handle!r}"
+                )
+            attestation_bytes = parse_identity_hash(attestation.identity_hash)
+            if attestation_bytes != ih_bytes:
+                raise ValueError("identity verification service returned mismatched identity_hash")
+            verifier = attestation.verifier
+            evidence_hash = parse_identity_hash(attestation.evidence_hash)
         elif self.mode in ("x-oauth", "x_oauth", "oauth"):
+            if not _legacy_oauth_allowed(self.profile):
+                raise ValueError("x-oauth mode is disabled; set POC_IDENTITY_VERIFIER=myso-identity")
             handle = self._verify_x_oauth(oauth_token=oauth_token)
             handle = canonical_registry_username(handle.strip().lstrip("@"))
             if required_handle and handle != required_handle:
@@ -119,20 +168,20 @@ class IdentityVerifier:
                     f"OAuth username {handle!r} does not match required_x_handle {required_handle!r}"
                 )
             verifier = "x-oauth"
+            evidence_payload = {
+                "v": EVIDENCE_VERSION,
+                "beneficiary_id": beneficiary_id,
+                "identity_source": 1,
+                "identity_hash": "0x" + ih_bytes.hex(),
+                "attested_x_handle": handle,
+                "wallet": wallet,
+                "verified_at": int(time.time()),
+                "verifier": verifier,
+            }
+            evidence_hash = compute_evidence_hash_v1(evidence_payload)
         else:
             raise RuntimeError(f"Unsupported identity verifier mode: {self.mode}")
 
-        evidence_payload = {
-            "v": EVIDENCE_VERSION,
-            "beneficiary_id": beneficiary_id,
-            "identity_source": 1,
-            "identity_hash": "0x" + ih_bytes.hex(),
-            "attested_x_handle": handle,
-            "wallet": wallet,
-            "verified_at": int(time.time()),
-            "verifier": verifier,
-        }
-        evidence_hash = compute_evidence_hash_v1(evidence_payload)
         logger.info(
             "Identity claim verified",
             network=self.network,

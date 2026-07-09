@@ -176,6 +176,33 @@ def bootstrap_network_session(network: str) -> dict[str, str]:
     return resolved
 
 
+def validate_registry_objects(profile: NetworkProfile) -> list[str]:
+    """Return missing required registry object keys for startup validation."""
+    required = (
+        "poc_registry",
+        "poc_config",
+        "username_registry",
+        "poc_vault_directory",
+        "username_beneficiary_directory",
+        "poc_beneficiary_admin_cap",
+    )
+    env_by_key = {
+        "poc_registry": "MYSO_POC_REGISTRY_ID",
+        "poc_config": "MYSO_POC_CONFIG_ID",
+        "username_registry": "MYSO_USERNAME_REGISTRY_ID",
+        "poc_vault_directory": "MYSO_POC_VAULT_DIRECTORY_ID",
+        "username_beneficiary_directory": "MYSO_POC_USERNAME_BENEFICIARY_DIRECTORY_ID",
+        "poc_beneficiary_admin_cap": "MYSO_POC_BENEFICIARY_ADMIN_CAP_ID",
+    }
+    objs = profile.objects or {}
+    missing = [
+        key
+        for key in required
+        if not objs.get(key) and not os.getenv(env_by_key[key], "").strip()
+    ]
+    return missing
+
+
 def bootstrap_active_network_sessions() -> None:
     """Bootstrap all active networks (MYSO_NETWORK or MYSO_NETWORKS)."""
     for network in active_networks():

@@ -108,3 +108,42 @@ def build_claim_username_beneficiary_call(
             _require(clock_id, "Clock"),
         ],
     }
+
+
+
+def build_reserve_towards_post_with_platform_call(
+    *,
+    package_id: str,
+    token_registry_id: str,
+    spt_config_id: str,
+    min_vault_deposit_amount: int,
+    reservation_pool_object_id: str,
+    treasury_id: str,
+    platform_registry_id: str,
+    platform_id: str,
+    block_list_registry_id: str,
+    post_id: str,
+    beneficiary_vault_id: str,
+    amount: int,
+    clock_id: str,
+) -> dict[str, Any]:
+    return {
+        "packageObjectId": package_id,
+        "module": "social_proof_tokens",
+        "function": "reserve_towards_post_with_platform",
+        "typeArguments": [],
+        "arguments": [
+            _require(token_registry_id, "TokenRegistry"),
+            _require(spt_config_id, "SocialProofTokensConfig"),
+            min_vault_deposit_amount,
+            _require(reservation_pool_object_id, "ReservationPoolObject"),
+            _require(treasury_id, "EcosystemTreasury"),
+            _require(platform_registry_id, "PlatformRegistry"),
+            _require(platform_id, "Platform"),
+            _require(block_list_registry_id, "BlockListRegistry"),
+            _require(post_id, "Post"),
+            _require(beneficiary_vault_id, "PoCBeneficiaryVault"),
+            amount,
+            _require(clock_id, "Clock"),
+        ],
+    }

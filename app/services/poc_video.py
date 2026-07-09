@@ -19,7 +19,12 @@ from app.services.fingerprint import (
     find_verified_fingerprint_hits,
     unpickle_fingerprint_hashes,
 )
-from app.services.media_similarity import corpus_search_kwargs, insert_kwargs_from_context
+from app.services.media_similarity import (
+    corpus_search_kwargs,
+    insert_kwargs_from_context,
+    _enrich_match_details,
+    _media_match_from_hit,
+)
 from app.core.database import (
     insert_embedding,
     insert_fingerprint,
@@ -69,22 +74,26 @@ def analyze_video_similarity(temp_file_path: str, query_media_id: str) -> VideoS
                 confidence = ConfidenceLevel.MEDIUM
             else:
                 confidence = ConfidenceLevel.LOW
+            details = _enrich_match_details(
+                match_media_id,
+                {"embedding_type": "clip", "kind": kind, "frame_index": idx},
+            )
             insert_similarity_match(
                 query_media_id=query_media_id,
                 match_media_id=match_media_id,
                 match_type="embedding",
                 similarity_score=sim,
                 confidence_level=confidence.value,
-                match_details={"embedding_type": "clip", "kind": kind, "frame_index": idx},
+                match_details=details,
             )
             meta_dict = metadata if isinstance(metadata, dict) else None
             matches.append(
-                MediaMatch(
-                    media_id=corpus_parent_media_id(match_media_id, meta_dict),
-                    similarity_score=sim,
-                    similarity_score_percent=similarity_float_to_u64_percent(sim),
-                    match_type=MatchType.EMBEDDING,
-                    confidence_level=confidence,
+                _media_match_from_hit(
+                    corpus_parent_media_id(match_media_id, meta_dict),
+                    sim,
+                    MatchType.EMBEDDING,
+                    confidence,
+                    details,
                 )
             )
 
@@ -101,13 +110,9 @@ def analyze_video_similarity(temp_file_path: str, query_media_id: str) -> VideoS
         for hit in verified_hits:
             v = hit.verdict
             match_media_id = hit.corpus_media_id
-            insert_similarity_match(
-                query_media_id=query_media_id,
-                match_media_id=match_media_id,
-                match_type="fingerprint",
-                similarity_score=float(hit.similarity_score),
-                confidence_level=hit.confidence_level.value,
-                match_details={
+            details = _enrich_match_details(
+                match_media_id,
+                {
                     "fingerprint_hash": audio_fp_hash,
                     "offset": v.get("offset"),
                     "matching_hashes": v.get("matching_hashes"),
@@ -115,13 +120,21 @@ def analyze_video_similarity(temp_file_path: str, query_media_id: str) -> VideoS
                     "constellation_verified": True,
                 },
             )
+            insert_similarity_match(
+                query_media_id=query_media_id,
+                match_media_id=match_media_id,
+                match_type="fingerprint",
+                similarity_score=float(hit.similarity_score),
+                confidence_level=hit.confidence_level.value,
+                match_details=details,
+            )
             matches.append(
-                MediaMatch(
-                    media_id=corpus_parent_media_id(match_media_id, None),
-                    similarity_score=float(hit.similarity_score),
-                    similarity_score_percent=similarity_float_to_u64_percent(float(hit.similarity_score)),
-                    match_type=MatchType.FINGERPRINT,
-                    confidence_level=hit.confidence_level,
+                _media_match_from_hit(
+                    corpus_parent_media_id(match_media_id, None),
+                    float(hit.similarity_score),
+                    MatchType.FINGERPRINT,
+                    hit.confidence_level,
+                    details,
                 )
             )
 

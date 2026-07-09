@@ -130,7 +130,12 @@ async def lifespan(app: FastAPI):
             logger.warning("Could not create vector indexes", error=str(e))
         
         # Step 5: Initialize MySocial blockchain client (optional)
-        from app.network_config import bootstrap_active_network_sessions
+        from app.network_config import (
+            active_networks,
+            bootstrap_active_network_sessions,
+            load_network_profile,
+            validate_registry_objects,
+        )
         from app.services.myso_client import init_myso_client
 
         bootstrap_active_network_sessions()
@@ -161,6 +166,20 @@ async def lifespan(app: FastAPI):
             logger.info("Database connection verified")
         else:
             logger.warning("Database connection check failed")
+
+        from app.discovery.bootstrap import evaluate_bootstrap_status
+
+        for network in active_networks():
+            profile = load_network_profile(network)
+            missing = validate_registry_objects(profile)
+            if missing:
+                logger.warning("Registry objects missing", network=network, missing=missing)
+
+        discovery_status = evaluate_bootstrap_status()
+        if discovery_status.ready:
+            logger.info("Discovery bootstrap ready", corpus=discovery_status.corpus_counts)
+        elif discovery_status.issues:
+            logger.warning("Discovery bootstrap issues", issues=discovery_status.issues)
 
         # Oracle WebSocket event bus → hub fan-out
         from app.api.ws.hub import ws_hub

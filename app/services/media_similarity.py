@@ -78,6 +78,8 @@ def _enrich_match_details(match_media_id: str, base: dict) -> dict:
             "corpus_scope": provenance.get("corpus_scope") or meta.get("corpus_scope", "platform"),
             "discovery_asset_id": provenance.get("discovery_asset_id") or meta.get("discovery_asset_id"),
             "identity_hash": meta.get("identity_hash"),
+            "creator_x_handle": meta.get("creator_x_handle"),
+            "creator_candidate_id": meta.get("creator_candidate_id"),
             "creator_confidence": meta.get("creator_confidence"),
             "work_confidence": meta.get("work_confidence"),
             "visibility": meta.get("visibility", "platform"),
@@ -261,6 +263,11 @@ async def detect_audio_similarity(file_path: str, media_id: str) -> List[MediaMa
             query_media_id=media_id,
         )
         insert_fingerprint(fp_hash, media_id, 0.0, fp_blob, **insert_kwargs)
+        metadata = ctx.provenance_metadata()
+        if metadata.get("corpus_scope") == "discovered":
+            from app.core.database import insert_provenance_metadata
+
+            insert_provenance_metadata(media_id, "audio", metadata, **insert_kwargs)
         matches: List[MediaMatch] = []
         for hit in verified_hits:
             v = hit.verdict

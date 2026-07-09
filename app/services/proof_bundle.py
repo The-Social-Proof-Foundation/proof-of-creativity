@@ -67,14 +67,42 @@ class ProofBundleService:
 
     def store(self, bundle: dict[str, Any]) -> str:
         storage = self.profile.storage
+        payload = json.dumps(bundle, indent=2).encode("utf-8")
+        name = f"proofs/{self.network}/{bundle['post_id']}_{uuid.uuid4().hex[:8]}.json"
+
+        if storage.use_local or not (
+            storage.use_gcs
+            or storage.use_walrus
+            or os.getenv("USE_CLOUDFLARE_R2", "").lower() in ("1", "true", "yes")
+        ):
+            base = Path(storage.local_path)
+            if not base.is_absolute():
+                base = ROOT_DIR / base
+            base.mkdir(parents=True, exist_ok=True)
+            path = base / Path(name).name
+            path.write_bytes(payload)
+            return f"file://{path}"
+
+        try:
+            import io
+
+            from app.core.storage import StorageClient
+
+            client = StorageClient()
+            uri = client.upload(
+                Path(name).name,
+                io.BytesIO(payload),
+                media_type="application/json",
+            )
+            if uri:
+                return uri
+        except Exception as exc:
+            logger.warning("Remote proof storage failed; falling back to local", error=str(exc))
+
         base = Path(storage.local_path)
         if not base.is_absolute():
             base = ROOT_DIR / base
         base.mkdir(parents=True, exist_ok=True)
-        name = f"{self.network}_{bundle['post_id']}_{uuid.uuid4().hex[:8]}.json"
-        path = base / name
-        path.write_text(json.dumps(bundle, indent=2), encoding="utf-8")
-        uri = f"file://{path}"
-        if storage.use_walrus and not storage.use_local:
-            logger.info("Walrus upload stub; stored locally", network=self.network, uri=uri)
-        return uri
+        path = base / Path(name).name
+        path.write_bytes(payload)
+        return f"file://{path}"

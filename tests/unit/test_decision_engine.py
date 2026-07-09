@@ -53,6 +53,7 @@ def test_off_network_forces_escrow(monkeypatch):
         off_network=True,
         identity_hash="abc123",
         creator_confidence=0.9,
+        work_confidence=0.96,
     )
     submission = engine.build_submission({}, analysis)
     assert submission.derivative_redirection_target == DERIVATIVE_TARGET_ESCROW

@@ -20,6 +20,7 @@ from app.services.events import event_bus
 from app.services.discovery_client import DiscoveryClient
 from app.services.proof_bundle import ProofBundleService
 from app.services.username_beneficiary import UsernameBeneficiaryService
+from app.services.vault_lifecycle import VaultLifecycleService
 from app.services.poc_utils import truncate_evidence_urls, truncate_reasoning
 
 logger = structlog.get_logger()
@@ -38,6 +39,7 @@ class OracleWorker:
         self.decisions = DecisionEngine()
         self.proofs = ProofBundleService(network)
         self.beneficiaries = UsernameBeneficiaryService(network)
+        self.vault_lifecycle = VaultLifecycleService(network)
         self.submitter = TransactionSubmitter(network)
 
     async def run_forever(self) -> None:
@@ -98,16 +100,14 @@ class OracleWorker:
         vault_provisioned = False
         if submission.off_network and submission.identity_hash and submission.original_creator is None:
             if submission.derivative_redirection_target == 1:
-                original_creator = await self.beneficiaries.ensure_provisioned(
+                original_creator, vault_provisioned = await self.vault_lifecycle.ensure_off_network_vault(
                     post_id=post_id,
                     identity_hash=submission.identity_hash,
                     username=analysis.matched_x_handle,
+                    discovery_asset_id=analysis.discovery_asset_id,
                 )
-                vault_provisioned = True
-                if analysis.discovery_asset_id:
-                    discovery = DiscoveryClient()
-                    await discovery.lifecycle_event(analysis.discovery_asset_id, "vault_created")
-                    await discovery.record_provenance_hit(
+                if vault_provisioned and analysis.discovery_asset_id:
+                    await DiscoveryClient().record_provenance_hit(
                         {
                             "network": self.network,
                             "post_id": post_id,
@@ -120,6 +120,10 @@ class OracleWorker:
                             "vault_provisioned": True,
                             "vault_identity_hash": submission.identity_hash,
                         }
+                    )
+                    await self.vault_lifecycle.mark_claimable(
+                        submission.identity_hash,
+                        analysis.discovery_asset_id,
                     )
 
         cfg = self.submitter.get_poc_config()
@@ -169,6 +173,8 @@ class OracleWorker:
                 "status": "submitted",
             }
         )
+        if tx_digest and not tx.get("mock"):
+            self.attestations.mark_confirmed(self.network, str(tx_digest))
         self.posts.update_status(
             self.network,
             post_id,
@@ -217,6 +223,7 @@ class OracleWorker:
             identity_hash=str(identity_hash),
             attested_x_handle=payload.get("attested_x_handle"),
             oauth_token=payload.get("oauth_token"),
+            session_jwt=payload.get("session_jwt"),
             mock_headers=payload.get("mock_headers") or {},
             display_name=str(payload.get("display_name") or ""),
             bio=str(payload.get("bio") or ""),
@@ -236,6 +243,12 @@ class OracleWorker:
             cover_photo_url=verified.cover_photo_url,
         )
         tx = result.get("tx_hash")
+        discovery_asset_id = payload.get("discovery_asset_id")
+        await self.vault_lifecycle.mark_claimed(
+            identity_hash=str(identity_hash),
+            claimant_address=str(claimant),
+            discovery_asset_id=str(discovery_asset_id) if discovery_asset_id else None,
+        )
         await event_bus.publish(
             "beneficiary.claim.completed",
             {

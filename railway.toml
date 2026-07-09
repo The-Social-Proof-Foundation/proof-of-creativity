@@ -9,6 +9,11 @@ healthcheckTimeout = 120
 restartPolicyType = "on_failure"
 restartPolicyMaxRetries = 3
 
+# Production requires separate Railway services for background workers:
+# - grpc-sync: python scripts/run_grpc_sync.py
+# - oracle-worker: python scripts/run_oracle_worker.py
+# API-only deploy cannot process analyze/claim jobs.
+
 [variables]
 # Core Application Settings
 API_HOST = "0.0.0.0"

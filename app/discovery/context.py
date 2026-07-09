@@ -35,6 +35,7 @@ class EmbeddingContext:
     creator_confidence: float = 0.0
     identity_hash: str | None = None
     work_confidence: float = 0.0
+    creator_candidate_id: str | None = None
 
     def provenance_metadata(self) -> dict[str, Any]:
         meta: dict[str, Any] = {
@@ -50,6 +51,8 @@ class EmbeddingContext:
             meta["identity_hash"] = self.identity_hash
         if self.creator_x_handle:
             meta["creator_x_handle"] = self.creator_x_handle
+        if self.creator_candidate_id:
+            meta["creator_candidate_id"] = self.creator_candidate_id
         if self.creator_confidence:
             meta["creator_confidence"] = self.creator_confidence
         if self.work_confidence:
@@ -74,6 +77,7 @@ def discovered_context(
     creator_x_handle: str | None = None,
     creator_confidence: float = 0.0,
     identity_hash: str | None = None,
+    creator_candidate_id: str | None = None,
 ) -> EmbeddingContext:
     return EmbeddingContext(
         corpus_scope="discovered",
@@ -82,4 +86,5 @@ def discovered_context(
         creator_x_handle=creator_x_handle,
         creator_confidence=creator_confidence,
         identity_hash=identity_hash,
+        creator_candidate_id=creator_candidate_id,
     )
