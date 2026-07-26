@@ -1,35 +1,18 @@
 #!/usr/bin/env bash
-# Validate discovery bootstrap prerequisites for PoC + discovery-service.
+# Verify PoC API readiness and discovery migration state.
+
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-cd "$ROOT"
+POC_URL="${POC_ORACLE_URL:-http://127.0.0.1:8000}"
 
-API_URL="${POC_API_URL:-http://127.0.0.1:8000}"
-DISCOVERY_URL="${DISCOVERY_SERVICE_URL:-http://127.0.0.1:8096}"
-SECRET="${DISCOVERY_EMBED_SECRET:-}"
+echo ">>> PoC discovery bootstrap check"
+echo "POC_URL=$POC_URL"
 
-echo "== Discovery bootstrap check =="
-
-if [[ -z "$SECRET" ]]; then
-  echo "WARN: DISCOVERY_EMBED_SECRET not set"
-else
-  echo "DISCOVERY_EMBED_SECRET: set"
-fi
-
-curl -sf "$API_URL/health" >/dev/null && echo "PoC API: ok" || {
-  echo "PoC API health failed"
+curl -sf "$POC_URL/health" >/dev/null && echo "poc-api: ok" || {
+  echo "ERROR: PoC API not reachable at $POC_URL"
   exit 1
 }
 
-if [[ -n "$SECRET" ]]; then
-  curl -sf -H "Authorization: Bearer $SECRET" "$API_URL/internal/discovery/status" | python3 -m json.tool
-else
-  echo "Skipping /internal/discovery/status (no embed secret)"
-fi
+curl -sf "$POC_URL/oracle/health" >/dev/null && echo "oracle: ok" || echo "WARN: /oracle/health unavailable"
 
-curl -sf "$DISCOVERY_URL/health" >/dev/null && echo "discovery-service: ok" || {
-  echo "WARN: discovery-service not reachable at $DISCOVERY_URL"
-}
-
-echo "Bootstrap check complete"
+echo "Run alembic upgrade head if discovery_assets table is missing (migration f3a4b5c6d7e8)."

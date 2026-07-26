@@ -6,7 +6,7 @@ import time
 from typing import List, Optional
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, status, Query, Request, WebSocket, BackgroundTasks
+from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, status, Query, Request, WebSocket, BackgroundTasks, Body
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 import uvicorn
@@ -49,7 +49,15 @@ from app.core.database import (
     check_database_connection,
 )
 from app.core.utils import save_temp_upload, new_media_id, calculate_file_hash, cleanup_temp_file
-from app.models.similarity import MediaMatch, UploadResponse, ErrorResponse, HealthResponse, StreamingUploadResponse
+from app.models.similarity import (
+    MediaMatch,
+    UploadResponse,
+    ErrorResponse,
+    HealthResponse,
+    StreamingUploadResponse,
+    PresignUploadRequest,
+    PresignUploadResponse,
+)
 
 # Configure structured logging
 structlog.configure(
@@ -177,7 +185,7 @@ async def lifespan(app: FastAPI):
 
         discovery_status = evaluate_bootstrap_status()
         if discovery_status.ready:
-            logger.info("Discovery bootstrap ready", corpus=discovery_status.corpus_counts)
+            logger.info("Discovery bootstrap ready", assets=discovery_status.asset_counts)
         elif discovery_status.issues:
             logger.warning("Discovery bootstrap issues", issues=discovery_status.issues)
 
@@ -227,11 +235,9 @@ app.add_middleware(
 )
 
 from app.api.rest.routes import router as oracle_rest_router
-from app.api.rest.discovery_internal import router as discovery_internal_router
 from app.api.ws.routes import router as oracle_ws_router
 
 app.include_router(oracle_rest_router)
-app.include_router(discovery_internal_router)
 app.include_router(oracle_ws_router)
 
 # Configuration constants
@@ -305,6 +311,121 @@ async def validate_file(file: UploadFile) -> tuple[str, str]:
     
     return content_type, media_type
 
+
+def _require_bearer_session_jwt(request: Request) -> str:
+    """Require Authorization: Bearer <MySocial session JWT> (presence check)."""
+    auth = request.headers.get("Authorization") or ""
+    if not auth.lower().startswith("bearer "):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Authorization Bearer session JWT required",
+        )
+    token = auth[7:].strip()
+    if not token:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Authorization Bearer session JWT required",
+        )
+    return token
+
+
+def _media_type_from_content_type(content_type: str) -> str:
+    if content_type in SUPPORTED_IMAGE_TYPES:
+        return "image"
+    if content_type in SUPPORTED_AUDIO_TYPES:
+        return "audio"
+    if content_type in SUPPORTED_VIDEO_TYPES:
+        return "video"
+    raise HTTPException(
+        status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+        detail=f"Unsupported media type: {content_type}. Supported types: {', '.join(sorted(SUPPORTED_TYPES))}",
+    )
+
+
+@app.post("/uploads/presign", response_model=PresignUploadResponse)
+async def presign_upload(
+    request: Request,
+    body: PresignUploadRequest = Body(...),
+    _rate_limit: None = Depends(check_rate_limit),
+):
+    """
+    Reserve an R2 object key and return a presigned PUT URL for direct client upload.
+
+    DripDrop publish flow:
+    1. POST /uploads/presign → public_url + upload_url
+    2. create_post on-chain with media_urls=[public_url]
+    3. PUT video bytes to upload_url (background)
+    4. Oracle downloads public_url and attests (retries on 404 while upload in flight)
+    """
+    _require_bearer_session_jwt(request)
+
+    if not config.USE_CLOUDFLARE_R2:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Cloudflare R2 storage is not enabled",
+        )
+    if not (config.R2_PUBLIC_DOMAIN or "").strip():
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="R2_PUBLIC_DOMAIN must be configured for chain-publishable media URLs",
+        )
+    if not storage_client or not getattr(storage_client, "r2_client", None):
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="R2 storage client is not available",
+        )
+
+    content_type = (body.content_type or "").strip().lower()
+    if content_type not in SUPPORTED_TYPES:
+        raise HTTPException(
+            status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+            detail=f"Unsupported media type: {content_type}",
+        )
+    if body.content_length is not None and body.content_length > MAX_FILE_SIZE:
+        raise HTTPException(
+            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            detail=f"File size exceeds maximum allowed size of {MAX_FILE_SIZE} bytes",
+        )
+    if not (body.filename or "").strip():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="filename is required",
+        )
+
+    media_type = _media_type_from_content_type(content_type)
+    media_id = new_media_id()
+    expires_in = int(os.getenv("R2_PRESIGN_EXPIRES_SECONDS", "3600"))
+
+    try:
+        reserved = storage_client.reserve_presigned_upload(
+            media_type=media_type,
+            media_id=media_id,
+            filename=body.filename.strip(),
+            content_type=content_type,
+            expires_in=expires_in,
+        )
+    except ValueError as e:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=str(e),
+        ) from e
+    except Exception as e:
+        logger.error("Failed to create presigned upload", error=str(e))
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to create presigned upload URL",
+        ) from e
+
+    logger.info(
+        "Presigned upload reserved",
+        media_id=reserved["media_id"],
+        key=reserved["key"],
+        public_url=reserved["public_url"],
+        expires_in=reserved["expires_in"],
+    )
+    return PresignUploadResponse(**reserved)
+
+
 @app.get("/", response_model=dict)
 async def root():
     """Root endpoint with API information."""
@@ -315,7 +436,8 @@ async def root():
         "docs_url": "/docs",
         "health_url": "/health",
         "readyz_url": "/readyz",
-        "database": "PostgreSQL with pgvector"
+        "database": "PostgreSQL with pgvector",
+        "dripdrop_publish": "POST /uploads/presign → create_post(media_urls) → PUT to upload_url → oracle analyzes",
     }
 
 @app.get("/health", response_model=HealthResponse)
@@ -1028,8 +1150,18 @@ async def get_system_stats():
         )
 
 # Global exception handler
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"error": "http_error", "message": exc.detail},
+    )
+
+
 @app.exception_handler(Exception)
 async def global_exception_handler(request, exc):
+    if isinstance(exc, HTTPException):
+        raise exc
     logger.error("Unhandled exception", 
                 url=str(request.url), method=request.method, error=str(exc), exc_info=True)
     return JSONResponse(

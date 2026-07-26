@@ -1,1 +1,1 @@
-"""Discovery embedding integration for proof-of-creativity."""
+"""Off-network creative media discovery (self-contained PoC)."""

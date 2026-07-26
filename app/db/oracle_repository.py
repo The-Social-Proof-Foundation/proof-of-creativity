@@ -235,6 +235,7 @@ class JobRepository:
                         WHERE id = (
                             SELECT id FROM oracle_jobs
                             WHERE network = %s AND status = 'pending' AND job_type = %s
+                              AND updated_at <= NOW()
                             ORDER BY created_at ASC
                             FOR UPDATE SKIP LOCKED
                             LIMIT 1
@@ -251,6 +252,7 @@ class JobRepository:
                         WHERE id = (
                             SELECT id FROM oracle_jobs
                             WHERE network = %s AND status = 'pending'
+                              AND updated_at <= NOW()
                             ORDER BY created_at ASC
                             FOR UPDATE SKIP LOCKED
                             LIMIT 1
@@ -262,6 +264,29 @@ class JobRepository:
                 row = cur.fetchone()
                 conn.commit()
                 return dict(row) if row else None
+
+    def requeue(
+        self,
+        job_id: str,
+        *,
+        error: str | None = None,
+        delay_seconds: int = 15,
+    ) -> None:
+        """Return job to pending after a delay (used for media-not-ready / 404 races)."""
+        delay = max(1, int(delay_seconds))
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE oracle_jobs
+                    SET status = 'pending',
+                        last_error = %s,
+                        updated_at = NOW() + (%s * INTERVAL '1 second')
+                    WHERE id = %s
+                    """,
+                    (error, delay, job_id),
+                )
+                conn.commit()
 
     def complete(self, job_id: str, status: str = "completed", error: str | None = None) -> None:
         with get_db_connection() as conn:

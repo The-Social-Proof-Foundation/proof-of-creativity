@@ -7,23 +7,33 @@ import asyncio
 import structlog
 
 from app.chain.rpc_client import TransactionSubmitter
+from app.db.discovery_repository import ProvenanceHitRepository
 from app.db.oracle_repository import (
     AttestationRepository,
     ChainPostRepository,
     ConfigCacheRepository,
     JobRepository,
 )
+from app.discovery.store import DiscoveryStore
 from app.network_config import get_settings, load_network_profile
+from app.services.analysis.media_fetcher import MediaNotReadyError
 from app.services.analysis.pipeline import AnalysisService
 from app.services.decision_engine import DecisionEngine
 from app.services.events import event_bus
-from app.services.discovery_client import DiscoveryClient
 from app.services.proof_bundle import ProofBundleService
 from app.services.username_beneficiary import UsernameBeneficiaryService
 from app.services.vault_lifecycle import VaultLifecycleService
 from app.services.poc_utils import truncate_evidence_urls, truncate_reasoning
 
 logger = structlog.get_logger()
+
+
+def _is_media_not_ready(exc: BaseException) -> bool:
+    if isinstance(exc, MediaNotReadyError):
+        return True
+    # httpx errors that bubble from nested callers without MediaNotReadyError wrap
+    status = getattr(getattr(exc, "response", None), "status_code", None)
+    return status in {404, 408, 425, 429, 503}
 
 
 class OracleWorker:
@@ -56,6 +66,8 @@ class OracleWorker:
         async with sem:
             job_id = str(job["id"])
             job_type = job.get("job_type") or "analyze_post"
+            attempts = int(job.get("attempts") or 1)
+            max_retries = int(getattr(self.settings, "oracle_max_retries", 5) or 5)
             try:
                 if job_type == "claim_beneficiary":
                     await self._process_claim(job)
@@ -63,6 +75,28 @@ class OracleWorker:
                     await self._process_analyze(job)
                 self.jobs.complete(job_id, "completed")
             except Exception as exc:
+                if job_type != "claim_beneficiary" and _is_media_not_ready(exc) and attempts < max_retries:
+                    # Exponential backoff: 15s, 30s, 60s, … capped at 120s
+                    delay = min(120, 15 * (2 ** max(0, attempts - 1)))
+                    logger.warning(
+                        "Oracle media not ready; requeueing",
+                        job_id=job_id,
+                        post_id=job.get("post_id"),
+                        attempts=attempts,
+                        max_retries=max_retries,
+                        delay_seconds=delay,
+                        error=str(exc),
+                    )
+                    self.jobs.requeue(job_id, error=str(exc), delay_seconds=delay)
+                    post_id = job.get("post_id")
+                    if post_id:
+                        self.posts.update_status(
+                            self.network,
+                            post_id,
+                            analysis_status="pending_media",
+                        )
+                    return
+
                 logger.exception("Oracle job failed", job_id=job_id, error=str(exc))
                 self.jobs.complete(job_id, "failed", str(exc))
                 await event_bus.publish(
@@ -107,20 +141,21 @@ class OracleWorker:
                     discovery_asset_id=analysis.discovery_asset_id,
                 )
                 if vault_provisioned and analysis.discovery_asset_id:
-                    await DiscoveryClient().record_provenance_hit(
-                        {
-                            "network": self.network,
-                            "post_id": post_id,
-                            "query_media_id": analysis.media_id,
-                            "discovery_asset_id": analysis.discovery_asset_id,
-                            "similarity_score": analysis.highest_similarity_u64 / 100.0,
-                            "work_confidence": analysis.work_confidence,
-                            "creator_confidence": analysis.creator_confidence,
-                            "decision": "redirect_escrow",
-                            "vault_provisioned": True,
-                            "vault_identity_hash": submission.identity_hash,
-                        }
+                    ProvenanceHitRepository().record(
+                        network=self.network,
+                        post_id=post_id,
+                        query_media_id=analysis.media_id,
+                        discovery_asset_id=analysis.discovery_asset_id,
+                        creator_candidate_id=None,
+                        similarity_score=analysis.highest_similarity_u64 / 100.0,
+                        match_type="discovered",
+                        work_confidence=analysis.work_confidence,
+                        creator_confidence=analysis.creator_confidence,
+                        decision="redirect_escrow",
+                        vault_provisioned=True,
+                        vault_identity_hash=submission.identity_hash,
                     )
+                    DiscoveryStore().transition_asset(analysis.discovery_asset_id, "match_detected")
                     await self.vault_lifecycle.mark_claimable(
                         submission.identity_hash,
                         analysis.discovery_asset_id,

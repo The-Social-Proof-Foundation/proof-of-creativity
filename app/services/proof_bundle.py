@@ -31,7 +31,7 @@ class ProofBundleService:
         *,
         tx_digest: str | None = None,
     ) -> dict[str, Any]:
-        expose_sources = os.getenv("DISCOVERY_EXPOSE_SOURCE_IN_EVIDENCE", "false").lower() in (
+        expose_sources = os.getenv("POC_EXPOSE_SOURCE_IN_EVIDENCE", os.getenv("DISCOVERY_EXPOSE_SOURCE_IN_EVIDENCE", "false")).lower() in (
             "1",
             "true",
             "yes",

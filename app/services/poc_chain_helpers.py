@@ -16,6 +16,21 @@ logger = structlog.get_logger()
 
 NUM_SHARDS = 256
 
+_BENEFICIARY_STATUS_ACTIVE = frozenset({None, "ACTIVE", 0, "0", 1, "1"})
+_BENEFICIARY_STATUS_CLAIMED = frozenset({2, "2", "CLAIMED"})
+_BENEFICIARY_STATUS_ENDED = frozenset({3, "3", "ENDED"})
+
+
+def normalize_beneficiary_status(raw: Any) -> str | None:
+    """Map Move UsernameBeneficiary.status variants to ACTIVE | CLAIMED | ENDED."""
+    if raw in _BENEFICIARY_STATUS_ACTIVE:
+        return "ACTIVE"
+    if raw in _BENEFICIARY_STATUS_CLAIMED:
+        return "CLAIMED"
+    if raw in _BENEFICIARY_STATUS_ENDED:
+        return "ENDED"
+    return str(raw)
+
 
 def _graphql_post(profile: NetworkProfile, query: str, variables: dict | None = None) -> dict[str, Any]:
     url = resolve_graphql_url(profile)
@@ -125,7 +140,7 @@ def fetch_username_beneficiary_fields(
     verification = fields.get("verification") or {}
     creator_identity = fields.get("creator_identity") or {}
     return {
-        "status": fields.get("status"),
+        "status": normalize_beneficiary_status(fields.get("status")),
         "username": fields.get("username"),
         "required_x_handle": verification.get("required_x_handle") if isinstance(verification, dict) else None,
         "creator_identity_source": creator_identity.get("source") if isinstance(creator_identity, dict) else None,

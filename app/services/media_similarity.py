@@ -47,7 +47,7 @@ def _active_context() -> EmbeddingContext:
 
 
 def corpus_search_kwargs() -> dict:
-    version = os.getenv("DISCOVERY_ACTIVE_EMBEDDING_VERSION", default_embedding_version())
+    version = os.getenv("POC_ACTIVE_EMBEDDING_VERSION", os.getenv("DISCOVERY_ACTIVE_EMBEDDING_VERSION", default_embedding_version()))
     return {
         "corpus_scopes": ["platform", "discovered"],
         "active_embedding_version": version,

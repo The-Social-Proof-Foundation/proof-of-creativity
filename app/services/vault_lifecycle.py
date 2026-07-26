@@ -1,11 +1,11 @@
-"""Vault lifecycle orchestration for lazy provisioning and discovery callbacks."""
+"""Vault lifecycle orchestration for lazy provisioning and discovery lifecycle updates."""
 
 from __future__ import annotations
 
 import structlog
 
+from app.discovery.store import DiscoveryStore
 from app.network_config import load_network_profile
-from app.services.discovery_client import DiscoveryClient
 from app.services.events import event_bus
 from app.services.poc_chain_helpers import (
     resolve_beneficiary_object_for_identity,
@@ -21,7 +21,7 @@ class VaultLifecycleService:
         self.network = network
         self.profile = load_network_profile(network)
         self.beneficiaries = UsernameBeneficiaryService(network)
-        self.discovery = DiscoveryClient()
+        self.discovery = DiscoveryStore()
 
     async def ensure_off_network_vault(
         self,
@@ -65,7 +65,7 @@ class VaultLifecycleService:
                 },
             )
             if discovery_asset_id:
-                await self.discovery.lifecycle_event(discovery_asset_id, "vault_created")
+                self.discovery.transition_asset(discovery_asset_id, "vault_created")
         return address, provisioned_now
 
     async def mark_escrow_active(self, post_id: str, identity_hash: str) -> None:
@@ -83,7 +83,7 @@ class VaultLifecycleService:
             metadata={"claim_status": "unclaimed"},
         )
         if discovery_asset_id:
-            await self.discovery.lifecycle_event(discovery_asset_id, "vault_claimable")
+            self.discovery.transition_asset(discovery_asset_id, "vault_claimable")
 
     async def mark_claimed(
         self,
@@ -100,4 +100,4 @@ class VaultLifecycleService:
             metadata={"claim_status": "claimed", "claimant_address": claimant_address},
         )
         if discovery_asset_id:
-            await self.discovery.lifecycle_event(discovery_asset_id, "vault_claimed")
+            self.discovery.transition_asset(discovery_asset_id, "vault_claimed")

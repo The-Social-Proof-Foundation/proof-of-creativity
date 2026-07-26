@@ -57,9 +57,9 @@ services:
       API_HOST: 0.0.0.0
       API_PORT: "8000"
       PORT: "8000"
-      DISCOVERY_EMBED_SECRET: "${DISCOVERY_EMBED_SECRET:-}"
-      DISCOVERY_ACTIVE_EMBEDDING_VERSION: "${DISCOVERY_ACTIVE_EMBEDDING_VERSION:-clip-vit-b32-v1}"
-      DISCOVERY_SERVICE_URL: "${DISCOVERY_SERVICE_URL:-http://host.docker.internal:8096}"
+      POC_ACTIVE_EMBEDDING_VERSION: "${POC_ACTIVE_EMBEDDING_VERSION:-clip-vit-b32-v1}"
+      DISCOVERY_ENABLED: "${DISCOVERY_ENABLED:-true}"
+      DISCOVERY_SOURCES_CONFIG: "${DISCOVERY_SOURCES_CONFIG:-config/discovery/sources.localnet.yaml}"
     ports:
       - "${API_PORT:-8000}:8000"
     depends_on:
@@ -69,6 +69,7 @@ services:
         condition: service_healthy
     volumes:
       - ./data:/app/data
+      - ./config:/app/config
 
   grpc-sync:
     profiles: ["app"]
@@ -84,6 +85,7 @@ services:
       MYSO_NETWORK: localnet
       MYSOCIAL_RPC_URL: http://host.docker.internal:9000
       GRAPHQL_URL: http://host.docker.internal:9125/graphql
+      POC_SYNC_MODE: "${POC_SYNC_MODE:-grpc}"
     depends_on:
       postgres:
         condition: service_healthy
@@ -106,14 +108,37 @@ services:
       MYSOCIAL_RPC_URL: http://host.docker.internal:9000
       GRAPHQL_URL: http://host.docker.internal:9125/graphql
       ORACLE_WORKER_CONCURRENCY: "2"
-      DISCOVERY_ENABLED: "${DISCOVERY_ENABLED:-false}"
-      DISCOVERY_SERVICE_URL: "${DISCOVERY_SERVICE_URL:-http://host.docker.internal:8096}"
-      DISCOVERY_X_HANDLE_CONFIDENCE_THRESHOLD: "${DISCOVERY_X_HANDLE_CONFIDENCE_THRESHOLD:-0.85}"
+      POC_X_HANDLE_CONFIDENCE_THRESHOLD: "${POC_X_HANDLE_CONFIDENCE_THRESHOLD:-0.85}"
+      POC_WORK_CONFIDENCE_THRESHOLD: "${POC_WORK_CONFIDENCE_THRESHOLD:-0.95}"
     depends_on:
       postgres:
         condition: service_healthy
     volumes:
       - ./data:/app/data
+
+  discovery-worker:
+    profiles: ["app"]
+    build:
+      context: .
+      dockerfile: Dockerfile
+    command: python scripts/run_discovery_worker.py
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      DATABASE_URL: postgresql://poc:poc@postgres:5432/proof_of_creativity
+      DISCOVERY_ENABLED: "${DISCOVERY_ENABLED:-true}"
+      DISCOVERY_EMBED_ENABLED: "${DISCOVERY_EMBED_ENABLED:-true}"
+      DISCOVERY_SOURCES_CONFIG: "${DISCOVERY_SOURCES_CONFIG:-config/discovery/sources.localnet.yaml}"
+      DISCOVERY_POLL_INTERVAL_SECONDS: "${DISCOVERY_POLL_INTERVAL_SECONDS:-30}"
+      POC_USE_MANUAL_CURATED: "${POC_USE_MANUAL_CURATED:-1}"
+      POC_ACTIVE_EMBEDDING_VERSION: "${POC_ACTIVE_EMBEDDING_VERSION:-clip-vit-b32-v1}"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./data:/app/data
+      - ./config:/app/config
 
 volumes:
   poc_pgdata:

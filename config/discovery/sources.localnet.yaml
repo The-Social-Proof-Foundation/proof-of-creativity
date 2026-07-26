@@ -1,6 +1,22 @@
-- id: local-curated
+# Creative media sources for PoC off-network embed E2E.
+# Requires POC_USE_MANUAL_CURATED=1 for manual_curated adapter.
+
+- id: curated-public-images
   adapter_type: manual_curated
   domain: creative
-  trust_score: 0.95
+  content_kind: media
+  trust_score: 0.9
   enabled: true
-  entries: []
+  entries:
+    - url: https://pub-8f69c25218db46419ad423201e6877ab.r2.dev/validators/1764923700242-ro3yncchsdf.png
+      media_type: image
+      title: MySo validator image
+      creator_x_handle: null
+    - url: https://pub-b2100065e2e5444db484a5fed5d87096.r2.dev/image/2025/10/_cbeb2878-a1d0-4ee9-a398-6a25dabf5ad2_Screenshot_2025-07-29_at_3.45.03_PM.png
+      media_type: image
+      title: MySo image sample
+      creator_x_handle: null
+    - url: https://pub-b2100065e2e5444db484a5fed5d87096.r2.dev/image/2025/10/_8493d043-fb8e-4b75-b910-192cfd765947_gov-pillar.png
+      media_type: image
+      title: Gov pillar image sample
+      creator_x_handle: null

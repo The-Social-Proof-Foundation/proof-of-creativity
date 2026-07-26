@@ -1,4 +1,4 @@
-"""Creator identity helpers for discovered provenance."""
+"""Creator identity helpers for off-network discovery."""
 
 from __future__ import annotations
 

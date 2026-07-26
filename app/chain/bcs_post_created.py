@@ -2,12 +2,21 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 
 class BcsDecodeError(ValueError):
     pass
+
+
+@dataclass
+class PostAccessDecoded:
+    kind: str
+    mydata_id: str | None = None
+    subscription_service_id: str | None = None
+    subscription_min_tier_level: int | None = None
+    requires_subscription: bool = False
 
 
 class BcsReader:
@@ -117,6 +126,31 @@ class BcsReader:
         length = self.read_uleb128()
         return [self.read_string() for _ in range(length)]
 
+    def read_post_access(self) -> PostAccessDecoded:
+        """Decode Move post::PostAccess (Rust/BCS enum index 0/1/2)."""
+        variant = self.read_uleb128()
+        if variant == 0:
+            return PostAccessDecoded(kind="public", requires_subscription=False)
+        if variant == 1:
+            service_id = self.read_move_object_id()
+            mydata_id = self.read_option_move_object_id()
+            min_tier = self.read_option_u64()
+            return PostAccessDecoded(
+                kind="profile_subscription",
+                mydata_id=mydata_id,
+                subscription_service_id=service_id,
+                subscription_min_tier_level=min_tier,
+                requires_subscription=True,
+            )
+        if variant == 2:
+            mydata_id = self.read_move_object_id()
+            return PostAccessDecoded(
+                kind="marketplace_one_time",
+                mydata_id=mydata_id,
+                requires_subscription=False,
+            )
+        raise BcsDecodeError(f"invalid PostAccess variant: {variant}")
+
 
 @dataclass
 class PostCreatedEventDecoded:
@@ -136,19 +170,25 @@ class PostCreatedEventDecoded:
     revenue_redirect_to: str | None
     revenue_redirect_percentage: int | None
     enable_spt: bool
-    enable_poc: bool
-    enable_spot: bool
-    spot_id: str | None
     spt_id: str | None
     poc_redirection_kind: int = 0
     actor_address: str | None = None
     sub_agent_id: str | None = None
     organization_id: str | None = None
     action_identity_class: int = 0
+    post_access_kind: str = "public"
+    subscription_service_id: str | None = None
+    subscription_min_tier_level: int | None = None
+    requires_subscription: bool = False
+    # Legacy-only fields (not on current Move wire layout).
+    enable_poc: bool | None = None
+    enable_spot: bool = False
+    spot_id: str | None = None
+    access: PostAccessDecoded | None = field(default=None, repr=False)
 
     def to_payload(self) -> dict[str, Any]:
         media_urls = self.media_urls or []
-        return {
+        payload: dict[str, Any] = {
             "post_id": self.post_id,
             "owner": self.owner,
             "creator": self.owner,
@@ -162,13 +202,14 @@ class PostCreatedEventDecoded:
             "media_urls": media_urls,
             "metadata_json": self.metadata_json,
             "mydata_id": self.mydata_id,
+            "post_access_kind": self.post_access_kind,
+            "subscription_service_id": self.subscription_service_id,
+            "subscription_min_tier_level": self.subscription_min_tier_level,
+            "requires_subscription": self.requires_subscription,
             "promotion_id": self.promotion_id,
             "revenue_redirect_to": self.revenue_redirect_to,
             "revenue_redirect_percentage": self.revenue_redirect_percentage,
             "enable_spt": self.enable_spt,
-            "enable_poc": self.enable_poc,
-            "enable_spot": self.enable_spot,
-            "spot_id": self.spot_id,
             "spt_id": self.spt_id,
             "poc_redirection_kind": self.poc_redirection_kind,
             "actor_address": self.actor_address or self.owner,
@@ -176,9 +217,91 @@ class PostCreatedEventDecoded:
             "organization_id": self.organization_id,
             "action_identity_class": self.action_identity_class,
         }
+        # Omit enable_poc when absent so parse_post_created defaults to True.
+        if self.enable_poc is not None:
+            payload["enable_poc"] = self.enable_poc
+        if self.spot_id is not None:
+            payload["spot_id"] = self.spot_id
+            payload["enable_spot"] = self.enable_spot
+        return payload
 
 
-def _read_post_created_core(reader: BcsReader) -> PostCreatedEventDecoded:
+def _apply_access(ev: PostCreatedEventDecoded, access: PostAccessDecoded) -> None:
+    ev.access = access
+    ev.post_access_kind = access.kind
+    ev.mydata_id = access.mydata_id
+    ev.subscription_service_id = access.subscription_service_id
+    ev.subscription_min_tier_level = access.subscription_min_tier_level
+    ev.requires_subscription = access.requires_subscription
+
+
+def _read_post_created_current_core(reader: BcsReader) -> PostCreatedEventDecoded:
+    """Current Move PostCreatedEvent fields through spt_id (includes PostAccess)."""
+    post_id = reader.read_address()
+    owner = reader.read_address()
+    profile_id = reader.read_address()
+    platform_id = reader.read_address()
+    permissions = reader.read_u8()
+    content = reader.read_string()
+    post_type = reader.read_string()
+    parent_post_id = reader.read_option_address()
+    mentions = reader.read_option_vec_address()
+    media_urls = reader.read_option_vec_string()
+    metadata_json = reader.read_option_string()
+    access = reader.read_post_access()
+    promotion_id = reader.read_option_address()
+    revenue_redirect_to = reader.read_option_address()
+    revenue_redirect_percentage = reader.read_option_u64()
+    enable_spt = reader.read_bool()
+    spt_id = reader.read_option_address()
+    ev = PostCreatedEventDecoded(
+        post_id=post_id,
+        owner=owner,
+        profile_id=profile_id,
+        platform_id=platform_id,
+        permissions=permissions,
+        content=content,
+        post_type=post_type,
+        parent_post_id=parent_post_id,
+        mentions=mentions,
+        media_urls=media_urls,
+        metadata_json=metadata_json,
+        mydata_id=None,
+        promotion_id=promotion_id,
+        revenue_redirect_to=revenue_redirect_to,
+        revenue_redirect_percentage=revenue_redirect_percentage,
+        enable_spt=enable_spt,
+        spt_id=spt_id,
+    )
+    _apply_access(ev, access)
+    return ev
+
+
+def _decode_current_with_organization(reader: BcsReader) -> PostCreatedEventDecoded:
+    ev = _read_post_created_current_core(reader)
+    ev.poc_redirection_kind = reader.read_u8()
+    ev.actor_address = reader.read_address()
+    ev.sub_agent_id = reader.read_option_move_object_id()
+    ev.organization_id = reader.read_option_move_object_id()
+    ev.action_identity_class = reader.read_u8()
+    if reader.remaining != 0:
+        raise BcsDecodeError(f"trailing bytes: {reader.remaining}")
+    return ev
+
+
+def _decode_current_with_attribution(reader: BcsReader) -> PostCreatedEventDecoded:
+    ev = _read_post_created_current_core(reader)
+    ev.poc_redirection_kind = reader.read_u8()
+    ev.actor_address = reader.read_address()
+    ev.sub_agent_id = reader.read_option_move_object_id()
+    ev.action_identity_class = reader.read_u8()
+    if reader.remaining != 0:
+        raise BcsDecodeError(f"trailing bytes: {reader.remaining}")
+    return ev
+
+
+def _read_post_created_legacy_core(reader: BcsReader) -> PostCreatedEventDecoded:
+    """Pre-PostAccess layout: mydata_id + enable_poc/enable_spot/spot_id."""
     return PostCreatedEventDecoded(
         post_id=reader.read_address(),
         owner=reader.read_address(),
@@ -200,11 +323,12 @@ def _read_post_created_core(reader: BcsReader) -> PostCreatedEventDecoded:
         enable_spot=reader.read_bool(),
         spot_id=reader.read_option_address(),
         spt_id=reader.read_option_address(),
+        post_access_kind="legacy_mydata",
     )
 
 
-def _decode_with_organization(reader: BcsReader) -> PostCreatedEventDecoded:
-    ev = _read_post_created_core(reader)
+def _decode_legacy_with_organization(reader: BcsReader) -> PostCreatedEventDecoded:
+    ev = _read_post_created_legacy_core(reader)
     ev.poc_redirection_kind = reader.read_u8()
     ev.actor_address = reader.read_address()
     ev.sub_agent_id = reader.read_option_move_object_id()
@@ -215,8 +339,8 @@ def _decode_with_organization(reader: BcsReader) -> PostCreatedEventDecoded:
     return ev
 
 
-def _decode_with_attribution(reader: BcsReader) -> PostCreatedEventDecoded:
-    ev = _read_post_created_core(reader)
+def _decode_legacy_with_attribution(reader: BcsReader) -> PostCreatedEventDecoded:
+    ev = _read_post_created_legacy_core(reader)
     ev.poc_redirection_kind = reader.read_u8()
     ev.actor_address = reader.read_address()
     ev.sub_agent_id = reader.read_option_move_object_id()
@@ -226,8 +350,8 @@ def _decode_with_attribution(reader: BcsReader) -> PostCreatedEventDecoded:
     return ev
 
 
-def _decode_current(reader: BcsReader) -> PostCreatedEventDecoded:
-    ev = _read_post_created_core(reader)
+def _decode_legacy_current(reader: BcsReader) -> PostCreatedEventDecoded:
+    ev = _read_post_created_legacy_core(reader)
     ev.poc_redirection_kind = reader.read_u8()
     ev.actor_address = ev.owner
     if reader.remaining != 0:
@@ -236,7 +360,7 @@ def _decode_current(reader: BcsReader) -> PostCreatedEventDecoded:
 
 
 def _decode_legacy(reader: BcsReader) -> PostCreatedEventDecoded:
-    ev = _read_post_created_core(reader)
+    ev = _read_post_created_legacy_core(reader)
     ev.poc_redirection_kind = 0
     ev.actor_address = ev.owner
     if reader.remaining != 0:
@@ -250,9 +374,11 @@ def decode_post_created_event(contents: bytes) -> PostCreatedEventDecoded:
         raise BcsDecodeError("empty contents")
 
     decoders = (
-        _decode_with_organization,
-        _decode_with_attribution,
-        _decode_current,
+        _decode_current_with_organization,
+        _decode_current_with_attribution,
+        _decode_legacy_with_organization,
+        _decode_legacy_with_attribution,
+        _decode_legacy_current,
         _decode_legacy,
     )
     errors: list[str] = []

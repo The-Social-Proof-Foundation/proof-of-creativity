@@ -314,3 +314,90 @@ class ProvenanceHit(Base):
         Index("idx_provenance_hits_post", "network", "post_id", "created_at"),
     )
 
+
+class DiscoverySource(Base):
+    __tablename__ = "discovery_sources"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    adapter_type = Column(String(64), nullable=False)
+    domain = Column(String(32), default="creative")
+    source_url = Column(Text)
+    config = Column(JSONB, default=dict)
+    trust_score = Column(Float, default=0.5)
+    enabled = Column(Boolean, default=True)
+    terms_notes = Column(Text)
+    last_polled_at = Column(DateTime(timezone=True))
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
+class CreatorCandidate(Base):
+    __tablename__ = "creator_candidates"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    primary_x_handle = Column(String(256), unique=True)
+    identity_hash = Column(String(128))
+    display_name = Column(String(256))
+    aliases = Column(JSONB, default=list)
+    platform_handles = Column(JSONB, default=dict)
+    source_urls = Column(JSONB, default=list)
+    creator_confidence = Column(Float, default=0.0)
+    work_count = Column(Integer, default=0)
+    blockchain_hit_count = Column(Integer, default=0)
+    similarity_hit_count = Column(Integer, default=0)
+    lifecycle_state = Column(String(32), default="unresolved")
+    merge_target_id = Column(UUID(as_uuid=True))
+    metadata_json = Column("metadata", JSONB, default=dict)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
+class DiscoveryAsset(Base):
+    __tablename__ = "discovery_assets"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    source_id = Column(UUID(as_uuid=True))
+    external_source_url = Column(Text, nullable=False, unique=True)
+    canonical_metadata = Column(JSONB, default=dict)
+    media_type = Column(String(32), nullable=False)
+    content_kind = Column(String(16), default="media")
+    content_hash = Column(String(128))
+    metadata_hash = Column(String(128))
+    lifecycle_state = Column(String(32), default="discovered")
+    source_trust_score = Column(Float, default=0.5)
+    work_confidence = Column(Float, default=0.0)
+    creator_confidence = Column(Float, default=0.0)
+    creator_candidate_id = Column(UUID(as_uuid=True))
+    active_embedding_version = Column(String(64))
+    related_on_chain_post = Column(String(128))
+    priority_score = Column(BigInteger, default=0)
+    discovered_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+    exclusion_reason = Column(Text)
+
+    __table_args__ = (
+        Index("idx_discovery_assets_lifecycle", "lifecycle_state", "priority_score"),
+        Index("idx_discovery_assets_creator", "creator_candidate_id"),
+    )
+
+
+class DiscoveryJob(Base):
+    __tablename__ = "discovery_jobs"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    job_type = Column(String(32), nullable=False)
+    discovery_asset_id = Column(UUID(as_uuid=True))
+    priority_score = Column(BigInteger, default=0)
+    status = Column(String(32), default="pending")
+    attempts = Column(Integer, default=0)
+    max_attempts = Column(Integer, default=5)
+    run_after = Column(DateTime(timezone=True), server_default=func.now())
+    last_error = Column(Text)
+    payload = Column(JSONB, default=dict)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    __table_args__ = (
+        Index("idx_discovery_jobs_claim", "status", "run_after", "priority_score", "created_at"),
+    )
+

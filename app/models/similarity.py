@@ -112,6 +112,27 @@ class StreamingUploadResponse(BaseModel):
     message: str = Field(..., description="Status message")
     post_id: Optional[str] = Field(None, description="MySocial post ID if provided")
 
+
+class PresignUploadRequest(BaseModel):
+    """Request body for direct-to-R2 upload reservation (chain-first publish)."""
+    filename: str = Field(..., description="Original filename (extension used for object key)")
+    content_type: str = Field(..., description="MIME type, e.g. video/mp4")
+    content_length: Optional[int] = Field(
+        None,
+        description="Optional declared file size in bytes (validated against MAX_FILE_SIZE when set)",
+    )
+
+
+class PresignUploadResponse(BaseModel):
+    """Presigned PUT slot for client→R2 upload; public_url is safe to put on-chain."""
+    media_id: str = Field(..., description="Server-assigned media id (object basename)")
+    key: str = Field(..., description="R2 object key, e.g. video/YYYY/MM/{media_id}.mp4")
+    public_url: str = Field(..., description="HTTPS CDN URL to use in create_post media_urls")
+    upload_url: str = Field(..., description="Presigned PUT URL for the video bytes")
+    expires_in: int = Field(..., description="Presigned URL lifetime in seconds")
+    content_type: str = Field(..., description="Content-Type the client must send on PUT")
+
+
 class ErrorResponse(BaseModel):
     """Error response model."""
     error: str = Field(..., description="Error type")

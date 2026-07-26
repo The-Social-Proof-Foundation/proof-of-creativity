@@ -15,7 +15,10 @@ import structlog
 from app.chain.move_address import canonical_registry_username, parse_identity_hash
 from app.network_config import NetworkProfile, load_network_profile
 from app.services.identity_verification_client import IdentityVerificationClient
-from app.services.poc_chain_helpers import fetch_username_beneficiary_fields
+from app.services.poc_chain_helpers import (
+    fetch_username_beneficiary_fields,
+    normalize_beneficiary_status,
+)
 
 logger = structlog.get_logger()
 
@@ -92,8 +95,11 @@ class IdentityVerifier:
         cover_photo_url: str = "",
     ) -> VerifiedClaim:
         fields = fetch_username_beneficiary_fields(self.profile, beneficiary_id)
-        status = fields.get("status")
-        if status not in (None, "ACTIVE", 0, "0"):
+        status = normalize_beneficiary_status(fields.get("status"))
+        raw = fields.get("raw") or {}
+        if raw.get("claimed_by") or raw.get("claimed_at"):
+            raise ValueError(f"Beneficiary {beneficiary_id} is already claimed")
+        if status not in (None, "ACTIVE"):
             raise ValueError(f"Beneficiary {beneficiary_id} is not ACTIVE (status={status})")
 
         required_handle = canonical_registry_username(

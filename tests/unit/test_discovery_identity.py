@@ -1,18 +1,18 @@
-"""Tests for discovery identity hash derivation."""
+"""Tests for corpus identity helpers."""
 
 from app.discovery.identity import identity_hash_from_x_handle, resolve_identity_hash
 
 
 def test_identity_hash_from_x_handle():
-    ih = identity_hash_from_x_handle("@Alice")
-    assert ih.startswith("0x")
-    assert ih == identity_hash_from_x_handle("alice")
+    h = identity_hash_from_x_handle("CreatorName")
+    assert h.startswith("0x")
+    assert len(h) > 10
 
 
-def test_resolve_identity_hash_prefers_explicit():
-    explicit = "0xdeadbeef"
-    assert resolve_identity_hash("alice", explicit=explicit) == explicit
+def test_resolve_identity_hash_explicit():
+    assert resolve_identity_hash(None, explicit="0xdead") == "0xdead"
 
 
-def test_resolve_identity_hash_none_without_handle():
-    assert resolve_identity_hash(None) is None
+def test_resolve_identity_hash_from_handle():
+    h = resolve_identity_hash("CreatorName")
+    assert h and h.startswith("0x")

@@ -12,10 +12,10 @@ from app.core.utils import cleanup_temp_file, new_media_id
 from app.db.discovery_repository import ProvenanceHitRepository
 from app.db.oracle_repository import ConfigCacheRepository, MediaPostLinkRepository
 from app.discovery.confidence import passes_off_network_thresholds
+from app.discovery.store import DiscoveryStore
 from app.models.similarity import MediaMatch
 from app.services.analysis.media_fetcher import download_media
 from app.services.analysis.scoring import similarity_float_to_u64_percent
-from app.services.discovery_client import DiscoveryClient
 from app.services.events import event_bus
 from app.services.media_similarity import detect_audio_similarity, detect_image_similarity
 from app.services.poc_utils import MEDIA_TYPE_AUDIO, MEDIA_TYPE_IMAGE, MEDIA_TYPE_VIDEO, OFFCHAIN_DEFAULT_POC_CONFIG
@@ -62,7 +62,7 @@ class AnalysisService:
         self.links = MediaPostLinkRepository()
         self.config_repo = ConfigCacheRepository()
         self.provenance = ProvenanceHitRepository()
-        self.discovery = DiscoveryClient()
+        self.discovery = DiscoveryStore()
 
     def _load_thresholds(self, network: str) -> tuple[int, int, int]:
         try:
@@ -180,21 +180,19 @@ class AnalysisService:
                         decision=decision,
                     )
                     if discovery_asset_id and off_network:
-                        await self.discovery.lifecycle_event(str(discovery_asset_id), "match_detected")
+                        self.discovery.transition_asset(str(discovery_asset_id), "match_detected")
                     if needs_review and discovery_asset_id:
-                        await self.discovery.lifecycle_event(str(discovery_asset_id), "needs_review")
-                        await self.discovery.record_provenance_hit(
-                            {
-                                "network": network,
-                                "post_id": post_id,
-                                "query_media_id": media_id,
-                                "discovery_asset_id": discovery_asset_id,
-                                "similarity_score": float(discovered_match.similarity_score),
-                                "work_confidence": work_confidence,
-                                "creator_confidence": creator_confidence,
-                                "decision": "needs_review",
-                                "vault_provisioned": False,
-                            }
+                        self.provenance.record(
+                            network=network,
+                            post_id=post_id,
+                            query_media_id=media_id,
+                            discovery_asset_id=str(discovery_asset_id),
+                            creator_candidate_id=str(creator_candidate_id) if creator_candidate_id else None,
+                            similarity_score=float(discovered_match.similarity_score),
+                            match_type=str(discovered_match.match_type),
+                            work_confidence=work_confidence,
+                            creator_confidence=creator_confidence,
+                            decision="needs_review",
                         )
 
             reasoning = f"Analyzed {media_url}; matches={len(matches)}; top_score_u64={highest}."

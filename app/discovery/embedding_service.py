@@ -1,17 +1,17 @@
-"""Embed discovered external assets without persisting raw media."""
+"""Embed off-network assets without persisting raw media."""
 
 from __future__ import annotations
 
-import os
 import uuid
 from dataclasses import dataclass
 
+import httpx
 import structlog
 from fastapi import HTTPException
 
 from app.core.utils import cleanup_temp_file
-from app.discovery.context import discovered_context
 from app.discovery.confidence import cold_start_work_confidence
+from app.discovery.context import discovered_context
 from app.discovery.identity import resolve_identity_hash
 from app.services.analysis.media_fetcher import download_media
 from app.services.media_similarity import (
@@ -41,9 +41,7 @@ def _normalize_media_type(media_type: str) -> str:
 
 
 def validate_embed_media_type(media_type: str) -> str:
-    """Return normalized media type or raise HTTP 400 for non-media."""
     normalized = _normalize_media_type(media_type)
-    # Accept MIME prefixes from misconfigured clients, map to PoC codes.
     if normalized.startswith("image/"):
         return "image"
     if normalized.startswith("video/"):
@@ -101,7 +99,6 @@ async def embed_discovered_asset(
     creator_confidence: float = 0.0,
     creator_candidate_id: str | None = None,
 ) -> EmbedResult:
-    # Fail fast before download when media_type is not PoC-embeddable.
     code = _media_type_code(media_type)
     identity_hash = resolve_identity_hash(creator_x_handle)
     ctx = discovered_context(
@@ -113,7 +110,32 @@ async def embed_discovered_asset(
         creator_candidate_id=creator_candidate_id,
     )
     media_id = f"disc_{uuid.uuid4()}"
-    path, _content_type = await download_media(external_source_url)
+    try:
+        path, _content_type = await download_media(external_source_url)
+    except httpx.HTTPStatusError as exc:
+        status = exc.response.status_code
+        logger.warning(
+            "Discovery embed media download failed",
+            discovery_asset_id=discovery_asset_id,
+            external_source_url=external_source_url,
+            http_status=status,
+            error=str(exc),
+        )
+        raise HTTPException(
+            status_code=502,
+            detail=f"failed to download media from {external_source_url}: HTTP {status}",
+        ) from exc
+    except httpx.HTTPError as exc:
+        logger.warning(
+            "Discovery embed media download failed",
+            discovery_asset_id=discovery_asset_id,
+            external_source_url=external_source_url,
+            error=str(exc),
+        )
+        raise HTTPException(
+            status_code=502,
+            detail=f"failed to download media from {external_source_url}: {exc}",
+        ) from exc
     try:
         set_active_embedding_context(ctx)
         matches = []
@@ -132,6 +154,7 @@ async def embed_discovered_asset(
                 logger.warning(
                     "Unsupported media for discovery embed",
                     discovery_asset_id=discovery_asset_id,
+                    external_source_url=external_source_url,
                     media_type=media_type,
                     error=str(exc),
                 )
@@ -139,12 +162,19 @@ async def embed_discovered_asset(
                     status_code=422,
                     detail=f"unsupported media: downloaded bytes are not valid {media_type}",
                 ) from exc
+            logger.error(
+                "Discovery embed similarity failed",
+                discovery_asset_id=discovery_asset_id,
+                external_source_url=external_source_url,
+                media_type=media_type,
+                error=str(exc),
+            )
             raise
 
         work_confidence = max((m.similarity_score for m in matches), default=cold_start_work_confidence())
         ctx.work_confidence = work_confidence
         logger.info(
-            "Discovered asset embedded",
+            "Discovery asset embedded",
             discovery_asset_id=discovery_asset_id,
             media_id=media_id,
             work_confidence=work_confidence,
@@ -161,13 +191,5 @@ async def embed_discovered_asset(
         cleanup_temp_file(path)
 
 
-def verify_embed_secret(authorization: str | None) -> bool:
-    secret = os.getenv("DISCOVERY_EMBED_SECRET", "").strip()
-    if not secret:
-        return os.getenv("DEBUG", "").lower() in ("1", "true", "yes")
-    if not authorization:
-        return False
-    prefix = "Bearer "
-    if not authorization.startswith(prefix):
-        return False
-    return authorization[len(prefix) :].strip() == secret
+# Backward-compatible alias during migration.
+embed_discovered_asset = embed_discovered_asset

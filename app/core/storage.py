@@ -1,4 +1,5 @@
 import os
+import mimetypes
 import structlog
 from typing import BinaryIO, Optional, Dict, Any
 from pathlib import Path
@@ -302,17 +303,81 @@ class StorageClient:
         logger.warning("No cloud storage backends available, using local storage")
         return self._upload_to_local(filename, fileobj, media_type, file_size)
     
+    def build_r2_object_key(self, media_type: str, filename: str) -> str:
+        """Build R2 object key: {media_type}/{YYYY}/{MM}/{filename}."""
+        from datetime import datetime
+
+        now = datetime.now()
+        year = now.strftime("%Y")
+        month = now.strftime("%m")
+        return f"{media_type}/{year}/{month}/{filename}"
+
+    def public_url_for_key(self, key: str) -> str:
+        """HTTPS CDN URL for an R2 key. Requires R2_PUBLIC_DOMAIN."""
+        domain = (config.R2_PUBLIC_DOMAIN or "").strip().rstrip("/")
+        if not domain:
+            raise ValueError("R2_PUBLIC_DOMAIN is required for public media URLs")
+        if domain.startswith("https://") or domain.startswith("http://"):
+            return f"{domain}/{key}"
+        return f"https://{domain}/{key}"
+
+    def create_presigned_put(
+        self,
+        key: str,
+        content_type: str,
+        expires_in: int = 3600,
+    ) -> str:
+        """Create a short-lived presigned PUT URL for direct client→R2 upload."""
+        if not self.r2_client:
+            raise ValueError("R2 client is not initialized")
+        return self.r2_client.generate_presigned_url(
+            "put_object",
+            Params={
+                "Bucket": config.R2_BUCKET_NAME,
+                "Key": key,
+                "ContentType": content_type,
+            },
+            ExpiresIn=expires_in,
+        )
+
+    def reserve_presigned_upload(
+        self,
+        *,
+        media_type: str,
+        media_id: str,
+        filename: str,
+        content_type: str,
+        expires_in: int = 3600,
+    ) -> dict:
+        """
+        Reserve an R2 key and return public_url + upload_url for chain-first publish.
+        Filename is only used for extension; object basename is always {media_id}{ext}.
+        """
+        from pathlib import Path
+
+        ext = Path(filename or "").suffix or mimetypes.guess_extension(content_type) or ".bin"
+        if not ext.startswith("."):
+            ext = f".{ext}"
+        object_filename = f"{media_id}{ext}"
+        key = self.build_r2_object_key(media_type, object_filename)
+        public_url = self.public_url_for_key(key)
+        upload_url = self.create_presigned_put(key, content_type, expires_in=expires_in)
+        return {
+            "media_id": media_id,
+            "key": key,
+            "public_url": public_url,
+            "upload_url": upload_url,
+            "expires_in": expires_in,
+            "content_type": content_type,
+        }
+
     def _upload_to_r2(self, filename: str, fileobj: BinaryIO, media_type: str, file_size: int, progress_callback: Optional[callable] = None) -> str:
         """Upload file to Cloudflare R2 (S3-compatible) with progress tracking."""
         try:
             bucket_name = config.R2_BUCKET_NAME
             
             # Simplified storage path: media_type/YYYY/MM/filename (filename is just media_id.ext)
-            from datetime import datetime
-            now = datetime.now()
-            year = now.strftime("%Y")
-            month = now.strftime("%m")
-            storage_path = f"{media_type}/{year}/{month}/{filename}"
+            storage_path = self.build_r2_object_key(media_type, filename)
             
             # Set metadata (sanitize to ASCII-only for S3/R2 compatibility)
             metadata = {

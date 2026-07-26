@@ -182,9 +182,20 @@ curl -X POST "http://localhost:8000/upload" \
 
 **Roles:** this service is the **oracle**: it fingerprints media, computes similarity, resolves **`original_creator`** from `media_files.creator_address` (including video frame ids mapped to parent media), maps scores to **integer 0–100** for Move, and submits `analyze_and_update_post` or `analyze_and_update_post_sync_token_pool`. The **chain** applies thresholds and mints/redirects; the **indexer** (separate Postgres) ingests events—keep scores and redirect percentages ≤ 100 so redirection events index cleanly.
 
-### Basic PoC post E2E flow
+### DripDrop publish path (presign → chain → oracle)
 
-1. **Post created on-chain** — `post::create_post` with `enable_poc=true` emits `PostCreatedEvent`.
+Happy path for DripDrop (video bytes never traverse this Railway service):
+
+1. **`POST /uploads/presign`** — Bearer MySocial session JWT + JSON `{ filename, content_type, content_length? }` → `{ media_id, key, public_url, upload_url, expires_in }`. Requires `R2_PUBLIC_DOMAIN` and R2 credentials. Object key matches server uploads: `video/YYYY/MM/{media_id}.mp4`.
+2. **`create_post` on-chain** — `media_urls = [public_url]`, `enable_poc=true`, DripDrop `platform_id`.
+3. **Client PUT** — upload bytes directly to `upload_url` with `Content-Type` matching the reservation (can finish after the tx).
+4. **Oracle** — gRPC sync enqueues analysis; worker downloads `public_url` (retries on 404 while upload is in flight) and submits `analyze_and_update_post`.
+
+Do **not** use multipart `POST /upload` for DripDrop publish (it rewrites storage keys and routes the full video through Railway).
+
+### Basic PoC post E2E flow (oracle)
+
+1. **Post created on-chain** — `post::create_post` with `enable_poc=true` emits `PostCreatedEvent` (and publicly fetchable `media_urls`).
 2. **Oracle discovery** — gRPC sync upserts `chain_posts` with `creator_address` (post owner) and enqueues an `analyze_post` job.
 3. **Analysis** — `AnalysisService` fingerprints media, queries similarity corpus, resolves `original_creator` from `media_files.creator_address` on matched ids.
 4. **Decision** — `DecisionEngine.build_submission` compares score to configured thresholds and decides derivative vs original. **Self-match guard:** when matched `original_creator` equals the posting profile (`chain_posts.creator_address`), the derivative path is skipped (no redirect, no vault provisioning); score is preserved for analytics and a fresh original badge is minted for the new post.

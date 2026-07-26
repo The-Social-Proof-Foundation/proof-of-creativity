@@ -13,7 +13,10 @@ def default_embedding_model() -> str:
 
 
 def default_embedding_version() -> str:
-    explicit = os.getenv("DISCOVERY_ACTIVE_EMBEDDING_VERSION", "").strip()
+    explicit = (
+        os.getenv("POC_ACTIVE_EMBEDDING_VERSION", "").strip()
+        or os.getenv("DISCOVERY_ACTIVE_EMBEDDING_VERSION", "").strip()
+    )
     if explicit:
         return explicit
     model = default_embedding_model().replace("/", "-")
