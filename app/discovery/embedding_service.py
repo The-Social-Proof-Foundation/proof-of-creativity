@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import uuid
 from dataclasses import dataclass
 
@@ -145,7 +146,9 @@ async def embed_discovered_asset(
             elif code == MEDIA_TYPE_AUDIO:
                 matches = await detect_audio_similarity(path, media_id)
             elif code == MEDIA_TYPE_VIDEO:
-                analysis = await analyze_video_similarity(path, media_id)
+                analysis = await asyncio.to_thread(
+                    analyze_video_similarity, path, media_id
+                )
                 matches = analysis.matches
             else:
                 matches = await detect_image_similarity(path, media_id)

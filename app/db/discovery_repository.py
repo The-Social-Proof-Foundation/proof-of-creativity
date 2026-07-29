@@ -142,10 +142,12 @@ class ProvenanceHitRepository:
                 cur.execute(sql, (media_id,))
                 row = cur.fetchone()
         if not row:
-            return self.get_embedding_provenance(media_id)
+            # Already exhausted embeddings/audio in get_embedding_provenance — do not re-enter.
+            return None
         frame_prov = self._normalize_provenance_row(*row)
         parent_id = (frame_prov.get("metadata") or {}).get("parent_media_id")
-        if parent_id:
+        # Frames are keyed by parent_media_id == media_id; recursing would loop forever.
+        if parent_id and str(parent_id) != str(media_id):
             parent_prov = self.get_embedding_provenance(str(parent_id))
             if parent_prov:
                 return parent_prov

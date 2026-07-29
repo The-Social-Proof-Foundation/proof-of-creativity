@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 from dataclasses import dataclass, field
 
@@ -111,7 +112,9 @@ class AnalysisService:
             elif media_type == MEDIA_TYPE_AUDIO:
                 matches = await detect_audio_similarity(path, media_id)
             elif media_type == MEDIA_TYPE_VIDEO:
-                video_analysis = await analyze_video_similarity(path, media_id)
+                video_analysis = await asyncio.to_thread(
+                    analyze_video_similarity, path, media_id
+                )
                 matches = video_analysis.matches
                 from app.services.poc_video_types import decide_video_poc_for_chain
 

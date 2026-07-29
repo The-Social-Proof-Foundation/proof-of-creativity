@@ -188,7 +188,8 @@ class GrpcSyncCheckpoint(Base):
     __tablename__ = "grpc_sync_checkpoints"
 
     network = Column(String(20), primary_key=True)
-    stream_id = Column(String(64), primary_key=True, default="default")
+    # 0x + 64 hex (full Move address); short forms like 0x50c1 also fit
+    stream_id = Column(String(66), primary_key=True, default="default")
     checkpoint_sequence = Column(BigInteger, default=0)
     last_transaction_digest = Column(String(128))
     updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())

@@ -46,7 +46,7 @@ def resolve_event_stream_id(profile: NetworkProfile) -> str:
 
 
 def resolve_checkpoint_stream_id(profile: NetworkProfile) -> str:
-    """Short package id for grpc_sync_checkpoints DB keys."""
+    """Package id for grpc_sync_checkpoints DB keys (short when possible, else full 0x+64)."""
     return format_address_short(_resolve_event_stream_id_raw(profile))
 
 

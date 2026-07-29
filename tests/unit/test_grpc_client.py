@@ -48,6 +48,16 @@ def test_resolve_stream_ids_short_db_and_padded_grpc(monkeypatch):
     assert len(resolve_event_stream_id(profile)) == 66
 
 
+def test_resolve_checkpoint_stream_id_full_address_fits_varchar_66(monkeypatch):
+    """Package ids without leading zeros stay 66 chars (0x + 64 hex) — DB column must allow that."""
+    full = "0xc5490e0ba67427191a018f1535f01d441ce33c2fd86703b91e6031313ba36517"
+    monkeypatch.setenv("MYSO_POC_PACKAGE_ID", full)
+    profile = load_network_profile("localnet")
+    short = resolve_checkpoint_stream_id(profile)
+    assert short == full
+    assert len(short) == 66
+
+
 def test_resolve_sync_start_checkpoint_prefers_saved_over_configured():
     assert resolve_sync_start_checkpoint(
         saved_checkpoint_sequence=100,
