@@ -600,111 +600,15 @@ class StorageClient:
     
     def upload_to_stream(self, filename: str, fileobj: BinaryIO, media_type: str, file_size: int, metadata: Optional[Dict[str, Any]] = None) -> Optional[str]:
         """
-        Upload video to Cloudflare Stream for optimized streaming delivery.
-        
-        Args:
-            filename: Name of the file
-            fileobj: File object to upload
-            media_type: Type of media (should be 'video')
-            file_size: File size in bytes
-            metadata: Optional metadata to attach
-            
-        Returns:
-            Stream video UID or None if Stream is not configured
+        Retired: Cloudflare Stream is no longer used for DripDrop video.
+        HLS encoding is owned by dripdrop-backend + external encoder → R2 streams.
         """
-        if not self.stream_client:
-            logger.debug("Cloudflare Stream not configured, skipping video upload")
-            return None
-        
-        if media_type != "video":
-            logger.debug("Skipping Stream upload for non-video media", media_type=media_type)
-            return None
-        
-        try:
-            logger.info("Uploading video to Cloudflare Stream", 
-                       filename=filename,
-                       file_size_mb=round(file_size / 1024 / 1024, 2))
-            
-            api_url = self.stream_client['api_base_url']
-            headers = {'Authorization': f"Bearer {self.stream_client['api_token']}"}
-            
-            # Prepare metadata for Stream
-            stream_metadata = {
-                'name': filename,
-                'requireSignedURLs': False,  # Public URLs for Drip Prop
-            }
-            
-            # Add custom metadata if provided
-            if metadata:
-                # Stream allows custom metadata as key-value pairs
-                for key, value in metadata.items():
-                    if isinstance(value, (str, int, float, bool)):
-                        stream_metadata[f'meta_{key}'] = str(value)
-            
-            # Reset file pointer
-            fileobj.seek(0)
-            
-            # Upload to Stream using multipart/form-data
-            # Stream API: POST /accounts/{account_id}/stream
-            files = {'file': (filename, fileobj, self._get_content_type(filename))}
-            
-            start_time = time.time()
-            response = requests.post(
-                api_url,
-                headers=headers,
-                files=files,
-                data=stream_metadata,
-                timeout=600  # 10 minutes for large videos
-            )
-            upload_time = time.time() - start_time
-            
-            response.raise_for_status()
-            result = response.json()
-            
-            if not result.get('success'):
-                error_msg = result.get('errors', [{}])[0].get('message', 'Unknown error')
-                raise StorageError(f"Stream upload failed: {error_msg}")
-            
-            # Extract video UID and playback URL
-            video_data = result.get('result', {})
-            video_uid = video_data.get('uid')
-            
-            if not video_uid:
-                raise StorageError("Stream upload succeeded but no video UID returned")
-            
-            # Generate playback URL
-            if self.stream_client['customer_subdomain']:
-                # Custom domain
-                playback_url = f"https://{self.stream_client['customer_subdomain']}/{video_uid}/manifest/video.m3u8"
-            else:
-                # Default Cloudflare domain
-                playback_url = f"https://customer-{self.stream_client['account_id']}.cloudflarestream.com/{video_uid}/manifest/video.m3u8"
-            
-            # Also get iframe embed URL
-            iframe_url = f"https://customer-{self.stream_client['account_id']}.cloudflarestream.com/{video_uid}/iframe"
-            
-            logger.info("Stream upload completed successfully",
-                       filename=filename,
-                       video_uid=video_uid,
-                       playback_url=playback_url,
-                       upload_time_seconds=round(upload_time, 2),
-                       upload_speed_mbps=round((file_size / 1024 / 1024) / upload_time, 2) if upload_time > 0 else 0)
-            
-            # Return stream URI in format: stream://{video_uid}
-            return f"stream://{video_uid}"
-            
-        except requests.exceptions.RequestException as e:
-            logger.error("Stream API error during upload",
-                        filename=filename,
-                        error=str(e),
-                        status_code=getattr(e.response, 'status_code', None),
-                        response_text=getattr(e.response, 'text', '')[:500])
-            return None
-        except Exception as e:
-            logger.error("Unexpected error during Stream upload",
-                        filename=filename,
-                        error=str(e))
-            return None
+        logger.warning(
+            "upload_to_stream is retired; use dripdrop-backend /v1/videos",
+            filename=filename,
+            media_type=media_type,
+        )
+        return None
     
     def get_stream_playback_url(self, stream_uri: str) -> Optional[str]:
         """

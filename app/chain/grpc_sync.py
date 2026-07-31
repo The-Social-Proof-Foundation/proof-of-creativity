@@ -156,7 +156,10 @@ class GrpcSyncService:
             enable_poc=True,
             media_urls=parsed["media_urls"],
             media_types=parsed.get("media_types") or [],
-            metadata={"tx_digest": event.transaction_digest},
+            metadata={
+                "tx_digest": event.transaction_digest,
+                "event_sequence": getattr(event, "event_idx", 0) or 0,
+            },
         )
         if not inserted:
             return

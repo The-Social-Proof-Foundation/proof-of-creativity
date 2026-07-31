@@ -12,6 +12,7 @@ class ChainEvent:
     checkpoint_sequence: int
     transaction_digest: str
     payload: dict
+    event_idx: int = 0
 
 
 CHECKPOINT_MARKER_EVENT = "__checkpoint__"

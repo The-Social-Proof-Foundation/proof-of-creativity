@@ -19,6 +19,7 @@ from app.network_config import get_settings, load_network_profile
 from app.services.analysis.media_fetcher import MediaNotReadyError
 from app.services.analysis.pipeline import AnalysisService
 from app.services.decision_engine import DecisionEngine
+from app.services.dripdrop_video_client import extract_asset_id_from_hls, get_dripdrop_video_client
 from app.services.events import event_bus
 from app.services.proof_bundle import ProofBundleService
 from app.services.username_beneficiary import UsernameBeneficiaryService
@@ -120,10 +121,35 @@ class OracleWorker:
         )
         self.posts.update_status(self.network, post_id, analysis_status="analyzing")
 
-        analysis = await self.analysis.analyze(
-            self.network, post_id, media_url, media_index, media_type
-        )
         post = self.posts.get(self.network, post_id) or {"post_id": post_id}
+        metadata = post.get("metadata") or {}
+        if isinstance(metadata, str):
+            import json
+
+            try:
+                metadata = json.loads(metadata)
+            except Exception:
+                metadata = {}
+        post_tx_digest = (
+            post.get("tx_digest")
+            or metadata.get("tx_digest")
+            or metadata.get("transaction_digest")
+            or ""
+        )
+        event_idx = int(metadata.get("event_sequence") or metadata.get("event_idx") or 0)
+        event_sequence = event_idx * 1000 + media_index
+        creator = post.get("creator_address") or ""
+
+        analysis = await self.analysis.analyze(
+            self.network,
+            post_id,
+            media_url,
+            media_index,
+            media_type,
+            creator_wallet_address=creator or None,
+            transaction_digest=str(post_tx_digest) or None,
+            event_sequence=event_sequence,
+        )
         submission = self.decisions.build_submission(post, analysis)
 
         if submission.needs_review:
@@ -227,6 +253,27 @@ class OracleWorker:
                 "poc_outcome": None,
             },
         )
+
+        # Notify dripdrop-backend to start private-source retention (HLS posts only).
+        try:
+            dd = get_dripdrop_video_client()
+            asset_id = extract_asset_id_from_hls(media_url, dd.media_host)
+            if asset_id and dd.enabled and creator and post_tx_digest:
+                await dd.analysis_complete(
+                    asset_id=asset_id,
+                    post_object_id=post_id,
+                    creator_wallet_address=creator,
+                    hls_url=media_url,
+                    transaction_digest=str(post_tx_digest),
+                    event_sequence=event_sequence,
+                    status="succeeded",
+                )
+        except Exception as exc:
+            logger.warning(
+                "analysis-complete notify failed",
+                post_id=post_id,
+                error=str(exc),
+            )
 
     async def _process_claim(self, job: dict) -> None:
         payload = job.get("payload") or {}

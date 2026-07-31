@@ -123,6 +123,7 @@ def to_chain_events(
             checkpoint_sequence=item.checkpoint_sequence,
             transaction_digest=item.transaction_digest,
             payload=item.payload,
+            event_idx=item.event_idx,
         )
         for item in extracted
     ]

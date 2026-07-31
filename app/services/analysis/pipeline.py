@@ -83,6 +83,10 @@ class AnalysisService:
         media_url: str,
         media_index: int,
         media_type: int,
+        *,
+        creator_wallet_address: str | None = None,
+        transaction_digest: str | None = None,
+        event_sequence: int | None = None,
     ) -> AnalysisResult:
         await event_bus.publish(
             "post.analysis.progress",
@@ -93,7 +97,13 @@ class AnalysisService:
                 "pct": 10,
             },
         )
-        path, _content_type = await download_media(media_url)
+        path, _content_type = await download_media(
+            media_url,
+            post_object_id=post_id,
+            creator_wallet_address=creator_wallet_address,
+            transaction_digest=transaction_digest,
+            event_sequence=event_sequence,
+        )
         media_id = new_media_id()
         try:
             await event_bus.publish(

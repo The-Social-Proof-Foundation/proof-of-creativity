@@ -342,88 +342,25 @@ def _media_type_from_content_type(content_type: str) -> str:
     )
 
 
-@app.post("/uploads/presign", response_model=PresignUploadResponse)
+@app.post("/uploads/presign")
 async def presign_upload(
     request: Request,
     body: PresignUploadRequest = Body(...),
     _rate_limit: None = Depends(check_rate_limit),
 ):
     """
-    Reserve an R2 object key and return a presigned PUT URL for direct client upload.
+    Retired: DripDrop video upload ownership moved to dripdrop-backend.
 
-    DripDrop publish flow:
-    1. POST /uploads/presign → public_url + upload_url
-    2. create_post on-chain with media_urls=[public_url]
-    3. PUT video bytes to upload_url (background)
-    4. Oracle downloads public_url and attests (retries on 404 while upload in flight)
+    Use POST {DRIPDROP_BACKEND_URL}/v1/videos/uploads (multipart → ready_unpublished → create_post).
     """
-    _require_bearer_session_jwt(request)
-
-    if not config.USE_CLOUDFLARE_R2:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="Cloudflare R2 storage is not enabled",
-        )
-    if not (config.R2_PUBLIC_DOMAIN or "").strip():
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="R2_PUBLIC_DOMAIN must be configured for chain-publishable media URLs",
-        )
-    if not storage_client or not getattr(storage_client, "r2_client", None):
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="R2 storage client is not available",
-        )
-
-    content_type = (body.content_type or "").strip().lower()
-    if content_type not in SUPPORTED_TYPES:
-        raise HTTPException(
-            status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
-            detail=f"Unsupported media type: {content_type}",
-        )
-    if body.content_length is not None and body.content_length > MAX_FILE_SIZE:
-        raise HTTPException(
-            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-            detail=f"File size exceeds maximum allowed size of {MAX_FILE_SIZE} bytes",
-        )
-    if not (body.filename or "").strip():
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="filename is required",
-        )
-
-    media_type = _media_type_from_content_type(content_type)
-    media_id = new_media_id()
-    expires_in = int(os.getenv("R2_PRESIGN_EXPIRES_SECONDS", "3600"))
-
-    try:
-        reserved = storage_client.reserve_presigned_upload(
-            media_type=media_type,
-            media_id=media_id,
-            filename=body.filename.strip(),
-            content_type=content_type,
-            expires_in=expires_in,
-        )
-    except ValueError as e:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail=str(e),
-        ) from e
-    except Exception as e:
-        logger.error("Failed to create presigned upload", error=str(e))
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Failed to create presigned upload URL",
-        ) from e
-
-    logger.info(
-        "Presigned upload reserved",
-        media_id=reserved["media_id"],
-        key=reserved["key"],
-        public_url=reserved["public_url"],
-        expires_in=reserved["expires_in"],
+    raise HTTPException(
+        status_code=status.HTTP_410_GONE,
+        detail={
+            "error": "Video upload presign moved to dripdrop-backend",
+            "use": "/v1/videos/uploads",
+            "docs": "dripdrop-backend/docs/video/client-publish.md",
+        },
     )
-    return PresignUploadResponse(**reserved)
 
 
 @app.get("/", response_model=dict)
@@ -437,7 +374,10 @@ async def root():
         "health_url": "/health",
         "readyz_url": "/readyz",
         "database": "PostgreSQL with pgvector",
-        "dripdrop_publish": "POST /uploads/presign → create_post(media_urls) → PUT to upload_url → oracle analyzes",
+        "dripdrop_publish": (
+            "dripdrop-backend POST /v1/videos/uploads → ready_unpublished → "
+            "create_post(media_urls=[HLS]) → oracle source-access → analyze"
+        ),
     }
 
 @app.get("/health", response_model=HealthResponse)
