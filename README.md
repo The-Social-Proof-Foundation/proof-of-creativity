@@ -180,34 +180,39 @@ curl -X POST "http://localhost:8000/upload" \
 
 ### MySocial Proof of Creativity (oracle)
 
-**Roles:** this service is the **oracle**: it fingerprints media, computes similarity, resolves **`original_creator`** from `media_files.creator_address` (including video frame ids mapped to parent media), maps scores to **integer 0–100** for Move, and submits `analyze_and_update_post` or `analyze_and_update_post_sync_token_pool`. The **chain** applies thresholds and mints/redirects; the **indexer** (separate Postgres) ingests events—keep scores and redirect percentages ≤ 100 so redirection events index cleanly.
+**MediaAsset-centric model (V1):** `MediaAsset.id` is the canonical creative identity. PoC runs two pipelines:
 
-### DripDrop publish path (presign → chain → oracle)
+1. **Asset resolution** — `submit_media_resolution` → oracle `finalize_media_asset` → canonical `MediaAsset.id`
+2. **Composition analysis** — `create_post(media_asset_ids)` + `MediaAssetUsedEvent` → oracle `analyze_post_composition` → `CompositionAnalysis` + creator-attributable `RevenueManifest`
 
-Happy path for DripDrop (video bytes never traverse this Railway service):
+Post-level `revenue_redirect_*` and `analyze_and_update_post` are **deprecated**. Protocol/platform fees are deducted **before** the attributable pool; the manifest splits only the creator-attributable remainder.
 
-1. **`POST /uploads/presign`** — Bearer MySocial session JWT + JSON `{ filename, content_type, content_length? }` → `{ media_id, key, public_url, upload_url, expires_in }`. Requires `R2_PUBLIC_DOMAIN` and R2 credentials. Object key matches server uploads: `video/YYYY/MM/{media_id}.mp4`.
-2. **`create_post` on-chain** — `media_urls = [public_url]`, `enable_poc=true`, DripDrop `platform_id`.
-3. **Client PUT** — upload bytes directly to `upload_url` with `Content-Type` matching the reservation (can finish after the tx).
-4. **Oracle** — gRPC sync enqueues analysis; worker downloads `public_url` (retries on 404 while upload is in flight) and submits `analyze_and_update_post`.
+See [`docs/media-asset-client-flow.md`](docs/media-asset-client-flow.md) for the full client sequence.
 
-Do **not** use multipart `POST /upload` for DripDrop publish (it rewrites storage keys and routes the full video through Railway).
+### DripDrop publish path (MediaAsset-centric)
 
-### Basic PoC post E2E flow (oracle)
+1. **`POST /uploads/presign`** — reservation + `public_url` (same as before).
+2. **`submit_media_resolution`** on-chain — content + fingerprint commitments; oracle enqueues `resolve_media_asset`.
+3. **Oracle `finalize_media_asset`** — mint or link deduped `MediaAsset.id`.
+4. **`create_post`** with `media_asset_ids = [asset_id]` and optional `media_urls` for delivery; chain emits `MediaAssetUsedEvent`.
+5. **Oracle `analyze_composition`** — validates usage grants, builds version-pinned `CompositionAnalysis` + `RevenueManifest`, submits `analyze_post_composition` (or `_sync_token_pool` when SPT pool present).
 
-1. **Post created on-chain** — `post::create_post` with `enable_poc=true` emits `PostCreatedEvent` (and publicly fetchable `media_urls`).
-2. **Oracle discovery** — gRPC sync upserts `chain_posts` with `creator_address` (post owner) and enqueues an `analyze_post` job.
-3. **Analysis** — `AnalysisService` fingerprints media, queries similarity corpus, resolves `original_creator` from `media_files.creator_address` on matched ids.
-4. **Decision** — `DecisionEngine.build_submission` compares score to configured thresholds and decides derivative vs original. **Self-match guard:** when matched `original_creator` equals the posting profile (`chain_posts.creator_address`), the derivative path is skipped (no redirect, no vault provisioning); score is preserved for analytics and a fresh original badge is minted for the new post.
-5. **Chain submission** — oracle calls `analyze_and_update_post`; Move clears self-match `original_creator` defensively, then either mints an original badge or applies derivative redirect + optional beneficiary vault.
-6. **Indexer** — social indexer writes `poc_analysis_results` (score + score-threshold `similarity_detected`), `poc_badges`, `poc_revenue_redirections`, and vault deposit events into Postgres.
-7. **Optional reservation** — `reserve_towards_post_with_platform` tips into the post owner's existing beneficiary vault (not a wrongful derivative vault).
+Legacy path (post-centric `media_urls` + `analyze_post` job) remains for unmigrated clients but should not be used for new integrations.
 
-**Self-match rule:** reposts, remasters, and director's cuts by the same creator must not enter the derivative pipeline against themselves. Similarity is still recorded (`highest_similarity_score`); GraphQL `similarityDetected` uses configured thresholds at the indexer layer.
+### Basic PoC post E2E flow (legacy post-centric — deprecated)
 
-**Local verification:** `ASSUME_YES=1 ./scripts/poc-oracle-post-runnable.sh --self-match-analyze` exercises on-chain self-match semantics (original badge, no `RevenueRedirectionActivatedEvent`).
+<details>
+<summary>Pre-MediaAsset flow (maintenance only)</summary>
 
-When `MYSO_INTEGRATION_ENABLED=true`, the service submits Move entries as above when **`MYSO_TOKEN_REGISTRY_ID`** and a per-post **`spt_pool_id`** (query param or inferred from the post object) are available for the sync variant. Required object IDs include **`MYSO_POC_VAULT_DIRECTORY_ID`** in addition to package, config, and registry. If the post has no token pool but you call the sync entry, expect on-chain abort (e.g. `ENoTokenPoolForPost`); the plain `analyze_and_update_post` path is used when pool + token registry are not both configured.
+1. **Post created on-chain** — `post::create_post` with publicly fetchable `media_urls` (legacy).
+2. **Oracle discovery** — gRPC sync enqueues `analyze_post` jobs per URL.
+3. **Analysis** — similarity + `DecisionEngine`.
+4. **Chain submission** — `analyze_and_update_post` (deprecated).
+
+New integrations must use the MediaAsset-centric flow above.
+</details>
+
+When `MYSO_INTEGRATION_ENABLED=true`, composition sync uses **`MYSO_TOKEN_REGISTRY_ID`** and per-post **`spt_pool_id`** for `analyze_post_composition_sync_token_pool`. Required: **`MYSO_POC_VAULT_DIRECTORY_ID`**, package, config, registry.
 
 **Chain submission checklist (actually hitting Move):**
 

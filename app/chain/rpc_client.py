@@ -68,6 +68,37 @@ class TransactionSubmitter:
             raise RuntimeError("MySocial client unavailable for chain writes")
         return self.client.submit_poc_analysis(**kwargs)
 
+    def submit_finalize_media_asset(self, move_call_data: dict) -> dict:
+        if not self.writes_enabled:
+            return self._mock_tx("finalize_media_asset", move_call_data.get("arguments", {}))
+        if not self.client:
+            raise RuntimeError("MySocial client unavailable for chain writes")
+        return self.client.submit_finalize_media_asset(move_call_data)
+
+    def submit_analyze_post_composition(self, move_call_data: dict) -> dict:
+        fn = move_call_data.get("function") or "analyze_post_composition"
+        if not self.writes_enabled:
+            return self._mock_tx(fn, move_call_data.get("arguments", {}))
+        if not self.client:
+            raise RuntimeError("MySocial client unavailable for chain writes")
+        return self.client.submit_analyze_post_composition(move_call_data)
+
+    def submit_move_call(self, move_call_data: dict) -> dict:
+        fn = move_call_data.get("function") or "move_call"
+        if not self.writes_enabled:
+            return self._mock_tx(fn, move_call_data.get("arguments", {}))
+        if not self.client:
+            raise RuntimeError("MySocial client unavailable for chain writes")
+        return self.client.submit_move_call(move_call_data)
+
+    def submit_ptb(self, steps: list[dict]) -> dict:
+        fn = "ptb"
+        if not self.writes_enabled:
+            return self._mock_tx(fn, {"step_count": len(steps)})
+        if not self.client:
+            raise RuntimeError("MySocial client unavailable for chain writes")
+        return self.client.submit_ptb(steps)
+
     def create_username_beneficiary(
         self,
         *,

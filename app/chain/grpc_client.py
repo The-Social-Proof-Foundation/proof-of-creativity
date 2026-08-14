@@ -16,7 +16,7 @@ from app.chain.authenticated_events_client import AuthenticatedEventsClient
 from app.chain.bcs_post_created import BcsDecodeError, decode_post_created_event
 from app.chain.chain_types import CHECKPOINT_MARKER_EVENT, ChainEvent
 from app.chain.checkpoint_event_extractor import (
-    extract_post_created_events,
+    extract_chain_events,
     format_address_padded,
     format_address_short,
     is_post_created_event,
@@ -149,7 +149,7 @@ class GrpcChainClient:
 
     async def _yield_checkpoint_events(self, checkpoint, checkpoint_seq: int) -> AsyncIterator[ChainEvent]:
         if checkpoint is not None:
-            extracted = extract_post_created_events(
+            extracted = extract_chain_events(
                 checkpoint,
                 network=self.network,
                 package_id=self.stream_id,

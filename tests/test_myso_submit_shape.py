@@ -8,6 +8,12 @@ from app.chain.move_calls import (
     build_claim_username_beneficiary_call,
     build_create_username_beneficiary_call,
 )
+from app.services.composition_submission import (
+    AssetVersionInput,
+    build_analyze_post_composition_move_call,
+    build_composition_submission_from_assets,
+)
+from app.services.media_asset_submission import MediaResolutionResult, build_finalize_media_asset_move_call
 from app.services.myso_client import MySocialClient
 
 
@@ -20,7 +26,79 @@ def poc_env_base(monkeypatch):
     monkeypatch.setenv("MYSOCIAL_RPC_URL", "https://rpc.example")
 
 
-def test_submit_poc_plain_move_call_argument_count(poc_env_base):
+def test_submit_finalize_media_asset_move_call_argument_count(poc_env_base):
+    resolution = MediaResolutionResult(
+        request_id="0xrequest",
+        content_commitment=b"\x01\x02",
+        observed_fingerprint_commitment=b"\x03\x04",
+        media_type=1,
+        submitter="0xsubmitter",
+    )
+    mc = build_finalize_media_asset_move_call(resolution)
+    assert mc["module"] == "proof_of_creativity"
+    assert mc["function"] == "finalize_media_asset"
+    assert len(mc["arguments"]) == 11
+
+
+def test_submit_analyze_post_composition_plain_move_call_argument_count(poc_env_base):
+    submission = build_composition_submission_from_assets(
+        post_id="0xpost",
+        assets=[
+            AssetVersionInput(
+                asset_id="0xasset",
+                rights_version=1,
+                economics_version=1,
+            )
+        ],
+    )
+    mc = build_analyze_post_composition_move_call(submission)
+    assert mc["module"] == "proof_of_creativity"
+    assert mc["function"] == "analyze_post_composition"
+    assert len(mc["arguments"]) == 13
+
+
+def test_submit_analyze_post_composition_sync_move_call_argument_count(poc_env_base, monkeypatch):
+    monkeypatch.setenv("MYSO_TOKEN_REGISTRY_ID", "0xtokenregistry")
+    submission = build_composition_submission_from_assets(
+        post_id="0xpost",
+        assets=[AssetVersionInput(asset_id="0xasset")],
+        spt_pool_id="0xpool",
+    )
+    mc = build_analyze_post_composition_move_call(submission)
+    assert mc["function"] == "analyze_post_composition_sync_token_pool"
+    assert len(mc["arguments"]) == 15
+
+
+def test_submit_analyze_post_composition_client_wrapper(poc_env_base):
+    captured = []
+
+    def fake_submit(self, move_call_data):
+        captured.append(move_call_data)
+        return {
+            "success": True,
+            "tx_hash": "0xdigest",
+            "status": {"status": "success"},
+            "events": [],
+        }
+
+    wallet = MagicMock()
+    wallet.get_address.return_value = "0xoracle"
+
+    submission = build_composition_submission_from_assets(
+        post_id="0xpost",
+        assets=[AssetVersionInput(asset_id="0xasset")],
+    )
+    move_call = build_analyze_post_composition_move_call(submission)
+
+    with patch.object(MySocialClient, "_submit_move_call", fake_submit):
+        client = MySocialClient(wallet=wallet)
+        client.submit_analyze_post_composition(move_call)
+
+    assert captured[0]["function"] == "analyze_post_composition"
+
+
+def test_submit_poc_analysis_logs_deprecation(poc_env_base):
+    """Legacy analyze_and_update_post path remains for backward compat but is deprecated."""
     captured = []
 
     def fake_submit(self, move_call_data):
@@ -38,56 +116,23 @@ def test_submit_poc_plain_move_call_argument_count(poc_env_base):
     with patch.object(MySocialClient, "_submit_move_call", fake_submit):
         with patch.object(MySocialClient, "fetch_post_fields", lambda self, pid: ({}, None)):
             client = MySocialClient(wallet=wallet)
-            client.submit_poc_analysis(
-                "0xpost",
-                media_type=2,
-                highest_similarity_score=88,
-                original_creator=None,
-                derivative_redirection_target=0,
-                embedded_audio_only_derivative=False,
-                apply_explicit_outcome=False,
-                explicit_poc_outcome=0,
-                reasoning=None,
-                evidence_urls=None,
-                spt_pool_id=None,
-            )
+            result = client.submit_poc_analysis("0xpost", media_type=2, highest_similarity_score=88)
 
-    mc = captured[0]
-    assert mc["module"] == "proof_of_creativity"
-    assert mc["function"] == "analyze_and_update_post"
-    assert len(mc["arguments"]) == 14
+    assert captured[0]["function"] == "analyze_and_update_post"
+    assert result["move_function"] == "analyze_and_update_post"
 
 
-def test_submit_poc_sync_move_call_argument_count(poc_env_base, monkeypatch):
-    monkeypatch.setenv("MYSO_TOKEN_REGISTRY_ID", "0xtokenregistry")
-    captured = []
+def test_submit_media_resolution_move_call(poc_env_base):
+    from app.services.media_asset_submission import build_submit_media_resolution_move_call
 
-    def fake_submit(self, move_call_data):
-        captured.append(move_call_data)
-        return {
-            "success": True,
-            "tx_hash": "0xdigest2",
-            "status": {"status": "success"},
-            "events": [],
-        }
-
-    wallet = MagicMock()
-    wallet.get_address.return_value = "0xoracle"
-
-    with patch.object(MySocialClient, "_submit_move_call", fake_submit):
-        with patch.object(MySocialClient, "fetch_post_fields", lambda self, pid: ({}, None)):
-            client = MySocialClient(wallet=wallet)
-            client.submit_poc_analysis(
-                "0xpost",
-                media_type=2,
-                highest_similarity_score=90,
-                original_creator="0xcreator",
-                spt_pool_id="0xpool",
-            )
-
-    mc = captured[0]
-    assert mc["function"] == "analyze_and_update_post_sync_token_pool"
-    assert len(mc["arguments"]) == 16
+    mc = build_submit_media_resolution_move_call(
+        content_commitment=b"\xaa\xbb",
+        observed_fingerprint_commitment=b"\xcc\xdd",
+        media_type=1,
+    )
+    assert mc["module"] == "media_asset"
+    assert mc["function"] == "submit_media_resolution"
+    assert len(mc["arguments"]) == 4
 
 
 def test_move_call_builders_argument_counts():

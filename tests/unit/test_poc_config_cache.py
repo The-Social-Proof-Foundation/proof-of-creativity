@@ -25,6 +25,7 @@ MOVE_POC_CONFIG_KEYS = {
     "username_beneficiary_join_referral_bps",
     "max_disputes_per_post",
     "min_vault_deposit_amount",
+    "max_embedded_asset_redirect_bps",
     "version",
 }
 

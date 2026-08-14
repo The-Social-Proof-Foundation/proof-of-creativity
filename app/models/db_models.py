@@ -174,6 +174,9 @@ class ChainPost(Base):
     enable_poc = Column(String(10), default="true")
     media_urls = Column(JSONB, default=list)
     media_types = Column(JSONB, default=list)
+    media_asset_ids = Column(JSONB, default=list)
+    composition_status = Column(Integer)
+    monetization_status = Column(Integer)
     analysis_status = Column(String(32), default="discovered")
     poc_outcome = Column(Integer)
     highest_similarity_score = Column(Integer)
@@ -380,6 +383,174 @@ class DiscoveryAsset(Base):
         Index("idx_discovery_assets_lifecycle", "lifecycle_state", "priority_score"),
         Index("idx_discovery_assets_creator", "creator_candidate_id"),
     )
+
+
+class CompositionAnalysisRecord(Base):
+    __tablename__ = "composition_analysis_records"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    network = Column(String(20), nullable=False)
+    post_id = Column(String(128), nullable=False)
+    composition_status = Column(Integer)
+    monetization_status = Column(Integer)
+    analysis_json = Column(JSONB, default=dict)
+    manifest_json = Column(JSONB)
+    reasoning = Column(Text)
+    evidence_urls = Column(JSONB, default=list)
+    contains_derivatives = Column(Boolean, default=False)
+    contains_unresolved_assets = Column(Boolean, default=False)
+    tx_digest = Column(String(128))
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    __table_args__ = (
+        Index("idx_composition_analysis_post", "network", "post_id", "created_at"),
+    )
+
+
+class ChainMediaAsset(Base):
+    __tablename__ = "chain_media_assets"
+
+    network = Column(String(20), primary_key=True)
+    asset_id = Column(String(128), primary_key=True)
+    content_commitment = Column(String(256))
+    fingerprint_commitment = Column(String(256))
+    media_type = Column(Integer)
+    asset_kind = Column(Integer, default=0)
+    originality_status = Column(Integer)
+    lineage_parent_id = Column(String(128))
+    pending_id = Column(String(128))
+    policy_version = Column(Integer, default=0)
+    creators = Column(JSONB, default=list)
+    rights_controllers = Column(JSONB, default=list)
+    beneficiaries = Column(JSONB, default=list)
+    beneficiary_splits = Column(JSONB, default=list)
+    rights_json = Column(JSONB, default=dict)
+    rights_version = Column(Integer, default=1)
+    economics_version = Column(Integer, default=1)
+    linked_existing = Column(Boolean, default=False)
+    resolve_tx_digest = Column(String(128))
+    request_id = Column(String(128))
+    metadata_json = Column("metadata", JSONB, default=dict)
+    registered_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    __table_args__ = (
+        Index("idx_chain_media_assets_fingerprint", "network", "fingerprint_commitment"),
+    )
+
+
+class FingerprintObservation(Base):
+    __tablename__ = "fingerprint_observations"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    network = Column(String(20), nullable=False)
+    fingerprint_commitment = Column(String(256), nullable=False)
+    content_commitment = Column(String(256))
+    media_asset_id = Column(String(128))
+    request_id = Column(String(128))
+    media_type = Column(Integer)
+    submitter = Column(String(128))
+    observed_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    __table_args__ = (
+        Index("idx_fingerprint_observations_fp", "network", "fingerprint_commitment"),
+        Index("idx_fingerprint_observations_asset", "network", "media_asset_id"),
+    )
+
+
+class MediaAssetUsage(Base):
+    __tablename__ = "media_asset_usages"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    network = Column(String(20), nullable=False)
+    asset_id = Column(String(128), nullable=False)
+    container_id = Column(String(128), nullable=False)
+    container_type = Column(Integer, default=1)
+    usage_class = Column(Integer, default=1)
+    position = Column(Integer, default=0)
+    tx_digest = Column(String(128))
+    observed_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    __table_args__ = (
+        Index("idx_media_asset_usages_asset", "network", "asset_id", "observed_at"),
+        Index("idx_media_asset_usages_container", "network", "container_id"),
+    )
+
+
+class PendingDerivativeAsset(Base):
+    __tablename__ = "pending_derivative_assets"
+
+    network = Column(String(20), primary_key=True)
+    pending_id = Column(String(128), primary_key=True)
+    request_id = Column(String(128))
+    content_commitment = Column(String(256))
+    fingerprint_commitment = Column(String(256))
+    media_type = Column(Integer)
+    asset_kind = Column(Integer, default=0)
+    creator = Column(String(128))
+    status = Column(String(32), default="pending")
+    finalize_tx_digest = Column(String(128))
+    child_asset_id = Column(String(128))
+    metadata_json = Column("metadata", JSONB, default=dict)
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    __table_args__ = (
+        Index("idx_pending_derivative_request", "network", "request_id"),
+    )
+
+
+class DerivativeEdge(Base):
+    __tablename__ = "derivative_edges"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    network = Column(String(20), nullable=False)
+    parent_asset_id = Column(String(128), nullable=False)
+    child_asset_id = Column(String(128), nullable=False)
+    relationship_type = Column(Integer, default=1)
+    license_instance_id = Column(String(128))
+    template_version_id = Column(String(128))
+    parent_share_bps = Column(Integer)
+    tx_digest = Column(String(128))
+    observed_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+
+    __table_args__ = (
+        Index("idx_derivative_edges_child", "network", "child_asset_id"),
+        Index("idx_derivative_edges_parent", "network", "parent_asset_id"),
+    )
+
+
+class DetectedAssetRelationship(Base):
+    __tablename__ = "detected_asset_relationships"
+
+    network = Column(String(20), primary_key=True)
+    proposal_id = Column(String(128), primary_key=True)
+    accused_pending_id = Column(String(128), nullable=False)
+    accused_asset_id = Column(String(128))
+    original_asset_id = Column(String(128), nullable=False)
+    similarity_bps = Column(Integer, nullable=False)
+    status = Column(Integer, default=0)
+    evidence_commitment = Column(String(256))
+    tx_digest = Column(String(128))
+    created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+    __table_args__ = (
+        Index("idx_detected_relationships_pending", "network", "accused_pending_id"),
+    )
+
+
+class PostEnforcementSnapshot(Base):
+    __tablename__ = "post_enforcement_snapshots"
+
+    network = Column(String(20), primary_key=True)
+    post_id = Column(String(128), primary_key=True)
+    bindings_json = Column(JSONB, default=list)
+    usage_decisions_json = Column(JSONB, default=list)
+    usage_denials_json = Column(JSONB, default=list)
+    playback_policy_json = Column(JSONB, default=dict)
+    tx_digest = Column(String(128))
+    updated_at = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
 
 
 class DiscoveryJob(Base):

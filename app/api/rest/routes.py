@@ -18,8 +18,16 @@ from app.db.oracle_repository import (
     AttestationRepository,
     ChainPostRepository,
     CheckpointRepository,
+    CompositionAnalysisRepository,
     ConfigCacheRepository,
+    DetectedRelationshipRepository,
+    DerivativeEdgeRepository,
     JobRepository,
+    MediaAssetRepository,
+    MediaAssetUsageRepository,
+    MediaAssetRightsBundleRepository,
+    PendingDerivativeAssetRepository,
+    PostEnforcementSnapshotRepository,
     UsernameBeneficiaryRepository,
 )
 from app.chain.grpc_client import (
@@ -29,6 +37,22 @@ from app.chain.grpc_client import (
 )
 from app.chain.grpc_v2_client import GrpcV2Client
 from app.network_config import get_settings, load_network_profile
+from app.services.indexer_graphql_client import fetch_media_asset, fetch_post_playback_policy
+from app.chain.bcs_media_asset_claims import (
+    compute_claims_bundle_commitment,
+    split_claims_and_grants_bcs,
+)
+from app.services.media_asset_rights_governance_submission import (
+    build_finalize_media_asset_rights_governance_move_call,
+    build_implement_media_asset_rights_move_call,
+)
+from app.services.derivative_graph_submission import (
+    build_accept_and_finalize_detected_ptb,
+    build_derivative_finalize_ptb,
+    build_original_finalize_ptb,
+    ParentEdgeInput,
+    PendingAssetInput,
+)
 from app.services.myso_client import init_myso_client
 from app.discovery.identity import identity_hash_from_x_handle
 from app.services.identity_verification_client import IdentityVerificationClient
@@ -42,6 +66,14 @@ jobs_repo = JobRepository()
 attestations_repo = AttestationRepository()
 config_repo = ConfigCacheRepository()
 beneficiaries_repo = UsernameBeneficiaryRepository()
+media_assets_repo = MediaAssetRepository()
+media_usages_repo = MediaAssetUsageRepository()
+composition_repo = CompositionAnalysisRepository()
+pending_assets_repo = PendingDerivativeAssetRepository()
+derivative_edges_repo = DerivativeEdgeRepository()
+detected_relationships_repo = DetectedRelationshipRepository()
+post_enforcement_repo = PostEnforcementSnapshotRepository()
+rights_bundles_repo = MediaAssetRightsBundleRepository()
 
 
 class BeneficiaryClaimRequest(BaseModel):
@@ -148,6 +180,31 @@ async def get_matches(post_id: str, network: str | None = Query(default=None)):
     net = _network_param(network)
     attestations = attestations_repo.list_for_post(net, post_id)
     return {"network": net, "post_id": post_id, "attestations": attestations}
+
+
+@router.get("/assets/{asset_id}")
+async def get_asset(asset_id: str, network: str | None = Query(default=None)):
+    net = _network_param(network)
+    asset = media_assets_repo.get(net, asset_id)
+    if not asset:
+        raise HTTPException(status_code=404, detail="Asset not found")
+    return {"network": net, "asset": asset}
+
+
+@router.get("/assets/{asset_id}/usages")
+async def get_asset_usages(asset_id: str, network: str | None = Query(default=None)):
+    net = _network_param(network)
+    usages = media_usages_repo.list_for_asset(net, asset_id)
+    return {"network": net, "asset_id": asset_id, "usages": usages}
+
+
+@router.get("/posts/{post_id}/manifest")
+async def get_post_manifest(post_id: str, network: str | None = Query(default=None)):
+    net = _network_param(network)
+    record = composition_repo.latest_for_post(net, post_id)
+    if not record:
+        raise HTTPException(status_code=404, detail="Composition manifest not found")
+    return {"network": net, "post_id": post_id, "composition": record}
 
 
 @router.get("/beneficiaries/{identity_hash}")
@@ -495,6 +552,208 @@ async def registry_username_lookup(handle: str, network: str | None = Query(defa
         "beneficiary": record,
         "beneficiary_id": beneficiary_id,
         "on_chain_fields": fields,
+    }
+
+
+@router.get("/assets/{asset_id}/derivatives")
+async def get_asset_derivatives(asset_id: str, network: str | None = Query(default=None)):
+    net = _network_param(network)
+    profile = load_network_profile(net)
+    gql = fetch_media_asset(profile, asset_id)
+    if gql and gql.get("derivativeGraph"):
+        return {"network": net, "asset_id": asset_id, "derivative_graph": gql["derivativeGraph"], "source": "graphql"}
+    edges = derivative_edges_repo.list_for_asset(net, asset_id)
+    return {"network": net, "asset_id": asset_id, "edges": edges, "source": "local"}
+
+
+@router.get("/pending/{pending_id}")
+async def get_pending_asset(pending_id: str, network: str | None = Query(default=None)):
+    net = _network_param(network)
+    row = pending_assets_repo.get(net, pending_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Pending asset not found")
+    return {"network": net, "pending": row}
+
+
+@router.get("/pending/{pending_id}/proposals")
+async def list_pending_proposals(pending_id: str, network: str | None = Query(default=None)):
+    net = _network_param(network)
+    items = detected_relationships_repo.list_for_pending(net, pending_id)
+    return {"network": net, "pending_id": pending_id, "proposals": items}
+
+
+@router.get("/assets/{asset_id}/resolved-policy")
+async def get_resolved_policy(asset_id: str, network: str | None = Query(default=None)):
+    net = _network_param(network)
+    profile = load_network_profile(net)
+    gql = fetch_media_asset(profile, asset_id)
+    policy = (gql or {}).get("resolvedPolicy")
+    return {"network": net, "asset_id": asset_id, "resolved_policy": policy, "source": "graphql" if policy else "none"}
+
+
+@router.get("/posts/{post_id}/playback-policy")
+async def get_playback_policy(post_id: str, network: str | None = Query(default=None)):
+    net = _network_param(network)
+    profile = load_network_profile(net)
+    gql = fetch_post_playback_policy(profile, post_id)
+    if gql:
+        return {"network": net, "post_id": post_id, **gql, "source": "graphql"}
+    snap = post_enforcement_repo.get(net, post_id)
+    if snap:
+        return {"network": net, "post_id": post_id, "snapshot": snap, "source": "local"}
+    raise HTTPException(status_code=404, detail="Playback policy unavailable")
+
+
+@router.get("/posts/{post_id}/bindings")
+async def get_post_bindings(post_id: str, network: str | None = Query(default=None)):
+    net = _network_param(network)
+    snap = post_enforcement_repo.get(net, post_id)
+    profile = load_network_profile(net)
+    gql = fetch_post_playback_policy(profile, post_id)
+    return {
+        "network": net,
+        "post_id": post_id,
+        "embedded_bindings": (gql or {}).get("embeddedBindings") or (snap or {}).get("bindings_json") or [],
+        "usage_decisions": (gql or {}).get("usageDecisions") or (snap or {}).get("usage_decisions_json") or [],
+    }
+
+
+@router.post("/posts/{post_id}/refresh-decisions")
+async def refresh_post_decisions(post_id: str, network: str | None = Query(default=None)):
+    net = _network_param(network)
+    snap = post_enforcement_repo.get(net, post_id) or {}
+    binding_ids = [
+        int(b.get("binding_id") or b.get("bindingId") or 0)
+        for b in (snap.get("bindings_json") or [])
+        if int(b.get("binding_id") or b.get("bindingId") or 0) > 0
+    ]
+    if not binding_ids:
+        raise HTTPException(status_code=400, detail="No bindings to refresh")
+    job_id = jobs_repo.enqueue(
+        net,
+        post_id,
+        job_type="refresh_post_usage_decisions",
+        payload={"post_id": post_id, "binding_ids": binding_ids},
+    )
+    return {"network": net, "post_id": post_id, "job_id": job_id, "status": "enqueued"}
+
+
+class PtbDerivativeFinalizeRequest(BaseModel):
+    content_commitment_hex: str
+    media_type: int = 1
+    parents: list[dict] = []
+
+
+@router.post("/ptb/derivative-finalize")
+async def ptb_derivative_finalize(body: PtbDerivativeFinalizeRequest):
+    pending = PendingAssetInput(
+        content_commitment=bytes.fromhex(body.content_commitment_hex),
+        media_type=body.media_type,
+    )
+    parents = [
+        ParentEdgeInput(
+            parent_asset_id=str(p["parent_asset_id"]),
+            license_instance_id=str(p["license_instance_id"]),
+            template_version_id=str(p["template_version_id"]),
+            relationship_type=int(p.get("relationship_type") or 1),
+        )
+        for p in body.parents
+    ]
+    recipe = build_derivative_finalize_ptb(pending, parents) if parents else build_original_finalize_ptb(pending)
+    return {"recipe": recipe.to_dict()}
+
+
+@router.post("/proposals/{proposal_id}/accept")
+async def accept_proposal(proposal_id: str, network: str | None = Query(default=None)):
+    net = _network_param(network)
+    proposals = detected_relationships_repo.list_for_pending(net, proposal_id)
+    row = next((p for p in proposals if str(p.get("proposal_id")) == proposal_id), None)
+    if not row:
+        with get_db_connection() as conn:
+            with conn.cursor(cursor_factory=extras.RealDictCursor) as cur:
+                cur.execute(
+                    "SELECT * FROM detected_asset_relationships WHERE network = %s AND proposal_id = %s",
+                    (net, proposal_id),
+                )
+                fetched = cur.fetchone()
+                row = dict(fetched) if fetched else None
+    if not row:
+        raise HTTPException(status_code=404, detail="Proposal not found")
+    config_id = os.getenv("MYSO_POC_CONFIG_ID", "")
+    recipe = build_accept_and_finalize_detected_ptb(
+        config_id=config_id,
+        proposal_id=proposal_id,
+        pending_id=str(row["accused_pending_id"]),
+        parent_asset_id=str(row["original_asset_id"]),
+        license_instance_id=str(row.get("license_instance_id") or row["original_asset_id"]),
+        template_version_id=str(row.get("template_version_id") or row["original_asset_id"]),
+    )
+    return {"network": net, "proposal_id": proposal_id, "recipe": recipe.to_dict()}
+
+
+class MediaAssetRightsPrepareRequest(BaseModel):
+    media_asset_id: str
+    claims: list[dict]
+    usage_grants: list[dict]
+
+
+@router.post("/disputes/media-asset-rights/prepare")
+async def prepare_media_asset_rights_dispute(body: MediaAssetRightsPrepareRequest):
+    commitment = compute_claims_bundle_commitment(body.claims, body.usage_grants)
+    return {
+        "media_asset_id": body.media_asset_id,
+        "claims_commitment": "0x" + commitment.hex(),
+    }
+
+
+class MediaAssetRightsSubmitRequest(BaseModel):
+    proposal_id: str
+    media_asset_id: str
+    submitter: str
+    claims: list[dict]
+    usage_grants: list[dict]
+    network: str | None = None
+
+
+@router.post("/disputes/media-asset-rights/submit")
+async def submit_media_asset_rights_bundle(body: MediaAssetRightsSubmitRequest):
+    net = _network_param(body.network)
+    commitment = compute_claims_bundle_commitment(body.claims, body.usage_grants)
+    claims_bcs, grants_bcs = split_claims_and_grants_bcs(body.claims, body.usage_grants)
+    rights_bundles_repo.upsert(
+        net,
+        proposal_id=body.proposal_id,
+        media_asset_id=body.media_asset_id,
+        claims_commitment=commitment,
+        claims_bcs=claims_bcs,
+        usage_grants_bcs=grants_bcs,
+        submitter=body.submitter,
+        status="pending",
+    )
+    return {
+        "network": net,
+        "proposal_id": body.proposal_id,
+        "claims_commitment": "0x" + commitment.hex(),
+        "status": "pending",
+    }
+
+
+@router.get("/disputes/media-asset-rights/{proposal_id}/bundle")
+async def get_media_asset_rights_bundle(proposal_id: str):
+    row = rights_bundles_repo.get(proposal_id)
+    if not row:
+        raise HTTPException(status_code=404, detail="Bundle not found")
+    commitment = row["claims_commitment"]
+    if isinstance(commitment, memoryview):
+        commitment = commitment.tobytes()
+    return {
+        "proposal_id": row["proposal_id"],
+        "media_asset_id": row["media_asset_id"],
+        "submitter": row["submitter"],
+        "status": row["status"],
+        "claims_commitment": "0x" + bytes(commitment).hex(),
+        "claims_bcs_hex": "0x" + bytes(row["claims_bcs"]).hex(),
+        "usage_grants_bcs_hex": "0x" + bytes(row["usage_grants_bcs"]).hex(),
     }
 
 

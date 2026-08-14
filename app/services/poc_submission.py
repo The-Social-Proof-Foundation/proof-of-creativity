@@ -373,6 +373,48 @@ def preview_video_track_attestation(
     )
 
 
+def build_composition_submission(
+    *,
+    post_id: str,
+    assets: list[Any],
+    manifest_entries: list[Any] | None = None,
+    derivative_redirection_target: int = 0,
+    max_embedded_asset_redirect_bps: int | None = None,
+    contains_derivatives: bool = False,
+    contains_unresolved_assets: bool = False,
+    reasoning: str | None = None,
+    evidence_urls: list[str] | None = None,
+    spt_pool_id: str | None = None,
+) -> Any:
+    """Delegate to composition_submission for post-level Move args."""
+    from app.services.composition_submission import (
+        AssetVersionInput,
+        build_composition_submission_from_assets,
+    )
+
+    def _coerce(raw: Any) -> AssetVersionInput:
+        if isinstance(raw, AssetVersionInput):
+            return raw
+        if isinstance(raw, dict):
+            return AssetVersionInput(**raw)
+        raise TypeError(f"Expected AssetVersionInput or dict, got {type(raw)!r}")
+
+    asset_inputs = [_coerce(a) for a in assets]
+    manifest_inputs = [_coerce(m) for m in manifest_entries] if manifest_entries else None
+    return build_composition_submission_from_assets(
+        post_id=post_id,
+        assets=asset_inputs,
+        manifest_entries=manifest_inputs,
+        derivative_redirection_target=derivative_redirection_target,
+        max_embedded_asset_redirect_bps=max_embedded_asset_redirect_bps,
+        contains_derivatives=contains_derivatives,
+        contains_unresolved_assets=contains_unresolved_assets,
+        reasoning=reasoning,
+        evidence_urls=evidence_urls,
+        spt_pool_id=spt_pool_id,
+    )
+
+
 def attempt_proof_of_creativity_submission(
     *,
     myso_client: Any,

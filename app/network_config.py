@@ -83,7 +83,7 @@ def active_networks() -> list[str]:
 
 
 @lru_cache(maxsize=8)
-def load_network_profile(network: str) -> NetworkProfile:
+def _load_network_profile_from_yaml(network: str) -> NetworkProfile:
     if network not in SUPPORTED_NETWORKS:
         raise ValueError(f"Unsupported network: {network}")
     path = CONFIG_DIR / f"{network}.yaml"
@@ -92,6 +92,37 @@ def load_network_profile(network: str) -> NetworkProfile:
     with path.open("r", encoding="utf-8") as fh:
         data = yaml.safe_load(fh) or {}
     return NetworkProfile(**data)
+
+
+def _apply_env_overrides(profile: NetworkProfile) -> NetworkProfile:
+    """Let .env / shell overrides win over Docker-oriented yaml defaults."""
+    updates: dict[str, Any] = {}
+    rpc = os.getenv("MYSOCIAL_RPC_URL", "").strip()
+    if rpc:
+        updates["rpc_url"] = rpc
+        grpc = os.getenv("MYSO_GRPC_URL", "").strip() or rpc
+        updates["grpc_url"] = grpc
+    graphql = os.getenv("GRAPHQL_URL", "").strip()
+    if graphql:
+        updates["graphql_url"] = graphql
+
+    grpc_tls = os.getenv("MYSO_GRPC_TLS", "").strip().lower()
+    if grpc_tls in ("0", "false", "no"):
+        updates["grpc_tls"] = False
+    elif grpc_tls in ("1", "true", "yes"):
+        updates["grpc_tls"] = True
+    else:
+        grpc_url = str(updates.get("grpc_url", profile.grpc_url))
+        if grpc_url.startswith("http://"):
+            updates["grpc_tls"] = False
+
+    if updates:
+        return profile.model_copy(update=updates)
+    return profile
+
+
+def load_network_profile(network: str) -> NetworkProfile:
+    return _apply_env_overrides(_load_network_profile_from_yaml(network))
 
 
 @lru_cache(maxsize=1)
@@ -121,7 +152,8 @@ def chain_writes_allowed(profile: NetworkProfile) -> bool:
 
 def apply_profile_to_env(profile: NetworkProfile) -> None:
     """Inject network profile object IDs into process env for MySocialClient."""
-    os.environ["MYSOCIAL_RPC_URL"] = profile.rpc_url
+    if not os.getenv("MYSOCIAL_RPC_URL", "").strip():
+        os.environ["MYSOCIAL_RPC_URL"] = profile.rpc_url
     objs = profile.objects or {}
     mapping = {
         "MYSO_POC_PACKAGE_ID": objs.get("poc_package") or objs.get("package"),

@@ -44,6 +44,48 @@ def _post_access_public() -> bytes:
     return _uleb128(0)
 
 
+def encode_post_created_media_asset(
+    *,
+    media_asset_ids: list[str] | None = None,
+    media_urls: list[str] | None = None,
+    composition_status: int = 0,
+    monetization_status: int = 0,
+    with_organization: bool = True,
+) -> bytes:
+    """Current Move PostCreatedEvent (media_asset_ids, no post-level PoC redirect)."""
+    asset_ids = media_asset_ids or []
+    asset_body = _uleb128(len(asset_ids))
+    for aid in asset_ids:
+        hexpart = aid[2:] if aid.startswith("0x") else aid
+        asset_body += bytes.fromhex(hexpart.zfill(64))
+    parts = [
+        _addr(1),
+        _addr(2),
+        _addr(3),
+        _addr(4),
+        b"\x1f",
+        _string("hello"),
+        _string("post"),
+        _option_none(),
+        _option_none(),
+        asset_body,
+        _option_some_vec_string(media_urls) if media_urls else _option_none(),
+        _option_none(),
+        _post_access_public(),
+        _option_none(),
+        bytes([composition_status]),
+        bytes([monetization_status]),
+        b"\x00",
+        _option_none(),
+        _addr(2),
+        _option_none(),
+    ]
+    if with_organization:
+        parts.append(_option_none())
+    parts.append(b"\x00")
+    return b"".join(parts)
+
+
 def encode_post_created_current(
     *,
     media_urls: list[str] | None = None,
@@ -104,6 +146,21 @@ def encode_post_created_legacy(*, enable_poc: bool = True) -> bytes:
         _option_none(),  # spt_id
     ]
     return b"".join(parts)
+
+
+def test_decode_post_created_media_asset_layout():
+    asset_hex = "ab" * 32
+    asset_id = f"0x{asset_hex}"
+    raw = encode_post_created_media_asset(
+        media_asset_ids=[asset_id],
+        media_urls=["https://example.com/a.jpg"],
+    )
+    decoded = decode_post_created_event(raw)
+    assert decoded.media_asset_ids[0].lower() == asset_id.lower()
+    assert decoded.composition_status == 0
+    assert decoded.monetization_status == 0
+    assert decoded.media_urls == ["https://example.com/a.jpg"]
+    assert decoded.enable_poc is None
 
 
 def test_decode_post_created_current_with_organization():

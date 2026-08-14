@@ -172,6 +172,9 @@ class MySocialClient:
             ),
             "max_disputes_per_post": _parse_po_u8(fields.get("max_disputes_per_post"), 2),
             "min_vault_deposit_amount": _parse_po_u8(fields.get("min_vault_deposit_amount"), 1),
+            "max_embedded_asset_redirect_bps": _parse_po_u8(
+                fields.get("max_embedded_asset_redirect_bps"), 5000
+            ),
             "version": _parse_po_u8(fields.get("version"), 0),
         }
 
@@ -319,12 +322,30 @@ class MySocialClient:
         return None
 
     # --- Transactions ---
-    # Move entry `analyze_and_update_post_sync_token_pool` (verify against deployed package):
-    #   config, registry, token_registry, vault_directory, post, token_pool,
-    #   media_type, highest_similarity_score, original_creator (Option),
-    #   derivative_redirection_target, embedded_audio_only_derivative,
-    #   apply_explicit_outcome, explicit_poc_outcome, reasoning (Option), evidence_urls (Option).
-    # Plain `analyze_and_update_post` omits token_registry + token_pool; post is first of the tail args.
+    def submit_finalize_media_asset(self, move_call_data: dict) -> dict:
+        """Submit media_asset::finalize_media_asset as the configured oracle."""
+        result = self._submit_move_call(move_call_data)
+        result["move_function"] = move_call_data.get("function")
+        return result
+
+    def submit_media_resolution(self, move_call_data: dict) -> dict:
+        """Submit media_asset::submit_media_resolution (client upload step)."""
+        result = self._submit_move_call(move_call_data)
+        result["move_function"] = move_call_data.get("function")
+        return result
+
+    def submit_analyze_post_composition(self, move_call_data: dict) -> dict:
+        """Submit proof_of_creativity::analyze_post_composition(_sync_token_pool)."""
+        result = self._submit_move_call(move_call_data)
+        result["move_function"] = move_call_data.get("function")
+        result["resolved_spt_pool_id"] = None
+        args = move_call_data.get("arguments") or []
+        fn = move_call_data.get("function") or ""
+        if fn.endswith("_sync_token_pool") and len(args) >= 6:
+            result["resolved_spt_pool_id"] = args[5]
+        return result
+
+    # Legacy analyze_and_update_post paths — deprecated in favor of analyze_post_composition.
     def submit_poc_analysis(
         self,
         post_id: str,
@@ -340,6 +361,10 @@ class MySocialClient:
         evidence_urls: Optional[List[str]] = None,
         spt_pool_id: Optional[str] = None,
     ) -> dict:
+        logger.warning(
+            "submit_poc_analysis is deprecated; use submit_analyze_post_composition via composition_submission",
+            post_id=post_id,
+        )
         logger.info(
             "Submitting PoC analysis to MySocial",
             post_id=post_id,
@@ -436,6 +461,55 @@ class MySocialClient:
             logger.error("Failed to build unsigned transaction", error=json.dumps(error_msg, indent=2))
             raise RuntimeError(str(error_msg))
         return result["result"]
+
+    def submit_move_call(self, move_call_data: dict, *, wallet: Optional[MySocialWallet] = None) -> dict:
+        """Public entry for arbitrary single Move calls (Phase 2–5 builders)."""
+        result = self._submit_move_call(move_call_data, wallet=wallet)
+        result["move_function"] = move_call_data.get("function")
+        return result
+
+    def submit_ptb(
+        self,
+        steps: list[dict],
+        *,
+        wallet: Optional[MySocialWallet] = None,
+    ) -> dict:
+        """
+        Execute an ordered list of Move calls.
+
+        When the chain RPC exposes a programmable transaction builder this can be
+        swapped to a single atomic PTB; today each step is submitted sequentially
+        and `$result:N` placeholders are resolved from created object ids.
+        """
+        from app.chain.ptb_builder import extract_created_object_id, resolve_step_arguments
+
+        if not steps:
+            raise ValueError("submit_ptb requires at least one Move call")
+
+        created: dict[int, str] = {}
+        digests: list[str] = []
+        last_result: dict = {}
+        for idx, step in enumerate(steps):
+            payload = dict(step)
+            payload["arguments"] = resolve_step_arguments(
+                list(payload.get("arguments") or []),
+                created_objects=created,
+            )
+            last_result = self._submit_move_call(payload, wallet=wallet)
+            last_result["move_function"] = payload.get("function")
+            digests.append(str(last_result.get("tx_hash") or ""))
+            oid = extract_created_object_id(last_result)
+            if oid:
+                created[idx] = oid
+
+        return {
+            "success": True,
+            "tx_hash": digests[-1] if digests else None,
+            "tx_hashes": digests,
+            "created_objects": created,
+            "events": last_result.get("events") or [],
+            "steps_executed": len(steps),
+        }
 
     def _submit_move_call(self, move_call_data: dict, *, wallet: Optional[MySocialWallet] = None) -> dict:
         signer = wallet or self.wallet

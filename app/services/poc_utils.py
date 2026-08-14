@@ -39,6 +39,7 @@ OFFCHAIN_DEFAULT_POC_CONFIG = {
     "username_beneficiary_join_referral_bps": 500,
     "max_disputes_per_post": 2,
     "min_vault_deposit_amount": 1,
+    "max_embedded_asset_redirect_bps": 5000,
     "version": 0,
 }
 

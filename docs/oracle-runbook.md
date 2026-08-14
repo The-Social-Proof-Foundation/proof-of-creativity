@@ -1,140 +1,97 @@
-# Proof of Creativity Oracle — Operations Runbook
+# PoC Oracle Runbook (MediaAsset-centric)
 
 ## Overview
 
-The oracle listens for on-chain `PostCreatedEvent` entries (via gRPC sync), downloads `media_urls`, runs similarity analysis, provisions off-network username beneficiary vaults when required, and submits `analyze_and_update_post` as the configured oracle signer.
+The oracle ingests on-chain social events via gRPC checkpoint sync and runs two job types:
 
-## Services
+| Job | Trigger | Chain entry |
+|-----|---------|-------------|
+| `resolve_media_asset` | `MediaResolutionRequestedEvent` | `media_asset::finalize_media_asset` |
+| `analyze_composition` | `PostCreatedEvent` with `media_asset_ids` | `proof_of_creativity::analyze_post_composition` |
+| `poc_gov_finalize_rights` | PoC governance proposal past `votingEndTime` (status=2) | `proof_of_creativity::finalize_media_asset_rights_governance_proposal` |
+| `poc_gov_implement_rights` | Approved rights dispute (status=3) + stored claims bundle | `proof_of_creativity::finalize_media_asset_rights_via_dao` |
 
-| Process | Command | Role |
-|---------|---------|------|
-| API | `python scripts/run_api.py` | REST `/oracle/*` + WebSocket `/ws` |
-| gRPC sync | `python scripts/run_grpc_sync.py` | Ingest posts, enqueue jobs |
-| Oracle worker | `python scripts/run_oracle_worker.py` | Analyze media, submit txs |
+Legacy `analyze_post` jobs (post-centric, `media_urls` only) are deprecated.
 
-Docker Compose runs all services against local Postgres:
+## Event sync
 
-```bash
-# 1) Ensure Docker Desktop is running (must respond quickly):
-docker info
+Configured in network profile (`grpc_sync` section). Live localnet uses checkpoint streaming; mock mode replays fixtures.
 
-# 2) Infra only — starts in seconds, no image build:
-docker compose up postgres redis
+Indexed event types:
 
-# 3) Full stack — first build downloads torch/CLIP (10–20 min):
-docker compose --profile app up --build
-# or: ./scripts/docker_up.sh
-```
+- `MediaResolutionRequestedEvent`
+- `MediaAssetResolvedEvent`, `FingerprintLinkedEvent`
+- `MediaAssetUsedEvent`
+- `PostCreatedEvent` (must decode `media_asset_ids`, `composition_status`, `monetization_status`)
+- `PostCompositionAnalyzedEvent`
 
-If `docker compose up` prints nothing for a long time, the usual causes are:
-- Docker Desktop not running (`docker info` hangs)
-- Missing `.dockerignore` uploading `.venv` (fixed in repo)
-- First `--build` downloading large ML wheels (wait for pip output)
+## Asset resolution pipeline
 
-## Network selection
+1. Client submits `submit_media_resolution`.
+2. Worker loads job payload (`request_id`, fingerprint commitments, `media_type`).
+3. Off-chain dedup via `fingerprint_observations` / vector store → optional `link_to_existing_id`.
+4. Oracle submits `finalize_media_asset` with default or custom `claims` + `usage_grants`.
+5. Upsert `chain_media_assets` with `rights_json` containing grants.
 
-Set `MYSO_NETWORK=localnet|testnet|mainnet` or `MYSO_NETWORKS=localnet,testnet` for multi-network workers.
+## Composition pipeline
 
-Object IDs and RPC/gRPC URLs live in `config/networks/{network}.yaml`.
+1. `PostCreatedEvent` carries `media_asset_ids`.
+2. Worker validates each asset exists and permits `SOCIAL_POST` usage class via `usage_grants`.
+3. Optional per-URL similarity for derivative detection within composition.
+4. Build `CompositionAnalysis` (version pins) + `RevenueManifest` (attributable pool splits).
+5. Submit `analyze_post_composition` or `_sync_token_pool` when `spt_id` present.
 
-On startup, each oracle process calls **session refresh** (when `MYSO_REFRESH_SESSION_OBJECTS=true`):
+## Prospective rights (V1)
 
-1. Query GraphQL at `GRAPHQL_URL` (default `http://127.0.0.1:9125/graphql`) for shared PoC objects:
-   - `PoCConfig`, `PoCRegistry`, `PoCVaultDirectory`, `TokenRegistry`, etc.
-2. Resolve `MYSO_POC_PACKAGE_ID` from the config object's on-chain Move type via RPC.
-3. Fall back to `.env` / `config/networks/*.yaml` when GraphQL is unreachable.
+When a referenced asset's `rights_version` or `economics_version` increments after composition analysis:
 
-Docker Compose sets `GRAPHQL_URL=http://host.docker.internal:9125/graphql` so containers reach the host indexer.
+- `monetization_status → RESTRICTED`
+- `composition_status` may stay `VERIFIED`
+- No retroactive clawback of historical tips
 
-## Localnet gRPC sync
+## Media asset rights governance (DAO disputes)
 
-`config/networks/localnet.yaml` sets **`grpc_sync.mock_mode: false`** for live localnet with `myso start --with-poc` (checkpoint sync against the host fullnode at `http://host.docker.internal:9000`).
+Rights disputes use the PoC `GovernanceDAO` (separate fee: `media_asset_dispute_cost` on chain).
 
-To replay fixtures offline instead of ingesting live `PostCreatedEvent` entries, explicitly set `grpc_sync.mock_mode: true` and point `fixture_path` at `data/fixtures/post_created_events.json`. Mock replay is **not** the default for localnet.
+### Client / operator flow
 
-**Recommended E2E validation** after starting the stack:
+1. `POST /oracle/disputes/media-asset-rights/prepare` — compute `claims_commitment` (SHA3-256 of BCS `ClaimsBundle`).
+2. User submits on-chain `submit_media_asset_rights_dispute_proposal` with payment + commitment.
+3. `POST /oracle/disputes/media-asset-rights/submit` — store full claims bundle in Postgres (`media_asset_rights_bundles`).
+4. Worker polls indexer GraphQL for PoC registry proposals (`registryType=1`):
+   - **Voting ended** (`status=2`, `votingEndTime < now`) → enqueue `poc_gov_finalize_rights`.
+   - **Approved** (`status=3`) with bundle `status=pending` → enqueue `poc_gov_implement_rights`.
+   - **Rejected / implemented** → update bundle status off-chain.
 
-```bash
-# From myso-core (sibling proof-of-creativity repo required)
-ASSUME_YES=1 ./scripts/poc-e2e-runnable.sh --run-all
-```
+### REST endpoints
 
-This script syncs the on-chain oracle address, creates a PoC+SPT post, waits for grpc-sync + worker attestation, asserts Move events via `myso client tx-block`, and runs discovery embed + mock username claim legs.
+| Method | Path | Purpose |
+|--------|------|---------|
+| POST | `/oracle/disputes/media-asset-rights/prepare` | Commitment preview |
+| POST | `/oracle/disputes/media-asset-rights/submit` | Persist bundle after on-chain submit |
+| GET | `/oracle/disputes/media-asset-rights/{proposal_id}/bundle` | Operator inspect stored bundle |
 
-## Production gRPC sync (default: checkpoint_v2)
+### Governance env
 
-`grpc-sync` uses standard v2 gRPC — no `authenticated_events_indexing` required:
+- `POC_GOVERNANCE_REGISTRY_ID` — PoC `GovernanceDAO` object id (`PoCConfig.dispute_governance_registry_id`)
+- `POC_GOVERNANCE_POLL_INTERVAL_SECS` (default `30`)
+- `POC_GOVERNANCE_IMPLEMENT_ENABLED` (default `true`)
+- `POC_POST_REFRESH_AFTER_RIGHTS_IMPLEMENT` (default `true`) — enqueue `refresh_post_usage_decisions` for posts embedding the asset
+- `MYSO_ECOSYSTEM_TREASURY_ID`, `GRAPHQL_URL`
 
-1. **Catch-up:** `LedgerService.GetCheckpoint` for each sequence with transaction events
-2. **Live tail:** `SubscriptionService.SubscribeCheckpoints` (falls back to polling if unavailable)
-3. **Lag metrics:** `LedgerService.GetServiceInfo.checkpoint_height`
+Oracle signer must match `PoCConfig.oracle_address`.
 
-| Setting | Purpose |
-|---------|---------|
-| `grpc_sync.mock_mode` | `true` for fixture replay; `false` for live chain |
-| `grpc_sync.sync_mode` | `checkpoint_v2` (default), `authenticated_events` (opt-in), or mock via `mock_mode` |
-| `grpc_sync.event_stream_id` | Package filter; defaults to `MYSO_POC_PACKAGE_ID` |
-| `grpc_sync.poll_interval_seconds` | Idle sleep when caught up (polling mode) |
-| `grpc_sync.checkpoint_catchup_batch_size` | Checkpoints fetched per catch-up batch |
+## Required env
 
-**Localnet live sync:** set `mock_mode: false` and `sync_mode: checkpoint_v2` in `config/networks/localnet.yaml`. Docker uses `grpc_url: http://host.docker.internal:9000`.
+- `MYSO_POC_PACKAGE_ID`, `MYSO_POC_CONFIG_ID`, `MYSO_POC_REGISTRY_ID`, `MYSO_POC_VAULT_DIRECTORY_ID`
+- Oracle signer matching on-chain `PoCConfig.oracle_address`
+- `max_embedded_asset_redirect_bps` on `PoCConfig` (default 5000): caps each embedded source asset's manifest slice and license `compensation_bps`; oracle clamps manifests before submit
+- `MYSO_INTEGRATION_ENABLED=true` for chain submission
 
-**Optional authenticated events mode:** set `sync_mode: authenticated_events` only when the fullnode has `authenticated_events_indexing = true`.
-
-**Checkpointing:** Stored per `(network, stream_id)` in `grpc_sync_checkpoints`.
-
-**Sync status:** `GET /oracle/sync/status?network=localnet` returns `sync_mode`, `chain_tip`, `lag_checkpoints`, and `checkpoint`.
-
-## Mainnet writes
-
-Mainnet profile sets `chain_writes_enabled: false`. Enable production writes only with:
-
-```bash
-MAINNET_WRITES_ENABLED=true
-```
-
-## WebSocket subscription
-
-```javascript
-const ws = new WebSocket("ws://localhost:8000/ws?network=localnet&topics=sync,jobs");
-ws.onmessage = (e) => console.log(JSON.parse(e.data));
-ws.send(JSON.stringify({
-  action: "subscribe",
-  network: "localnet",
-  topics: ["post:0xmock_post_001", "sync"]
-}));
-```
-
-Event types include: `post.discovered`, `post.analysis.progress`, `post.attestation.submitted`, `post.attestation.confirmed`, `sync.checkpoint`.
-
-## REST endpoints
-
-- `GET /oracle/networks`
-- `GET /oracle/sync/status?network=localnet`
-- `GET /oracle/posts/{post_id}?network=localnet`
-- `GET /oracle/posts/{post_id}/proof`
-- `POST /oracle/beneficiaries/{identity_hash}/claim?claimant_address=0x...`
-
-## Database
-
-Oracle tables are added via Alembic revision `c7d8e9f0a1b2`. Run migrations on startup (FastAPI lifespan) or:
+## Verification
 
 ```bash
-pip install -r requirements-migrate.txt
-alembic upgrade head
+pytest tests/integration/test_media_asset_e2e_flow.py tests/unit/test_bcs_post_created.py -q
 ```
 
-For full app setup use **Python 3.10–3.14**. Chain signing deps install via:
-
-```bash
-pip install -r requirements-blockchain.txt
-```
-
-Ed25519 oracle keys (default) work on all supported Python versions without `bip-utils`.  
-secp256k1/secp256r1 **mnemonic** paths optionally need `pip install bip-utils` (Python 3.10–3.13 only); use `MYSO_ORACLE_PRIVATE_KEY` on Python 3.14+.
-
-## Testing
-
-```bash
-pytest tests/unit/ -v
-```
+See also: [`media-asset-client-flow.md`](media-asset-client-flow.md)
