@@ -51,8 +51,7 @@ CREATE TABLE IF NOT EXISTS media_files (
     file_size BIGINT,
     storage_uri TEXT, -- GCS or Walrus URI
     file_hash VARCHAR(128), -- SHA-256 hash of file content
-    upload_user_id VARCHAR(36), -- For future user authentication
-    upload_ip INET,
+    creator_address VARCHAR(128), -- optional MySocial wallet for PoC original_creator resolution
     status VARCHAR(20) DEFAULT 'processing', -- 'processing', 'completed', 'failed'
     processing_results JSONB DEFAULT '{}',
     created_at TIMESTAMPTZ DEFAULT NOW(),
@@ -89,8 +88,8 @@ SELECT create_hypertable('similarity_matches', 'created_at',
 CREATE TABLE IF NOT EXISTS attribution_records (
     id UUID DEFAULT gen_random_uuid(),
     media_id VARCHAR(36) NOT NULL,
-    blockchain_tx_hash VARCHAR(128),
-    blockchain_address VARCHAR(128),
+    tx_hash VARCHAR(128),
+    wallet_address VARCHAR(128),
     attribution_type VARCHAR(50), -- 'original', 'derivative', 'remix'
     proof_data JSONB DEFAULT '{}',
     created_at TIMESTAMPTZ DEFAULT NOW(),
@@ -165,7 +164,7 @@ CREATE INDEX IF NOT EXISTS idx_attribution_records_media
 ON attribution_records (media_id, created_at DESC);
 
 CREATE INDEX IF NOT EXISTS idx_attribution_records_blockchain 
-ON attribution_records (blockchain_tx_hash);
+ON attribution_records (tx_hash);
 
 -- TIMESCALE-SPECIFIC OPTIMIZATIONS
 
@@ -216,7 +215,8 @@ COMMENT ON TABLE similarity_matches IS 'Timescale hypertable recording similarit
 COMMENT ON TABLE attribution_records IS 'Timescale hypertable for blockchain attribution with time-series support';
 
 COMMENT ON COLUMN media_embeddings.embedding IS 'CLIP ViT-B/32 512-dimensional embedding vector with HNSW index';
-COMMENT ON COLUMN audio_fingerprints.fp_hash IS 'SHA-256 hash of audio fingerprint for fast lookup';
+COMMENT ON COLUMN audio_fingerprints.fp_hash IS 'SHA-1 hex digest (40 chars): composite lookup key from constellation hashing';
+COMMENT ON COLUMN audio_fingerprints.fingerprint_data IS 'Pickled constellation tuples (BYTEA); leading hex bytes are pickle framing, not a short fingerprint ID';
 COMMENT ON COLUMN media_files.file_hash IS 'SHA-256 hash of original file content for deduplication';
 COMMENT ON COLUMN similarity_matches.similarity_score IS 'Cosine similarity score between 0.0 and 1.0';
 

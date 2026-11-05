@@ -1,0 +1,37 @@
+network: localnet
+rpc_url: http://host.docker.internal:9000
+grpc_url: http://host.docker.internal:9000
+grpc_tls: false
+faucet_url: http://host.docker.internal:9123
+graphql_url: http://host.docker.internal:9125/graphql
+platform_package_address: "0x50c1"
+chain_writes_enabled: true
+objects:
+  poc_package: ""
+  poc_config: ""
+  poc_registry: ""
+  poc_vault_directory: ""
+  token_registry: ""
+  username_beneficiary_directory: ""
+  username_beneficiary_shards: []
+  username_registry: ""
+  clock: "0x6"
+storage:
+  use_walrus: false
+  use_gcs: false
+  use_local: true
+  local_path: ./data/blobs
+  walrus_endpoint: https://api.walrus.xyz
+signers:
+  oracle_private_key_env: ORACLE_PRIVATE_KEY_LOCALNET
+  admin_private_key_env: POC_ADMIN_PRIVATE_KEY_LOCALNET
+grpc_sync:
+  mock_mode: false
+  sync_mode: checkpoint_v2
+  fixture_path: data/fixtures/post_created_events.json
+  start_checkpoint: null
+  event_stream_id: ""
+  batch_size: 1000
+  poll_interval_seconds: 5
+  max_pagination_iterations: 50
+  checkpoint_catchup_batch_size: 10

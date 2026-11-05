@@ -79,6 +79,19 @@ def preprocess_image(image_path: str, max_size: tuple = (512, 512)) -> Image.Ima
         logger.error("Failed to preprocess image", image_path=image_path, error=str(e))
         raise ValueError(f"Failed to preprocess image: {str(e)}")
 
+
+def clip_feature_tensor(output) -> torch.Tensor:
+    """Extract a feature tensor from CLIP get_*_features output (v4 tensor or v5 ModelOutput)."""
+    if isinstance(output, torch.Tensor):
+        return output
+    pooler = getattr(output, "pooler_output", None)
+    if pooler is not None:
+        return pooler
+    if isinstance(output, (tuple, list)) and output:
+        return output[0]
+    raise TypeError(f"Unexpected CLIP feature output: {type(output)}")
+
+
 def image_embedding(path: str, model_name: str = None, normalize: bool = True) -> List[float]:
     """
     Generate CLIP embedding for an image.
@@ -107,7 +120,7 @@ def image_embedding(path: str, model_name: str = None, normalize: bool = True) -
         
         # Generate embedding
         with torch.no_grad():
-            image_features = model.get_image_features(**inputs)
+            image_features = clip_feature_tensor(model.get_image_features(**inputs))
             
             # Normalize if requested
             if normalize:
@@ -181,7 +194,7 @@ def batch_image_embeddings(image_paths: List[str],
             inputs = {k: v.to(device) for k, v in inputs.items()}
             
             with torch.no_grad():
-                batch_features = model.get_image_features(**inputs)
+                batch_features = clip_feature_tensor(model.get_image_features(**inputs))
                 
                 if normalize:
                     batch_features = torch.nn.functional.normalize(batch_features, p=2, dim=1)
@@ -233,7 +246,7 @@ def text_embedding(text: str, model_name: str = None, normalize: bool = True) ->
         
         # Generate embedding
         with torch.no_grad():
-            text_features = model.get_text_features(**inputs)
+            text_features = clip_feature_tensor(model.get_text_features(**inputs))
             
             if normalize:
                 text_features = torch.nn.functional.normalize(text_features, p=2, dim=1)

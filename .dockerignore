@@ -1,0 +1,36 @@
+# Virtualenvs and caches (often GB — without this, `docker compose up --build` hangs uploading context)
+.venv/
+venv/
+env/
+ENV/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Git / IDE
+.git/
+.gitignore
+.cursor/
+.vscode/
+.idea/
+
+# Local data and uploads
+data/blobs/
+uploads/
+/tmp/
+
+# Secrets (mounted via env at runtime)
+.env
+.env.*
+*.json
+!data/fixtures/*.json
+
+# Docs and dev artifacts
+*.md
+!README.md
+
+# OS
+.DS_Store
+Thumbs.db

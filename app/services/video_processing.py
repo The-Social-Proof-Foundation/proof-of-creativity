@@ -6,8 +6,8 @@ from pathlib import Path
 from typing import List, Optional, Tuple
 import shutil
 
-from app.services import embedding
-from app.services import fingerprint
+from app.services.embedding import batch_image_embeddings
+from app.services.fingerprint import fingerprint_audio_with_blob
 from app.core.utils import cleanup_temp_file, batch_cleanup_temp_files
 
 logger = structlog.get_logger()
@@ -206,17 +206,17 @@ def process_video(
     video_path: str, 
     keyframe_rate: int = DEFAULT_KEYFRAME_RATE,
     max_frames: int = MAX_FRAMES_TO_PROCESS
-) -> Tuple[List[List[float]], Optional[str]]:
+) -> Tuple[List[List[float]], Optional[str], Optional[bytes]]:
     """
     Process video to extract keyframe embeddings and audio fingerprint.
-    
+
     Args:
         video_path: Path to video file
         keyframe_rate: Frames per second to extract
         max_frames: Maximum number of frames to process
-        
+
     Returns:
-        Tuple of (frame_embeddings, audio_fingerprint_hash)
+        Tuple of (frame_embeddings, audio_fingerprint_hash, fingerprint_data_blob)
     """
     frame_paths = []
     audio_path = None
@@ -236,7 +236,7 @@ def process_video(
         if frame_paths:
             logger.info("Generating embeddings for keyframes", frame_count=len(frame_paths))
             # Use batch processing for efficiency
-            frame_embeddings = embedding.batch_image_embeddings(
+            frame_embeddings = batch_image_embeddings(
                 frame_paths, 
                 batch_size=8  # Process 8 frames at a time
             )
@@ -254,24 +254,34 @@ def process_video(
         
         # Extract and fingerprint audio
         audio_fingerprint_hash = None
+        audio_fingerprint_blob: Optional[bytes] = None
         if video_info.get("has_audio"):
             audio_path = extract_audio(video_path)
             if audio_path:
                 try:
-                    audio_fingerprint_hash = fingerprint.fingerprint_audio(audio_path)
-                    logger.info("Audio fingerprint generated", 
-                               fingerprint_hash=audio_fingerprint_hash)
+                    audio_fingerprint_hash, audio_fingerprint_blob = fingerprint_audio_with_blob(
+                        audio_path
+                    )
+                    logger.info(
+                        "Audio fingerprint generated",
+                        fingerprint_hash=audio_fingerprint_hash,
+                        has_blob=audio_fingerprint_blob is not None,
+                    )
                 except Exception as e:
-                    logger.error("Audio fingerprinting failed", 
-                               audio_path=audio_path, error=str(e))
+                    logger.error(
+                        "Audio fingerprinting failed",
+                        audio_path=audio_path,
+                        error=str(e),
+                    )
                     audio_fingerprint_hash = None
+                    audio_fingerprint_blob = None
         
         logger.info("Video processing completed successfully", 
                    video_path=video_path,
                    frame_embeddings_count=len(valid_embeddings),
                    has_audio_fingerprint=audio_fingerprint_hash is not None)
         
-        return valid_embeddings, audio_fingerprint_hash
+        return valid_embeddings, audio_fingerprint_hash, audio_fingerprint_blob
         
     except Exception as e:
         logger.error("Video processing failed", 

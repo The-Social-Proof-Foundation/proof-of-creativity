@@ -10,10 +10,29 @@ from datetime import datetime, timedelta
 
 logger = structlog.get_logger()
 
-# Timescale Vector AI configuration
-TIMESCALE_DB_DSN = os.getenv("TIMESCALE_DB_DSN", os.getenv("DB_DSN", "postgresql://user:password@localhost:5432/proof_of_creativity"))
-TIMESCALE_SERVICE_URL = os.getenv("TIMESCALE_SERVICE_URL", "")
-TIMESCALE_API_KEY = os.getenv("TIMESCALE_API_KEY", "")
+# Redis cache for performance optimization
+def get_redis_cache():
+    """Lazy import to avoid circular dependencies"""
+    try:
+        from app.core.redis_client import get_redis
+        return get_redis()
+    except Exception as e:
+        logger.warning("Could not import Redis cache", error=str(e))
+        return None
+
+# Database configuration - works with regular PostgreSQL + pgvector
+def get_database_url():
+    """Get database URL and fix Railway's postgres:// format for SQLAlchemy 2.0"""
+    url = os.getenv("DATABASE_URL") or os.getenv("TIMESCALE_DB_DSN") or os.getenv("DB_DSN") or \
+          "postgresql://user:password@localhost:5432/proof_of_creativity"
+    
+    # Fix Railway/Heroku format (postgres:// → postgresql://)
+    if url.startswith("postgres://"):
+        url = url.replace("postgres://", "postgresql://", 1)
+    
+    return url
+
+DB_DSN = get_database_url()
 
 # Connection pool configuration
 MIN_CONNECTIONS = 1
@@ -23,16 +42,16 @@ MAX_CONNECTIONS = 20
 _connection_pool = None
 
 def initialize_connection_pool():
-    """Initialize the Timescale database connection pool."""
+    """Initialize the PostgreSQL database connection pool."""
     global _connection_pool
     if _connection_pool is None:
         try:
             _connection_pool = SimpleConnectionPool(
                 MIN_CONNECTIONS, 
                 MAX_CONNECTIONS, 
-                TIMESCALE_DB_DSN
+                DB_DSN
             )
-            logger.info("Timescale connection pool initialized", 
+            logger.info("PostgreSQL connection pool initialized", 
                        min_connections=MIN_CONNECTIONS, 
                        max_connections=MAX_CONNECTIONS)
             
@@ -47,18 +66,24 @@ def initialize_connection_pool():
                         logger.warning("Vector extension not found - ensure pgvector is installed")
                         
         except Exception as e:
-            logger.error("Failed to initialize Timescale connection pool", error=str(e))
+            logger.error("Failed to initialize PostgreSQL connection pool", error=str(e))
             raise
 
 @contextmanager
 def get_db_connection():
-    """Context manager for Timescale database connections with automatic cleanup."""
+    """Context manager for PostgreSQL database connections with automatic cleanup."""
     if _connection_pool is None:
         initialize_connection_pool()
     
     conn = None
     try:
         conn = _connection_pool.getconn()
+        try:
+            from pgvector.psycopg2 import register_vector
+
+            register_vector(conn)
+        except Exception:
+            pass
         yield conn
     except Exception as e:
         if conn:
@@ -71,38 +96,119 @@ def get_db_connection():
 
 def get_conn():
     """Legacy function for backward compatibility."""
-    return psycopg2.connect(TIMESCALE_DB_DSN)
+    return psycopg2.connect(DB_DSN)
 
-# Embedding management with Timescale Vector AI
-def insert_embedding(media_id: str, kind: str, embedding: List[float], metadata: Dict[str, Any]):
-    """Insert a new embedding into Timescale with vector indexing."""
+# Embedding management with pgvector
+def _corpus_filter_clause(
+    corpus_scopes: Optional[List[str]] = None,
+    active_embedding_version: Optional[str] = None,
+) -> tuple[str, list]:
+    clause = ""
+    params: list = []
+    if corpus_scopes:
+        clause += " AND corpus_scope = ANY(%s)"
+        params.append(corpus_scopes)
+    if active_embedding_version:
+        clause += " AND (embedding_version IS NULL OR embedding_version = %s)"
+        params.append(active_embedding_version)
+    return clause, params
+
+
+def insert_embedding(
+    media_id: str,
+    kind: str,
+    embedding: List[float],
+    metadata: Dict[str, Any],
+    *,
+    corpus_scope: str = "platform",
+    discovery_asset_id: Optional[str] = None,
+    embedding_model: Optional[str] = None,
+    embedding_version: Optional[str] = None,
+    embedding_dimension: Optional[int] = None,
+    embedding_created_at=None,
+):
+    """Insert a new embedding with vector indexing."""
+    from datetime import datetime, timezone
+
+    created_at = embedding_created_at or datetime.now(timezone.utc)
     sql = """
-    INSERT INTO media_embeddings (media_id, kind, embedding, metadata)
-    VALUES (%s, %s, %s, %s)
+    INSERT INTO media_embeddings (
+        id, media_id, kind, embedding, metadata,
+        corpus_scope, discovery_asset_id, embedding_model, embedding_version,
+        embedding_dimension, embedding_created_at
+    )
+    VALUES (gen_random_uuid(), %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
     """
     try:
         with get_db_connection() as conn:
             with conn.cursor() as cur:
-                cur.execute(sql, (media_id, kind, embedding, extras.Json(metadata)))
+                cur.execute(
+                    sql,
+                    (
+                        media_id,
+                        kind,
+                        embedding,
+                        extras.Json(metadata),
+                        corpus_scope,
+                        discovery_asset_id,
+                        embedding_model,
+                        embedding_version,
+                        embedding_dimension or len(embedding),
+                        created_at,
+                    ),
+                )
                 conn.commit()
         
         logger.debug("Embedding inserted successfully", 
-                    media_id=media_id, kind=kind, embedding_dim=len(embedding))
+                    media_id=media_id, kind=kind, embedding_dim=len(embedding),
+                    corpus_scope=corpus_scope)
                     
     except Exception as e:
         logger.error("Failed to insert embedding", 
                     media_id=media_id, kind=kind, error=str(e))
         raise
 
+def insert_provenance_metadata(
+    media_id: str,
+    kind: str,
+    metadata: Dict[str, Any],
+    *,
+    corpus_scope: str = "platform",
+    discovery_asset_id: Optional[str] = None,
+    embedding_model: Optional[str] = None,
+    embedding_version: Optional[str] = None,
+    embedding_dimension: Optional[int] = None,
+    embedding_created_at=None,
+):
+    """Store discovery provenance metadata without a searchable embedding vector."""
+    from datetime import datetime, timezone
+
+    dim = embedding_dimension or int(os.getenv("EMBEDDING_DIMENSION", "512"))
+    zero_vector = [0.0] * dim
+    insert_embedding(
+        media_id,
+        kind,
+        zero_vector,
+        metadata,
+        corpus_scope=corpus_scope,
+        discovery_asset_id=discovery_asset_id,
+        embedding_model=embedding_model,
+        embedding_version=embedding_version,
+        embedding_dimension=dim,
+        embedding_created_at=embedding_created_at,
+    )
+
 def search_embedding_with_timescale_ai(
     vector: List[float], 
     top_k: int = 5, 
     kind_filter: Optional[str] = None,
     time_filter_hours: Optional[int] = None,
-    similarity_threshold: float = 0.7
+    similarity_threshold: float = 0.7,
+    corpus_scopes: Optional[List[str]] = None,
+    active_embedding_version: Optional[str] = None,
 ) -> List[Tuple]:
     """
-    Advanced vector similarity search using Timescale Vector AI capabilities.
+    Vector similarity search using PostgreSQL + pgvector.
     
     Args:
         vector: Query embedding vector
@@ -131,6 +237,10 @@ def search_embedding_with_timescale_ai(
         base_sql += " AND kind = %s"
         params.append(kind_filter)
     
+    corpus_clause, corpus_params = _corpus_filter_clause(corpus_scopes, active_embedding_version)
+    base_sql += corpus_clause
+    params.extend(corpus_params)
+    
     if time_filter_hours:
         base_sql += " AND uploaded_at > NOW() - INTERVAL '%s hours'"
         params.append(time_filter_hours)
@@ -158,7 +268,7 @@ def search_embedding_with_timescale_ai(
         return results
         
     except Exception as e:
-        logger.error("Failed to search embeddings with Timescale AI", 
+        logger.error("Failed to search embeddings with pgvector", 
                     top_k=top_k, error=str(e))
         raise
 
@@ -190,80 +300,175 @@ def get_embedding_by_media_id(media_id: str) -> Optional[Tuple]:
         raise
 
 # Audio fingerprint management functions
-def insert_fingerprint(fp_hash: str, media_id: str, offset_seconds: float, fingerprint_data: Optional[bytes] = None):
-    """Insert a new audio fingerprint into the database."""
+def insert_fingerprint(
+    fp_hash: str,
+    media_id: str,
+    offset_seconds: float,
+    fingerprint_data: Optional[bytes] = None,
+    *,
+    corpus_scope: str = "platform",
+    discovery_asset_id: Optional[str] = None,
+    embedding_model: Optional[str] = None,
+    embedding_version: Optional[str] = None,
+    embedding_dimension: Optional[int] = None,
+    embedding_created_at=None,
+):
+    """Insert audio fingerprint; fingerprint_data is optional pickled constellation hashes (see fingerprint_audio_with_blob)."""
+    from datetime import datetime, timezone
+    from app.services.fingerprint import normalize_audio_fp_hash
+
+    fp_hash = normalize_audio_fp_hash(fp_hash)
+    blob_octets = len(fingerprint_data) if fingerprint_data else 0
+    created_at = embedding_created_at or datetime.now(timezone.utc)
     sql = """
-    INSERT INTO audio_fingerprints (fp_hash, media_id, offset_seconds, fingerprint_data)
-    VALUES (%s, %s, %s, %s)
+    INSERT INTO audio_fingerprints (
+        id, fp_hash, media_id, offset_seconds, fingerprint_data,
+        corpus_scope, discovery_asset_id, embedding_model, embedding_version,
+        embedding_dimension, embedding_created_at
+    )
+    VALUES (gen_random_uuid(), %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
     """
     try:
         with get_db_connection() as conn:
             with conn.cursor() as cur:
-                cur.execute(sql, (fp_hash, media_id, offset_seconds, fingerprint_data))
+                cur.execute(
+                    sql,
+                    (
+                        fp_hash,
+                        media_id,
+                        offset_seconds,
+                        fingerprint_data,
+                        corpus_scope,
+                        discovery_asset_id,
+                        embedding_model,
+                        embedding_version,
+                        embedding_dimension,
+                        created_at,
+                    ),
+                )
                 conn.commit()
-        
-        logger.debug("Fingerprint inserted successfully", 
-                    fp_hash=fp_hash, media_id=media_id, offset=offset_seconds)
-                    
+
+        logger.debug(
+            "Fingerprint inserted successfully",
+            fp_hash=fp_hash,
+            fp_hash_len=len(fp_hash),
+            media_id=media_id,
+            offset=offset_seconds,
+            fingerprint_data_octets=blob_octets,
+        )
+
     except Exception as e:
-        logger.error("Failed to insert fingerprint", 
+        logger.error("Failed to insert fingerprint",
                     fp_hash=fp_hash, media_id=media_id, error=str(e))
         raise
 
-def search_fingerprint(fp_hash: str) -> List[Tuple]:
-    """Search for matching fingerprints."""
-    sql = "SELECT media_id, offset_seconds FROM audio_fingerprints WHERE fp_hash = %s"
-    
-    try:
-        with get_db_connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute(sql, (fp_hash,))
-                results = cur.fetchall()
-        
-        logger.debug("Fingerprint search completed", 
-                    fp_hash=fp_hash, results_count=len(results))
-        return results
-        
-    except Exception as e:
-        logger.error("Failed to search fingerprint", fp_hash=fp_hash, error=str(e))
-        raise
+def search_fingerprint_rows(
+    fp_hash: str,
+    *,
+    corpus_scopes: Optional[List[str]] = None,
+    active_embedding_version: Optional[str] = None,
+) -> List[Tuple[str, float, Optional[bytes]]]:
+    """
+    Corpus candidates for audio similarity: latest row per media_id (handles retries).
+    Includes fingerprint_data for README step 5 (constellation verification).
+    PostgreSQL only — Redis is not authoritative for similarity.
+    """
+    from app.services.fingerprint import normalize_audio_fp_hash
 
-# Image perceptual hash management functions
-def insert_image_hashes(media_id: str, hashes: dict) -> None:
-    """Insert image perceptual hashes into database."""
+    fp_hash = normalize_audio_fp_hash(fp_hash)
     sql = """
-    INSERT INTO image_hashes (media_id, dhash, phash, ahash, dhash_16, phash_16)
-    VALUES (%s, %s, %s, %s, %s, %s)
-    ON CONFLICT (media_id) DO UPDATE SET
-        dhash = EXCLUDED.dhash,
-        phash = EXCLUDED.phash,
-        ahash = EXCLUDED.ahash,
-        dhash_16 = EXCLUDED.dhash_16,
-        phash_16 = EXCLUDED.phash_16,
-        updated_at = NOW()
+    SELECT DISTINCT ON (media_id) media_id, offset_seconds, fingerprint_data
+    FROM audio_fingerprints
+    WHERE fp_hash = %s
+    """
+    params: list = [fp_hash]
+    corpus_clause, corpus_params = _corpus_filter_clause(corpus_scopes, active_embedding_version)
+    sql += corpus_clause
+    params.extend(corpus_params)
+    sql += """
+    ORDER BY media_id, created_at DESC
     """
     try:
         with get_db_connection() as conn:
             with conn.cursor() as cur:
-                cur.execute(sql, (
-                    media_id,
-                    hashes.get('dhash'),
-                    hashes.get('phash'),
-                    hashes.get('ahash'), 
-                    hashes.get('dhash_16'),
-                    hashes.get('phash_16')
-                ))
-                conn.commit()
-        
-        logger.debug("Image hashes inserted", 
-                    media_id=media_id, hash_types=list(hashes.keys()))
-                    
+                cur.execute(sql, params)
+                results = cur.fetchall()
+        logger.debug(
+            "Fingerprint candidate rows loaded",
+            fp_hash=fp_hash,
+            candidates=len(results),
+        )
+        return results
     except Exception as e:
-        logger.error("Failed to insert image hashes", 
-                    media_id=media_id, error=str(e))
+        logger.error("Failed to search fingerprint rows", fp_hash=fp_hash, error=str(e))
         raise
 
-def search_similar_image_hashes(hashes: dict, exclude_media_id: Optional[str] = None) -> List[Tuple]:
+
+def search_fingerprint(fp_hash: str) -> List[Tuple]:
+    """Return (media_id, offset_seconds) for callers that do not need blobs."""
+    rows = search_fingerprint_rows(fp_hash)
+    return [(mid, off) for mid, off, _blob in rows]
+
+# Image perceptual hash management functions
+def insert_image_hashes(
+    media_id: str,
+    hashes: dict,
+    *,
+    corpus_scope: str = "platform",
+    discovery_asset_id: Optional[str] = None,
+    embedding_model: Optional[str] = None,
+    embedding_version: Optional[str] = None,
+    embedding_dimension: Optional[int] = None,
+    embedding_created_at=None,
+) -> None:
+    """Insert image perceptual hashes into database (delete-then-insert; works without UNIQUE)."""
+    from datetime import datetime, timezone
+
+    created_at = embedding_created_at or datetime.now(timezone.utc)
+    sql_insert = """
+    INSERT INTO image_hashes (
+        id, media_id, dhash, phash, ahash, dhash_16, phash_16,
+        corpus_scope, discovery_asset_id, embedding_model, embedding_version,
+        embedding_dimension, embedding_created_at
+    )
+    VALUES (gen_random_uuid(), %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+    """
+    try:
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM image_hashes WHERE media_id = %s", (media_id,))
+                cur.execute(
+                    sql_insert,
+                    (
+                        media_id,
+                        hashes.get("dhash"),
+                        hashes.get("phash"),
+                        hashes.get("ahash"),
+                        hashes.get("dhash_16"),
+                        hashes.get("phash_16"),
+                        corpus_scope,
+                        discovery_asset_id,
+                        embedding_model,
+                        embedding_version,
+                        embedding_dimension,
+                        created_at,
+                    ),
+                )
+                conn.commit()
+
+        logger.debug("Image hashes inserted", media_id=media_id, hash_types=list(hashes.keys()))
+
+    except Exception as e:
+        logger.error("Failed to insert image hashes", media_id=media_id, error=str(e))
+        raise
+
+def search_similar_image_hashes(
+    hashes: dict,
+    exclude_media_id: Optional[str] = None,
+    *,
+    corpus_scopes: Optional[List[str]] = None,
+    active_embedding_version: Optional[str] = None,
+) -> List[Tuple]:
     """Search for similar image hashes in database."""
     # Search for exact matches first (fastest)
     sql = """
@@ -282,6 +487,10 @@ def search_similar_image_hashes(hashes: dict, exclude_media_id: Optional[str] = 
     if exclude_media_id:
         sql += " AND media_id != %s"
         params.append(exclude_media_id)
+
+    corpus_clause, corpus_params = _corpus_filter_clause(corpus_scopes, active_embedding_version)
+    sql += corpus_clause
+    params.extend(corpus_params)
     
     sql += " ORDER BY created_at DESC"
     
@@ -328,39 +537,97 @@ def insert_media_file(
     content_type: str,
     file_size: int,
     file_hash: str,
-    upload_user_id: Optional[str] = None,
-    upload_ip: Optional[str] = None,
-    status: str = "processing"
+    status: str = "processing",
+    creator_address: Optional[str] = None,
 ):
-    """Insert a new media file record."""
+    """Insert a new media file record with Redis caching for deduplication."""
     sql = """
     INSERT INTO media_files (
         media_id, filename, original_filename, content_type, file_size, 
-        file_hash, upload_user_id, upload_ip, status
+        file_hash, creator_address, status
     )
-    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
     """
     try:
         with get_db_connection() as conn:
             with conn.cursor() as cur:
-                cur.execute(sql, (
-                    media_id, filename, original_filename, content_type, 
-                    file_size, file_hash, upload_user_id, upload_ip, status
-                ))
+                cur.execute(
+                    sql,
+                    (
+                        media_id,
+                        filename,
+                        original_filename,
+                        content_type,
+                        file_size,
+                        file_hash,
+                        creator_address,
+                        status,
+                    ),
+                )
                 conn.commit()
+
+        
+        # Cache file hash for fast deduplication
+        redis_cache = get_redis_cache()
+        if redis_cache:
+            redis_cache.cache_file_hash(file_hash, media_id)
         
         logger.info("Media file record inserted", 
                    media_id=media_id, filename=filename, file_size=file_size)
                    
     except Exception as e:
-        logger.error("Failed to insert media file record", 
-                    media_id=media_id, filename=filename, error=str(e))
+        logger.error(
+            "Failed to insert media file record",
+            media_id=media_id,
+            filename=filename,
+            error=str(e),
+        )
         raise
 
+
+def lookup_mysocial_creator_for_media_ids(media_ids: List[str]) -> Optional[str]:
+    """
+    Return first non-empty creator_address among catalog rows.
+
+    Enables mapping matched media_id → on-chain attribution address once rows are labeled.
+    Video frame ids (suffix \"_frame_<n>\") are expanded to their parent media_id so
+    creator_address stored on the parent row resolves correctly.
+    """
+    from app.services.poc_media_ids import expand_media_ids_for_creator_lookup
+
+    ids = expand_media_ids_for_creator_lookup(media_ids)
+    if not ids:
+        return None
+    try:
+        placeholders = ",".join(["%s"] * len(ids))
+        sql = f"""
+            SELECT creator_address FROM media_files
+            WHERE media_id IN ({placeholders})
+              AND creator_address IS NOT NULL
+              AND TRIM(creator_address) <> ''
+            LIMIT 1
+        """
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(sql, tuple(ids))
+                row = cur.fetchone()
+                if row and row[0]:
+                    return str(row[0]).strip()
+    except Exception as e:
+        logger.warning(
+            "lookup_mysocial_creator_for_media_ids failed",
+            error=str(e),
+            media_sample=ids[:3],
+        )
+    return None
+
+
 def update_media_file_status(
+
     media_id: str, 
     status: str, 
     storage_uri: Optional[str] = None,
+    streaming_uri: Optional[str] = None,
     processing_results: Optional[Dict] = None
 ):
     """Update media file status and related information with normalized columns."""
@@ -372,6 +639,7 @@ def update_media_file_status(
     sql = """
     UPDATE media_files 
     SET status = %s, storage_uri = COALESCE(%s, storage_uri), 
+        streaming_uri = COALESCE(%s, streaming_uri),
         processing_results = COALESCE(%s, processing_results),
         matches_found = %s, processing_time_ms = %s, media_type = %s,
         updated_at = NOW()
@@ -382,7 +650,8 @@ def update_media_file_status(
             with conn.cursor() as cur:
                 cur.execute(sql, (
                     status, 
-                    storage_uri, 
+                    storage_uri,
+                    streaming_uri,
                     extras.Json(processing_results) if processing_results else None,
                     matches_found, processing_time_ms, media_type,
                     media_id
@@ -391,7 +660,7 @@ def update_media_file_status(
         
         logger.debug("Media file status updated with normalized data", 
                     media_id=media_id, status=status, storage_uri=storage_uri,
-                    matches_found=matches_found, media_type=media_type)
+                    streaming_uri=streaming_uri, matches_found=matches_found, media_type=media_type)
                     
     except Exception as e:
         logger.error("Failed to update media file status", 
@@ -463,11 +732,11 @@ def insert_similarity_match(
     
     sql = """
     INSERT INTO similarity_matches (
-        query_media_id, match_media_id, match_type, 
+        id, query_media_id, match_media_id, match_type, 
         similarity_score, confidence_level, match_details,
         match_category, embedding_type, fingerprint_hash, offset_seconds
     )
-    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+    VALUES (gen_random_uuid(), %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
     """
     try:
         with get_db_connection() as conn:
@@ -531,8 +800,8 @@ def get_similarity_matches(
 def insert_attribution_record(
     media_id: str,
     attribution_type: str = "original",
-    blockchain_tx_hash: Optional[str] = None,
-    blockchain_address: Optional[str] = None,
+    tx_hash: Optional[str] = None,
+    wallet_address: Optional[str] = None,
     proof_data: Optional[Dict] = None
 ):
     """Insert a blockchain attribution record with normalized columns."""
@@ -543,21 +812,21 @@ def insert_attribution_record(
     high_confidence_matches = proof_data.get('high_confidence_matches', 0) if proof_data else 0
     max_similarity_score = proof_data.get('max_similarity_score', 0.0) if proof_data else 0.0
     processing_time_ms = proof_data.get('processing_time_ms', 0.0) if proof_data else 0.0
-    
+
     sql = """
     INSERT INTO attribution_records (
-        media_id, blockchain_tx_hash, blockchain_address, 
+        id, media_id, tx_hash, wallet_address, 
         attribution_type, proof_data,
         file_hash, media_type, matches_found, high_confidence_matches,
         max_similarity_score, processing_time_ms
     )
-    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+    VALUES (gen_random_uuid(), %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
     """
     try:
         with get_db_connection() as conn:
             with conn.cursor() as cur:
                 cur.execute(sql, (
-                    media_id, blockchain_tx_hash, blockchain_address,
+                    media_id, tx_hash, wallet_address,
                     attribution_type, extras.Json(proof_data) if proof_data else None,
                     file_hash, media_type, matches_found, high_confidence_matches,
                     max_similarity_score, processing_time_ms
@@ -576,7 +845,7 @@ def insert_attribution_record(
 def get_attribution_records(media_id: str) -> List[Dict]:
     """Get attribution records for a media file."""
     sql = """
-    SELECT blockchain_tx_hash, blockchain_address, attribution_type, 
+    SELECT tx_hash, wallet_address, attribution_type, 
            proof_data, created_at
     FROM attribution_records 
     WHERE media_id = %s
@@ -595,7 +864,7 @@ def get_attribution_records(media_id: str) -> List[Dict]:
                     media_id=media_id, error=str(e))
         raise
 
-# Timescale Vector AI specific functions
+# PostgreSQL + pgvector specific functions
 def create_vector_index_if_not_exists():
     """Create vector index for optimal similarity search performance."""
     sql = """
@@ -642,18 +911,18 @@ def get_vector_index_stats() -> Dict:
 
 # Database utility functions
 def check_database_connection() -> bool:
-    """Check if Timescale database connection is working."""
+    """Check if PostgreSQL database connection is working."""
     try:
         with get_db_connection() as conn:
             with conn.cursor() as cur:
                 cur.execute("SELECT 1")
                 result = cur.fetchone()
         
-        logger.info("Timescale database connection check successful")
+        logger.info("PostgreSQL database connection check successful")
         return result[0] == 1
         
     except Exception as e:
-        logger.error("Timescale database connection check failed", error=str(e))
+        logger.error("PostgreSQL database connection check failed", error=str(e))
         return False
 
 def get_database_stats() -> Dict:
@@ -684,7 +953,7 @@ def get_database_stats() -> Dict:
                     "postgres_version": result[5],
                     "vector_extension_version": result[6],
                     "connection_pool_size": len(_connection_pool._pool) if _connection_pool else 0,
-                    "database_type": "timescale"
+                    "database_type": "postgresql"
                 }
                 
     except Exception as e:
@@ -730,10 +999,5 @@ def cleanup_old_records(days_old: int = 30) -> Dict:
         logger.error("Database cleanup failed", error=str(e))
         raise
 
-# Initialize connection pool on module import
-try:
-    initialize_connection_pool()
-    # Ensure vector index exists
-    create_vector_index_if_not_exists()
-except Exception as e:
-    logger.warning("Could not initialize Timescale database at startup", error=str(e)) 
+# Connection pool and indexes are initialized in app startup (after migrations run)
+# See app/main.py lifespan function 

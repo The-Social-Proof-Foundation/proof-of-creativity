@@ -1,47 +1,11 @@
 import uuid
 import hashlib
 import os
-import tempfile
 import structlog
 from pathlib import Path
 from typing import Optional
 
 logger = structlog.get_logger()
-
-def save_temp_upload(upload_file) -> str:
-    """Save uploaded file to temporary location and return path."""
-    try:
-        suffix = Path(upload_file.filename).suffix if upload_file.filename else ""
-        
-        # Create temporary file with proper suffix
-        temp_fd, temp_path = tempfile.mkstemp(suffix=suffix)
-        
-        try:
-            # Write file content
-            with os.fdopen(temp_fd, 'wb') as f:
-                # Read file content
-                content = upload_file.file.read()
-                f.write(content)
-            
-            # Reset file pointer for potential re-reading
-            upload_file.file.seek(0)
-            
-            logger.info("Saved temporary upload", 
-                       filename=upload_file.filename, temp_path=temp_path, size=len(content))
-            return temp_path
-            
-        except Exception as e:
-            # Clean up file descriptor if writing failed
-            try:
-                os.close(temp_fd)
-            except:
-                pass
-            raise e
-            
-    except Exception as e:
-        logger.error("Failed to save temporary upload", 
-                    filename=getattr(upload_file, 'filename', 'unknown'), error=str(e))
-        raise
 
 def new_media_id() -> str:
     """Generate a new unique media ID."""

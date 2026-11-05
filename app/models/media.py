@@ -35,15 +35,11 @@ class MediaFileBase(BaseModel):
 
 class MediaFileCreate(MediaFileBase):
     """Model for creating a new media file record."""
-    upload_user_id: Optional[str] = Field(None, description="ID of the uploading user")
-    upload_ip: Optional[str] = Field(None, description="IP address of uploader")
 
 class MediaFile(MediaFileBase):
     """Complete media file model with all fields."""
     media_id: str = Field(..., description="Unique identifier for the media")
     storage_uri: Optional[str] = Field(None, description="Storage URI (GCS/Walrus)")
-    upload_user_id: Optional[str] = Field(None, description="ID of the uploading user")
-    upload_ip: Optional[str] = Field(None, description="IP address of uploader")
     status: ProcessingStatus = Field(default=ProcessingStatus.PROCESSING)
     processing_results: Optional[Dict[str, Any]] = Field(default=None)
     created_at: datetime = Field(default_factory=datetime.utcnow)
@@ -87,8 +83,8 @@ class AttributionRecordBase(BaseModel):
 class AttributionRecord(AttributionRecordBase):
     """Complete attribution record model."""
     id: Optional[str] = Field(None, description="Unique attribution ID")
-    blockchain_tx_hash: Optional[str] = Field(None, description="Blockchain transaction hash")
-    blockchain_address: Optional[str] = Field(None, description="Blockchain address")
+    tx_hash: Optional[str] = Field(None, description="Transaction hash (on-chain submission)")
+    wallet_address: Optional[str] = Field(None, description="Wallet address associated with attribution")
     proof_data: Optional[Dict[str, Any]] = Field(default=None, description="Proof data")
     created_at: datetime = Field(default_factory=datetime.utcnow)
 
@@ -101,14 +97,7 @@ class MediaDimensions(BaseModel):
     sample_rate: Optional[int] = Field(None, description="Audio sample rate")
     channels: Optional[int] = Field(None, description="Number of audio channels")
     format: Optional[str] = Field(None, description="Media format")
-    
-class MediaUploadRequest(BaseModel):
-    """Model for media upload request parameters."""
-    extract_keyframes: bool = Field(default=True, description="Extract keyframes from video")
-    keyframe_rate: int = Field(default=1, ge=1, le=10, description="Keyframes per second")
-    max_duration: float = Field(default=60.0, ge=1.0, le=600.0, description="Max processing duration")
-    generate_thumbnail: bool = Field(default=True, description="Generate thumbnail")
-    
+
 class ProcessingOptions(BaseModel):
     """Model for media processing options."""
     similarity_threshold: float = Field(default=0.7, ge=0.0, le=1.0)

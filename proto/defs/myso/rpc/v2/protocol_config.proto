@@ -1,0 +1,13 @@
+// Copyright (c) Mysten Labs, Inc.
+// Copyright (c) The Social Proof Foundation, LLC.
+// SPDX-License-Identifier: Apache-2.0
+
+syntax = "proto3";
+
+package myso.rpc.v2;
+
+message ProtocolConfig {
+  optional uint64 protocol_version = 1;
+  map<string, bool> feature_flags = 2;
+  map<string, string> attributes = 3;
+}

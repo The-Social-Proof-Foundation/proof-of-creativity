@@ -9,12 +9,13 @@ import sys
 import uvicorn
 from pathlib import Path
 
-# Add the parent directory to Python path
-sys.path.append(str(Path(__file__).parent.parent))
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+os.chdir(PROJECT_ROOT)
+sys.path.insert(0, str(PROJECT_ROOT))
 
-# Load environment variables from .env file
 from dotenv import load_dotenv
-load_dotenv()
+
+load_dotenv(PROJECT_ROOT / ".env")
 
 def check_environment():
     """Check if all required environment variables are set."""

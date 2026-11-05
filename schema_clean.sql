@@ -21,8 +21,7 @@ CREATE TABLE media_files (
     file_size BIGINT,
     storage_uri TEXT,
     file_hash VARCHAR(128),
-    upload_user_id VARCHAR(36),
-    upload_ip INET,
+    creator_address VARCHAR(128),
     status VARCHAR(20) DEFAULT 'processing',
     processing_results JSONB DEFAULT '{}',
     created_at TIMESTAMPTZ DEFAULT NOW(),
@@ -112,8 +111,8 @@ SELECT create_hypertable('similarity_matches', 'created_at',
 CREATE TABLE attribution_records (
     id UUID DEFAULT gen_random_uuid(),
     media_id VARCHAR(36) NOT NULL,
-    blockchain_tx_hash VARCHAR(128),
-    blockchain_address VARCHAR(128),
+    tx_hash VARCHAR(128),
+    wallet_address VARCHAR(128),
     attribution_type VARCHAR(50),
     proof_data JSONB DEFAULT '{}',
     created_at TIMESTAMPTZ DEFAULT NOW()
@@ -153,7 +152,7 @@ CREATE INDEX idx_similarity_matches_type ON similarity_matches (match_type);
 
 -- Attribution indexes
 CREATE INDEX idx_attribution_records_media ON attribution_records (media_id, created_at DESC);
-CREATE INDEX idx_attribution_records_blockchain ON attribution_records (blockchain_tx_hash);
+CREATE INDEX idx_attribution_records_blockchain ON attribution_records (tx_hash);
 
 -- Update triggers for updated_at timestamps
 CREATE OR REPLACE FUNCTION update_updated_at_column()

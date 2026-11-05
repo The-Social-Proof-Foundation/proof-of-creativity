@@ -1,0 +1,18 @@
+// Copyright (c) Mysten Labs, Inc.
+// Copyright (c) The Social Proof Foundation, LLC.
+// SPDX-License-Identifier: Apache-2.0
+
+syntax = "proto3";
+
+package myso.rpc.v2;
+
+// `Bcs` contains an arbitrary type that is serialized using the
+// [BCS](https://the-social-proof-foundation.github.io/myso-rust-sdk/myso_sdk_types/index.html#bcs)
+// format as well as a name that identifies the type of the serialized value.
+message Bcs {
+  // Name that identifies the type of the serialized value.
+  optional string name = 1;
+
+  // Bytes of a BCS serialized value.
+  optional bytes value = 2;
+}

@@ -170,13 +170,64 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 
 Visit `http://localhost:8000/docs` for interactive API documentation.
 
-**Basic Upload Test:**
+**Smoke test:**
 ```bash
-curl -X POST "http://localhost:8000/upload" \
-  -H "accept: application/json" \
-  -H "Content-Type: multipart/form-data" \
-  -F "file=@your-image.jpg"
+curl -s http://localhost:8000/health
 ```
+
+Video bytes are **not** uploaded through this API. Clients PUT to dripdrop-backend R2 presigns (`POST /v1/videos/uploads`), then `create_post`. The oracle watches chain events.
+
+### MySocial Proof of Creativity (oracle)
+
+**MediaAsset-centric model (V1):** `MediaAsset.id` is the canonical creative identity. PoC runs two pipelines:
+
+1. **Asset resolution** — `submit_media_resolution` → oracle `finalize_media_asset` → canonical `MediaAsset.id`
+2. **Composition analysis** — `create_post(media_asset_ids)` + `MediaAssetUsedEvent` → oracle `analyze_post_composition` → `CompositionAnalysis` + creator-attributable `RevenueManifest`
+
+Post-level `revenue_redirect_*` and `analyze_and_update_post` are **deprecated**. Protocol/platform fees are deducted **before** the attributable pool; the manifest splits only the creator-attributable remainder.
+
+See [`docs/media-asset-client-flow.md`](docs/media-asset-client-flow.md) for the full client sequence.
+
+### DripDrop publish path (MediaAsset-centric)
+
+1. **dripdrop-backend `POST /v1/videos/uploads`** — iOS PUTs parts in parallel to R2 presigned URLs, then `POST /v1/videos/{id}/complete` (commitments).
+2. **`create_post`** with commitments in metadata (empty `media_asset_ids` for video/drop). Oracle later calls `submit_media_resolution`.
+3. **Oracle `finalize_media_asset`** — mint or link deduped `MediaAsset.id`.
+4. **Oracle `analyze_composition`** — validates usage grants, builds version-pinned `CompositionAnalysis` + `RevenueManifest`.
+
+PoC does **not** expose `/upload` or `/uploads/presign`. Legacy post-centric `analyze_post` jobs may still exist in the DB for old rows.
+
+### Basic PoC post E2E flow (legacy post-centric — deprecated)
+
+<details>
+<summary>Pre-MediaAsset flow (maintenance only)</summary>
+
+1. **Post created on-chain** — `post::create_post` with publicly fetchable `media_urls` (legacy).
+2. **Oracle discovery** — gRPC sync enqueues `analyze_post` jobs per URL.
+3. **Analysis** — similarity + `DecisionEngine`.
+4. **Chain submission** — `analyze_and_update_post` (deprecated).
+
+New integrations must use the MediaAsset-centric flow above.
+</details>
+
+When `MYSO_INTEGRATION_ENABLED=true`, composition sync uses **`MYSO_TOKEN_REGISTRY_ID`** and per-post **`spt_pool_id`** for `analyze_post_composition_sync_token_pool`. Required: **`MYSO_POC_VAULT_DIRECTORY_ID`**, package, config, registry.
+
+**Chain submission checklist (actually hitting Move):**
+
+1. Set **`MYSO_INTEGRATION_ENABLED=true`** and fill **`MYSO_POC_PACKAGE_ID`**, **`MYSO_POC_CONFIG_ID`**, **`MYSO_POC_REGISTRY_ID`**, **`MYSO_POC_VAULT_DIRECTORY_ID`**, **`MYSOCIAL_RPC_URL`**, and oracle key (**`MYSO_ORACLE_PRIVATE_KEY`** or mnemonic via `myso_wallet`).
+2. Ensure the signing address matches **`PoCConfig.oracle_address`** on chain (use **`MYSO_POC_STRICT_ORACLE=true`** to fail client init if it does not).
+3. Publish via dripdrop + `create_post`; the oracle worker submits PoC from `PostCreatedEvent` / resolution jobs — there is no client `POST /upload`.
+4. Optionally set **`MYSO_POC_REQUIRE_TX_WHEN_POST_ID=true`** in production so a missing or failed submission returns **502** (sync) or marks the streaming job **failed** instead of completing with `tx_hash=null`.
+5. Optional **`MYSO_POC_FAIL_LIFESPAN_ON_MYS_MISCONFIG=true`**: refuse to boot if integration is on but the client cannot initialize (missing IDs, strict oracle, wallet error).
+6. **`GET /health`** includes a **`mysocial`** object (`integration_requested`, `client_active`, `oracle_authorized`, `ready_for_submission`). **`GET /readyz`** returns **503** when the database is down or when integration is requested but the oracle is not ready to submit.
+
+- **Prefetch:** uploads with `post_id` call `myso_getObject` and return **409** when the post still has active PoC data (`poc_outcome` ≠ none, populated redirect option, badge snapshot/object). After a dispute **clear**, fields are empty and analysis may run again. Set **`MYSO_POC_ALLOW_FORCE_RESUBMIT=true`** *and* pass `force_reanalyze=true` only for controlled operator reruns (bypasses that preflight).
+- **`MYSO_POC_REDIRECT_TARGET`:** `wallet` (0) vs `escrow` (1) for Move `derivative_redirection_target`.
+- **`MYSO_POC_CONFIG_CACHE_TTL_SECONDS`:** how long parsed `PoCConfig` stays in memory before refreshing from RPC (limits, thresholds, `max_reasoning_length`, etc.).
+
+Oracle composition/resolution jobs persist chain-aligned scores on oracle tables. Similarity matches still use **`similarity_score`** (0–1) plus optional **`similarity_score_percent`** (0–100) internally.
+
+See `env.example` for variable names and `app/config.py` for defaults.
 
 ## 📋 API Endpoints
 
@@ -185,33 +236,12 @@ curl -X POST "http://localhost:8000/upload" \
 | Method | Endpoint | Description |
 |--------|----------|-------------|
 | `GET` | `/` | API information |
-| `GET` | `/health` | System health check |
-| `POST` | `/upload` | Upload and analyze media |
-| `GET` | `/media/{id}/matches` | Get similarity matches |
+| `GET` | `/health` | System health check (includes `mysocial` payload when available) |
+| `GET` | `/readyz` | Readiness probe: DB + optional MySocial oracle gate (**503** if not ready) |
 | `GET` | `/stats` | System statistics |
+| `*` | `/oracle/*` | Oracle REST (pending assets, disputes, composition) |
 
-### Example Upload Response
-
-```json
-{
-  "media_id": "123e4567-e89b-12d3-a456-426614174000",
-  "filename": "example.jpg",
-  "content_type": "image/jpeg",
-  "file_size": 2048576,
-  "file_hash": "a1b2c3d4...",
-  "storage_uri": "gs://bucket/path/file.jpg",
-  "matches": [
-    {
-      "media_id": "other-media-id",
-      "similarity_score": 0.95,
-      "match_type": "embedding",
-      "confidence_level": "high"
-    }
-  ],
-  "processing_status": "completed",
-  "message": "Found 1 high-confidence match - possible derivative content"
-}
-```
+Video upload lives on **dripdrop-backend** (`POST /v1/videos/uploads`). PoC has no multipart upload API.
 
 ## 🔧 Architecture Deep Dive
 
@@ -244,6 +274,35 @@ Implements Shazam-style spectral peak pair hashing:
 4. **Hash Generation** - Frequency pair + time delta hashing
 5. **Matching** - Time offset clustering for robustness
 
+**Pipeline:** Steps **1–4** run together in one analysis pass per audio file (`AudioFingerprinter.fingerprint_audio`). Step **5** is separate: it runs at similarity time when `match_fingerprints` compares the query constellation to unpickled `fingerprint_data` from corpus candidates (`verify_constellation_against_blob` → `find_verified_fingerprint_hits`). **Mel fallback:** If `fingerprint_audio_with_blob` catches an error from that primary pipeline, it stores a coarse mel-hash and an **empty** constellation pickle—steps **2–4** are skipped and step **5** verification cannot run for that artifact until a full fingerprint succeeds.
+
+**Query-time behavior:** Steps **1–4** run on every uploaded or embedded audio track. The oracle stores a composite lookup key (`fp_hash`) plus pickled constellation tuples in `audio_fingerprints.fingerprint_data`. Similarity search loads **candidates** that share that `fp_hash`, then applies **step 5** (`match_fingerprints`): agreeing sub-hashes vote on a time offset, and a corpus hit is recorded only after this verification. Reported fingerprint similarity comes from verified confidence (not from “same fp_hash” alone). PostgreSQL holds authoritative rows and blobs; any Redis fingerprint keys are non-authoritative legacy cache.
+
+| Step | Responsibility |
+|------|----------------|
+| 1–4 (ingest + query audio) | [`app/services/fingerprint.py`](app/services/fingerprint.py) (`AudioFingerprinter`, `fingerprint_audio_with_blob`) |
+| Candidate rows | [`app/core/database.py`](app/core/database.py) `search_fingerprint_rows` |
+| Step 5 verify | [`app/services/fingerprint.py`](app/services/fingerprint.py) (`verify_constellation_against_blob`, `find_verified_fingerprint_hits`, …) |
+
+#### Inspecting `audio_fingerprints` in PostgreSQL
+
+- **`fp_hash`** — Exactly **40 hexadecimal characters** (SHA-1 digest). This is the stable lookup key you compare across rows or logs.
+- **`fingerprint_data`** — **`BYTEA`**: Python **pickle** of constellation tuples. Tools that show BYTEA as hex often display only the first bytes — strings like **`80055D942E`** are typically **pickle protocol framing**, not a second “fingerprint ID”. Ignore short hex previews here; rely on **`fp_hash`** or decode blobs only via [`unpickle_fingerprint_hashes`](app/services/fingerprint.py) in application code.
+
+Sanity check on a row:
+
+```sql
+SELECT fp_hash,
+       length(fp_hash) AS fp_hash_len,
+       octet_length(fingerprint_data) AS blob_octets,
+       encode(substring(fingerprint_data from 1 for 8), 'hex') AS blob_prefix_hex
+FROM audio_fingerprints
+ORDER BY created_at DESC
+LIMIT 5;
+```
+
+Expect **`fp_hash_len = 40`**. **`blob_prefix_hex`** starting with `8005` / `8004` is normal for pickle; it is not meant to equal `fp_hash`.
+
 ### Multi-Modal Processing Pipeline
 
 ```mermaid
@@ -254,11 +313,12 @@ graph TD
     B -->|Video| E[Frame + Audio Extract]
     
     C --> F[Vector Search]
-    D --> G[Hash Lookup]
+    D --> G[Candidate lookup by fp_hash]
+    G --> V[Constellation verify + offset clustering]
+    V --> I[Similarity Matches]
     E --> H[Batch Process]
     
-    F --> I[Similarity Matches]
-    G --> I
+    F --> I
     H --> I
     
     I --> J[Confidence Scoring]

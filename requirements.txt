@@ -2,6 +2,7 @@
 fastapi>=0.104.1
 uvicorn[standard]>=0.24.0
 pydantic>=2.5.0
+websockets>=12.0  # WebSocket support for progress streaming
 
 # Audio processing and fingerprinting
 librosa>=0.10.1
@@ -28,11 +29,16 @@ psycopg2-binary>=2.9.9
 redis>=5.0.1
 sqlalchemy>=2.0.23
 alembic>=1.13.0  # For database migrations
+pgvector>=0.2.0  # PostgreSQL vector extension for embeddings
 
 # Cloud storage
 google-cloud-storage>=2.10.0
 boto3>=1.29.0  # For S3-compatible storage
 requests>=2.31.0
+
+# Blockchain/Crypto — install separately on Python 3.10–3.13:
+#   pip install -r requirements-blockchain.txt
+# (coincurve/bip-utils do not build on Python 3.14+ yet)
 
 # Development and testing
 pytest>=7.4.3
@@ -45,6 +51,7 @@ python-json-logger>=2.0.7
 
 # Environment management
 python-dotenv>=1.0.0
+pyyaml>=6.0.1
 
 # Additional utilities
 python-multipart>=0.0.6  # For file uploads

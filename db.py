@@ -182,17 +182,15 @@ def insert_media_file(
     content_type: str,
     file_size: int,
     file_hash: str,
-    upload_user_id: Optional[str] = None,
-    upload_ip: Optional[str] = None,
-    status: str = "processing"
+    status: str = "processing",
 ):
     """Insert a new media file record."""
     sql = """
     INSERT INTO media_files (
         media_id, filename, original_filename, content_type, file_size, 
-        file_hash, upload_user_id, upload_ip, status
+        file_hash, status
     )
-    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+    VALUES (%s, %s, %s, %s, %s, %s, %s)
     ON CONFLICT (media_id) DO UPDATE SET
         filename = EXCLUDED.filename,
         original_filename = EXCLUDED.original_filename,
@@ -205,10 +203,18 @@ def insert_media_file(
     try:
         with get_db_connection() as conn:
             with conn.cursor() as cur:
-                cur.execute(sql, (
-                    media_id, filename, original_filename, content_type, 
-                    file_size, file_hash, upload_user_id, upload_ip, status
-                ))
+                cur.execute(
+                    sql,
+                    (
+                        media_id,
+                        filename,
+                        original_filename,
+                        content_type,
+                        file_size,
+                        file_hash,
+                        status,
+                    ),
+                )
                 conn.commit()
         
         logger.info("Media file record inserted", 
@@ -374,15 +380,15 @@ def get_similarity_matches(
 # Blockchain attribution functions
 def insert_attribution_record(
     media_id: str,
-    blockchain_tx_hash: Optional[str] = None,
-    blockchain_address: Optional[str] = None,
+    tx_hash: Optional[str] = None,
+    wallet_address: Optional[str] = None,
     attribution_type: str = "original",
     proof_data: Optional[Dict] = None
 ):
     """Insert a blockchain attribution record."""
     sql = """
     INSERT INTO attribution_records (
-        media_id, blockchain_tx_hash, blockchain_address, 
+        media_id, tx_hash, wallet_address, 
         attribution_type, proof_data
     )
     VALUES (%s, %s, %s, %s, %s)
@@ -391,7 +397,7 @@ def insert_attribution_record(
         with get_db_connection() as conn:
             with conn.cursor() as cur:
                 cur.execute(sql, (
-                    media_id, blockchain_tx_hash, blockchain_address,
+                    media_id, tx_hash, wallet_address,
                     attribution_type, extras.Json(proof_data) if proof_data else None
                 ))
                 conn.commit()
@@ -407,7 +413,7 @@ def insert_attribution_record(
 def get_attribution_records(media_id: str) -> List[Dict]:
     """Get attribution records for a media file."""
     sql = """
-    SELECT blockchain_tx_hash, blockchain_address, attribution_type, 
+    SELECT tx_hash, wallet_address, attribution_type, 
            proof_data, created_at
     FROM attribution_records 
     WHERE media_id = %s

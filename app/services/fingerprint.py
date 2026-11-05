@@ -2,11 +2,12 @@ import numpy as np
 import librosa
 import hashlib
 import structlog
-from typing import List, Tuple, Dict, Optional, Set
-from scipy import signal
+from dataclasses import dataclass
+from typing import List, Tuple, Dict, Optional
 from collections import defaultdict
 import pickle
-import os
+
+from app.models.media import ConfidenceLevel
 
 logger = structlog.get_logger()
 
@@ -20,6 +21,29 @@ MIN_HASH_TIME_DELTA = 0
 MAX_HASH_TIME_DELTA = 200
 FAN_VALUE = 5
 FINGERPRINT_REDUCTION = 20
+# README step 5: minimum agreeing constellation hashes before offset clustering counts as a match.
+DEFAULT_MIN_CONSTELLATION_MATCH_HASHES = 5
+# Stored fp_hash column: SHA-1 hexdigest length (primary composite key).
+AUDIO_FP_HASH_HEX_LEN = 40
+
+
+def normalize_audio_fp_hash(fp_hash: str) -> str:
+    """
+    Validate and normalize fp_hash for audio_fingerprints rows.
+
+    Exactly AUDIO_FP_HASH_HEX_LEN lowercase hex digits (SHA-1 from fingerprint_audio_with_blob).
+    """
+    if fp_hash is None or not isinstance(fp_hash, str):
+        raise ValueError("fp_hash must be a non-empty string")
+    h = fp_hash.strip().lower()
+    if len(h) != AUDIO_FP_HASH_HEX_LEN:
+        raise ValueError(
+            f"fp_hash must be exactly {AUDIO_FP_HASH_HEX_LEN} hex characters (SHA-1); got {len(h)}"
+        )
+    if not all(c in "0123456789abcdef" for c in h):
+        raise ValueError("fp_hash must contain only hexadecimal digits")
+    return h
+
 
 class AudioFingerprinter:
     """Enhanced audio fingerprinting using spectral peak pair hashing."""
@@ -73,12 +97,12 @@ class AudioFingerprinter:
             # Generate hash pairs
             hashes = self._generate_hash_pairs(constellation)
             
-            # Create primary hash for quick lookup
-            primary_hash = self._create_primary_hash(hashes)
-            
+            duration_sec = float(len(y) / sr)
+            primary_hash = self._create_primary_hash(hashes, duration_sec=duration_sec)
+
             logger.info("Audio fingerprinting completed", 
                        file_path=file_path,
-                       duration=len(y)/sr,
+                       duration=duration_sec,
                        peaks_found=len(peaks),
                        hashes_generated=len(hashes),
                        primary_hash=primary_hash)
@@ -241,17 +265,25 @@ class AudioFingerprinter:
             logger.error("Hash creation failed", f1=f1, f2=f2, time_delta=time_delta, error=str(e))
             raise
     
-    def _create_primary_hash(self, hashes: List[Tuple]) -> str:
-        """Create primary hash for quick database lookup."""
+    def _create_primary_hash(self, hashes: List[Tuple], duration_sec: float = 0.0) -> str:
+        """Composite lookup key: sampled constellation hashes plus count and duration (reduces silence collisions)."""
         try:
             if not hashes:
                 return hashlib.sha1(b"empty").hexdigest()
-            
-            # Take first few hashes and create composite hash
-            primary_hashes = [h[0] for h in hashes[:FINGERPRINT_REDUCTION]]
-            combined_hash = "|".join(sorted(primary_hashes))
-            
-            return hashlib.sha1(combined_hash.encode()).hexdigest()
+
+            n = len(hashes)
+            parts = [h[0] for h in hashes[:FINGERPRINT_REDUCTION]]
+            if n > FINGERPRINT_REDUCTION:
+                stride = max(1, (n - FINGERPRINT_REDUCTION) // max(1, FINGERPRINT_REDUCTION))
+                idx = FINGERPRINT_REDUCTION
+                max_parts = FINGERPRINT_REDUCTION * 2
+                while idx < n and len(parts) < max_parts:
+                    parts.append(hashes[idx][0])
+                    idx += stride
+
+            sorted_digest = "|".join(sorted(parts))
+            payload = f"{n}|{duration_sec:.6f}|{sorted_digest}"
+            return hashlib.sha1(payload.encode()).hexdigest()
             
         except Exception as e:
             logger.error("Primary hash creation failed", error=str(e))
@@ -324,31 +356,44 @@ class AudioFingerprinter:
 # Global fingerprinter instance
 _fingerprinter = AudioFingerprinter()
 
-def fingerprint_audio(file_path: str) -> str:
+def fingerprint_audio_with_blob(file_path: str) -> Tuple[str, Optional[bytes]]:
     """
-    Legacy function for backward compatibility.
-    Generate simple hash for audio file.
+    Primary lookup hash plus pickled detailed constellation hashes for BYTEA storage.
     """
     try:
-        logger.info("Generating simple audio fingerprint", file_path=file_path)
-        
-        # Generate detailed fingerprint
+        logger.info("Generating audio fingerprint with blob", file_path=file_path)
         primary_hash, detailed_hashes = _fingerprinter.fingerprint_audio(file_path)
-        
-        return primary_hash
-        
+        logger.debug(
+            "Primary fingerprint hash computed",
+            fp_hash_prefix=primary_hash[:12],
+            fp_hash_len=len(primary_hash),
+        )
+        blob = pickle.dumps(detailed_hashes, protocol=pickle.HIGHEST_PROTOCOL)
+        return primary_hash, blob
     except Exception as e:
-        logger.error("Simple fingerprinting failed", file_path=file_path, error=str(e))
-        # Fallback to basic hash
+        logger.error("Audio fingerprinting failed", file_path=file_path, error=str(e))
         try:
             y, sr = librosa.load(file_path, sr=DEFAULT_SAMPLE_RATE, mono=True)
             S = np.abs(librosa.stft(y))
             S = librosa.feature.melspectrogram(S=S, sr=sr)
             fp = hashlib.sha1(S.tobytes()).hexdigest()
-            return fp
+            empty = pickle.dumps([], protocol=pickle.HIGHEST_PROTOCOL)
+            logger.warning(
+                "Mel-spectrogram fallback: constellation steps 2–4 skipped; fingerprint_data pickle empty; "
+                "step 5 verification unavailable until full fingerprint succeeds",
+                file_path=file_path,
+                original_error=str(e),
+            )
+            return fp, empty
         except Exception as fallback_error:
             logger.error("Fallback fingerprinting failed", error=str(fallback_error))
             raise
+
+
+def fingerprint_audio(file_path: str) -> str:
+    """Generate primary fingerprint hash for audio (compatibility wrapper)."""
+    h, _ = fingerprint_audio_with_blob(file_path)
+    return h
 
 def detailed_fingerprint_audio(file_path: str) -> Tuple[str, List[Tuple]]:
     """
@@ -392,6 +437,105 @@ def match_audio_fingerprints(query_file: str, target_file: str) -> Dict:
                     query_file=query_file, target_file=target_file, error=str(e))
         return {"match": False, "error": str(e)}
 
+
+def unpickle_fingerprint_hashes(blob: Optional[bytes]) -> List[Tuple]:
+    """Decode BYTEA fingerprint_data into constellation hash tuples."""
+    if not blob:
+        return []
+    try:
+        data = pickle.loads(blob)
+        return data if isinstance(data, list) else []
+    except Exception as e:
+        logger.warning("Failed to unpickle fingerprint_data", error=str(e))
+        return []
+
+
+def verify_constellation_against_blob(
+    query_hashes: List[Tuple],
+    corpus_blob: Optional[bytes],
+    *,
+    min_matching_hashes: int = DEFAULT_MIN_CONSTELLATION_MATCH_HASHES,
+) -> Dict:
+    """
+    README step 5 at query time: time-offset clustering between query constellation and corpus blob.
+    Returns match_fingerprints dict plus reason when constellation data is missing.
+    """
+    corpus_hashes = unpickle_fingerprint_hashes(corpus_blob)
+    if not query_hashes or not corpus_hashes:
+        return {
+            "match": False,
+            "confidence": 0.0,
+            "matching_hashes": 0,
+            "total_query_hashes": len(query_hashes),
+            "offset": None,
+            "reason": "missing_constellation_data",
+        }
+    return _fingerprinter.match_fingerprints(
+        query_hashes, corpus_hashes, min_matching_hashes=min_matching_hashes
+    )
+
+
+def constellation_verdict_to_similarity_score(verdict: Dict) -> float:
+    """Map verified constellation match to 0–1 similarity for PoC / MediaMatch."""
+    if not verdict.get("match"):
+        return 0.0
+    return float(min(1.0, max(0.0, verdict.get("confidence", 0.0))))
+
+
+@dataclass(frozen=True)
+class VerifiedFingerprintHit:
+    corpus_media_id: str
+    verdict: Dict
+    similarity_score: float
+    confidence_level: ConfidenceLevel
+
+
+def confidence_level_from_constellation_verdict(verdict: Dict) -> ConfidenceLevel:
+    if not verdict.get("match"):
+        return ConfidenceLevel.LOW
+    conf = float(verdict.get("confidence") or 0.0)
+    mh = int(verdict.get("matching_hashes") or 0)
+    if conf >= 0.55 or mh >= 25:
+        return ConfidenceLevel.HIGH
+    if conf >= 0.30 or mh >= 12:
+        return ConfidenceLevel.MEDIUM
+    return ConfidenceLevel.LOW
+
+
+def find_verified_fingerprint_hits(
+    *,
+    query_hashes: List[Tuple],
+    candidate_rows: List[Tuple[str, float, Optional[bytes]]],
+    query_media_id: str,
+) -> List[VerifiedFingerprintHit]:
+    """Exclude self rows; verify query constellation against each corpus blob."""
+    hits: List[VerifiedFingerprintHit] = []
+    for corpus_media_id, _offset_seconds, corpus_blob in candidate_rows:
+        if corpus_media_id == query_media_id:
+            continue
+        verdict = verify_constellation_against_blob(query_hashes, corpus_blob)
+        if not verdict.get("match"):
+            continue
+        sim = constellation_verdict_to_similarity_score(verdict)
+        hits.append(
+            VerifiedFingerprintHit(
+                corpus_media_id=corpus_media_id,
+                verdict=verdict,
+                similarity_score=sim,
+                confidence_level=confidence_level_from_constellation_verdict(verdict),
+            )
+        )
+    return hits
+
+
+def audio_embedded_similarity_flags(hits: List[VerifiedFingerprintHit]) -> Tuple[bool, float]:
+    """Video summary: hit flag + best verified similarity (0–1)."""
+    if not hits:
+        return False, 0.0
+    best = max(h.similarity_score for h in hits)
+    return True, float(best)
+
+
 def save_fingerprint_to_file(hashes: List[Tuple], output_path: str):
     """Save detailed fingerprint data to file."""
     try:
@@ -423,5 +567,7 @@ def get_fingerprint_info() -> Dict:
         "peak_threshold": PEAK_THRESHOLD,
         "fan_value": FAN_VALUE,
         "fingerprint_reduction": FINGERPRINT_REDUCTION,
-        "algorithm": "spectral_peak_pair_hashing"
+        "min_constellation_match_hashes": DEFAULT_MIN_CONSTELLATION_MATCH_HASHES,
+        "audio_fp_hash_hex_len": AUDIO_FP_HASH_HEX_LEN,
+        "algorithm": "spectral_peak_pair_hashing",
     }
