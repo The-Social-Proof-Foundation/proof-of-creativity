@@ -42,13 +42,22 @@ from app.services.composition_submission import (
     build_analyze_post_composition_move_call,
 )
 from app.services.media_asset_submission import (
+    ASSET_KIND_SOUND_RECORDING,
+    ASSET_KIND_VISUAL_WORK,
     ORIGINALITY_DERIVATIVE,
     ORIGINALITY_ORIGINAL,
     MediaResolutionResult,
+    USAGE_MUSIC_SOUNDTRACK,
     build_finalize_media_asset_move_call,
     build_submit_media_resolution_move_call,
-    default_rights_payload,
+    audio_rights_from_intent,
     usage_permitted,
+    verified_visual_registration_rights,
+)
+from app.services.source_access import fetch_audio_source
+from app.services.standalone_audio_resolution import (
+    fetch_and_analyze_standalone_audio,
+    requires_relationship_review,
 )
 from app.services.derivative_graph_submission import (
     ParentEdgeInput,
@@ -61,20 +70,34 @@ from app.services.derivative_graph_submission import (
 )
 from app.services.post_enforcement_submission import (
     MEDIA_COMPONENT_AUDIO,
+    MEDIA_COMPONENT_IMAGE,
     MEDIA_COMPONENT_VIDEO,
     EmbeddedAssetBinding,
+    audio_edit_recipe_commitment,
     build_record_embedded_bindings_move_call,
     build_refresh_post_usage_decisions_ptb,
     build_submit_candidate_revenue_manifest_move_call,
+    deterministic_binding_id,
 )
 from app.services.media_asset_rights_governance_submission import (
     build_finalize_media_asset_rights_governance_move_call,
     build_implement_media_asset_rights_move_call,
+    build_implement_media_asset_rights_to_beneficiary_move_call,
+    build_implement_media_asset_rights_to_offchain_identity_move_call,
+    build_implement_media_asset_rights_to_onchain_username_move_call,
+    build_implement_media_asset_rights_to_profile_username_move_call,
 )
 from app.chain.bcs_media_asset_claims import (
-    compute_claims_bundle_commitment,
     decode_claims_vector_bcs,
     decode_usage_grants_vector_bcs,
+)
+from app.services.rights_resolution import (
+    TARGET_KIND_OFFCHAIN,
+    TARGET_KIND_ONCHAIN_USERNAME,
+    TARGET_KIND_VAULT,
+    TARGET_KIND_WALLET,
+    commitment_for_resolution,
+    target_from_bundle_row,
 )
 from app.services.indexer_graphql_client import (
     PROPOSAL_STATUS_APPROVED,
@@ -162,9 +185,12 @@ class OracleWorker:
             job_type = job.get("job_type") or "analyze_post"
             attempts = int(job.get("attempts") or 1)
             max_retries = int(getattr(self.settings, "oracle_max_retries", 5) or 5)
+            job_result = None
             try:
                 if job_type == "claim_beneficiary":
-                    await self._process_claim(job)
+                    job_result = await self._process_claim(job)
+                elif job_type == "propose_beneficiary_transfer":
+                    job_result = await self._process_beneficiary_transfer_proposal(job)
                 elif job_type == "resolve_media_asset":
                     await self._process_resolve_media_asset(job)
                 elif job_type == "resolve_post_media":
@@ -185,7 +211,7 @@ class OracleWorker:
                     await self._process_poc_gov_implement_rights(job)
                 else:
                     await self._process_analyze(job)
-                self.jobs.complete(job_id, "completed")
+                self.jobs.complete(job_id, "completed", result=job_result)
             except Exception as exc:
                 if job_type not in {"claim_beneficiary", "resolve_media_asset", "resolve_post_media"} and _is_media_not_ready(exc) and attempts < max_retries:
                     # Exponential backoff: 15s, 30s, 60s, … capped at 120s
@@ -260,6 +286,7 @@ class OracleWorker:
             creator_wallet_address=creator or None,
             transaction_digest=str(post_tx_digest) or None,
             event_sequence=event_sequence,
+            platform_id=post.get("platform_id") or metadata.get("platform_id"),
         )
         submission = self.decisions.build_submission(post, analysis)
 
@@ -387,7 +414,7 @@ class OracleWorker:
             )
 
     async def _process_resolve_post_media(self, job: dict) -> None:
-        """Post-first path: submit resolution from post metadata, finalize asset, enqueue composition."""
+        """Post-first path: submit resolution for each unresolved clip, then compose."""
         payload = job.get("payload") or {}
         if isinstance(payload, str):
             import json
@@ -395,37 +422,76 @@ class OracleWorker:
             payload = json.loads(payload)
 
         post_id = str(payload.get("post_id") or job.get("post_id") or "")
-        fp_hex = str(payload.get("observed_fingerprint_commitment") or "")
-        content_hex = str(payload.get("content_commitment") or "")
-        media_type = int(payload.get("media_type") or 2)
         submitter = str(payload.get("submitter") or "")
+        clips = payload.get("clips")
+        if not isinstance(clips, list) or not clips:
+            fp_hex = str(payload.get("observed_fingerprint_commitment") or "")
+            content_hex = str(payload.get("content_commitment") or "")
+            if fp_hex and content_hex:
+                clips = [
+                    {
+                        "content_commitment": content_hex,
+                        "observed_fingerprint_commitment": fp_hex,
+                        "media_type": int(payload.get("media_type") or 2),
+                    }
+                ]
+            else:
+                clips = []
 
-        if not post_id or not fp_hex or not content_hex:
+        if not post_id or not clips:
             raise ValueError("resolve_post_media requires post_id and fingerprint/content commitments")
 
-        submit_mc = build_submit_media_resolution_move_call(
-            content_commitment=bytes.fromhex(content_hex),
-            observed_fingerprint_commitment=bytes.fromhex(fp_hex),
-            media_type=media_type,
-        )
-        submit_tx = self.submitter.submit_move_call(submit_mc)
+        resolved_ids: list[str] = []
         from app.chain.ptb_builder import extract_created_object_id, extract_event_field
 
-        request_id = extract_event_field(submit_tx, "MediaResolutionRequestedEvent", "request_id")
-        if not request_id:
-            request_id = extract_created_object_id(submit_tx)
-        if not request_id:
-            raise ValueError("resolve_post_media: could not parse MediaResolutionRequestedEvent.request_id")
+        for clip in clips:
+            if not isinstance(clip, dict):
+                continue
+            existing_clip = str(clip.get("media_asset_id") or "")
+            if existing_clip:
+                if existing_clip not in resolved_ids:
+                    resolved_ids.append(existing_clip)
+                continue
+            content_hex = str(clip.get("content_commitment") or payload.get("content_commitment") or "")
+            fp_hex = str(
+                clip.get("observed_fingerprint_commitment")
+                or payload.get("observed_fingerprint_commitment")
+                or ""
+            )
+            media_type = int(clip.get("media_type") or payload.get("media_type") or 2)
+            if not fp_hex or not content_hex:
+                raise ValueError("resolve_post_media requires post_id and fingerprint/content commitments")
 
-        resolved_asset_id = await self._finalize_media_resolution(
-            request_id=request_id,
-            fp_hex=fp_hex,
-            content_hex=content_hex,
-            media_type=media_type,
-            submitter=submitter,
-            payload=payload,
-        )
-        if not resolved_asset_id:
+            submit_mc = build_submit_media_resolution_move_call(
+                content_commitment=bytes.fromhex(content_hex),
+                observed_fingerprint_commitment=bytes.fromhex(fp_hex),
+                media_type=media_type,
+            )
+            submit_tx = self.submitter.submit_move_call(submit_mc)
+            request_id = extract_event_field(submit_tx, "MediaResolutionRequestedEvent", "request_id")
+            if not request_id:
+                request_id = extract_created_object_id(submit_tx)
+            if not request_id:
+                raise ValueError("resolve_post_media: could not parse MediaResolutionRequestedEvent.request_id")
+
+            clip_payload = dict(payload)
+            clip_payload.update(clip)
+            resolved_asset_id = await self._finalize_media_resolution(
+                request_id=request_id,
+                fp_hex=fp_hex,
+                content_hex=content_hex,
+                media_type=media_type,
+                submitter=submitter,
+                payload=clip_payload,
+            )
+            if not resolved_asset_id:
+                raise ValueError(f"resolve_post_media: finalize produced no asset id for post {post_id}")
+            if resolved_asset_id not in resolved_ids:
+                resolved_ids.append(str(resolved_asset_id))
+
+        existing = [str(a) for a in (payload.get("existing_media_asset_ids") or []) if a]
+        media_asset_ids = existing + [a for a in resolved_ids if a not in existing]
+        if not media_asset_ids:
             raise ValueError(f"resolve_post_media: finalize produced no asset id for post {post_id}")
 
         job_id = self.jobs.enqueue(
@@ -433,16 +499,17 @@ class OracleWorker:
             post_id,
             job_type="analyze_composition",
             payload={
-                "media_asset_ids": [resolved_asset_id],
+                "media_asset_ids": media_asset_ids,
                 "spt_id": payload.get("spt_id"),
                 "tx_digest": payload.get("tx_digest"),
+                "platform_id": payload.get("platform_id"),
             },
         )
         logger.info(
             "Enqueued analyze_composition after resolve_post_media",
             network=self.network,
             post_id=post_id,
-            asset_id=resolved_asset_id,
+            asset_id=media_asset_ids[0],
             job_id=job_id,
         )
 
@@ -457,7 +524,7 @@ class OracleWorker:
         payload: dict,
     ) -> str:
         """Run finalize_media_asset for a resolution request; return canonical MediaAsset.id."""
-        if _pending_first_enabled():
+        if _pending_first_enabled() and media_type != 3:
             await self._process_resolve_media_asset_pending_first(
                 request_id=request_id,
                 fp_hex=fp_hex,
@@ -489,6 +556,25 @@ class OracleWorker:
         originality = ORIGINALITY_DERIVATIVE if link_existing else ORIGINALITY_ORIGINAL
         lineage = link_existing if link_existing else None
 
+        if link_existing:
+            existing_rights = self.media_assets.get(self.network, str(link_existing)) or {}
+            rights_payload = existing_rights.get("rights_json") or {}
+            if not rights_payload.get("claims") or not rights_payload.get("usage_grants"):
+                raise ValueError("dedup target has no verified rights snapshot")
+        elif media_type == 3:
+            rights_payload = audio_rights_from_intent(
+                intent=dict(payload.get("rights_intent") or {}),
+                wallet_signature=str(payload.get("wallet_signature") or ""),
+                submitter=submitter,
+                content_commitment_hex=content_hex,
+            )
+        else:
+            rights_payload = verified_visual_registration_rights(
+                submitter=submitter,
+                content_commitment_hex=content_hex,
+                fingerprint_commitment_hex=fp_hex,
+            )
+
         resolution = MediaResolutionResult(
             request_id=request_id,
             content_commitment=bytes.fromhex(content_hex) if content_hex else b"",
@@ -498,6 +584,9 @@ class OracleWorker:
             link_to_existing_id=link_existing,
             originality_status=originality,
             lineage_parent_id=lineage,
+            asset_kind=(ASSET_KIND_SOUND_RECORDING if media_type == 3 else ASSET_KIND_VISUAL_WORK),
+            claims=list(rights_payload.get("claims") or []),
+            usage_grants=list(rights_payload.get("usage_grants") or []),
             dedup_matched=bool(link_existing),
         )
         move_call = build_finalize_media_asset_move_call(resolution)
@@ -512,7 +601,34 @@ class OracleWorker:
         if not resolved_asset_id:
             resolved_asset_id = link_existing or request_id
 
-        rights_payload = default_rights_payload(submitter)
+        if link_existing:
+            self.fingerprint_obs.record(
+                self.network,
+                {
+                    "fingerprint_commitment": fp_hex,
+                    "content_commitment": content_hex,
+                    "media_asset_id": resolved_asset_id,
+                    "request_id": request_id,
+                    "media_type": media_type,
+                    "submitter": submitter,
+                },
+            )
+            await event_bus.publish(
+                "media_asset.resolved",
+                {
+                    "network": self.network,
+                    "request_id": request_id,
+                    "asset_id": resolved_asset_id,
+                    "linked_existing": True,
+                    "tx_digest": tx_digest,
+                },
+            )
+            return str(resolved_asset_id)
+
+        # Original works must expose a resolved policy before product use is allowed.
+        self.submitter.submit_move_call(
+            build_materialize_initial_resolved_policy_move_call(str(resolved_asset_id))
+        )
         claim_creators = [
             c["claimant"]
             for c in rights_payload.get("claims", [])
@@ -578,6 +694,38 @@ class OracleWorker:
 
         if not request_id or not fp_hex:
             raise ValueError("resolve_media_asset requires request_id and observed_fingerprint_commitment")
+
+        if media_type == 3:
+            public_url = str(
+                payload.get("source_url")
+                or payload.get("sourceUrl")
+                or (payload.get("media_urls") or [None])[0]
+                or ""
+            ) or None
+            source_access = await fetch_audio_source(
+                content_commitment=f"0x{content_hex.removeprefix('0x')}",
+                resolution_request_id=request_id,
+                platform_id=payload.get("platform_id"),
+                public_url=public_url,
+            )
+            source_url = str(source_access.get("sourceUrl") or "")
+            if not source_url:
+                raise MediaNotReadyError("audio-source-lease", message="audio source lease missing URL")
+            analysis = await fetch_and_analyze_standalone_audio(
+                source_url=source_url,
+                content_commitment_hex=content_hex,
+                observed_fingerprint_commitment_hex=fp_hex,
+            )
+            known_exact = self.fingerprint_obs.find_asset_for_fingerprint(self.network, fp_hex)
+            if not known_exact and requires_relationship_review(analysis):
+                raise ValueError("standalone audio resembles existing work and requires rights review")
+            owner = str(source_access.get("ownerWalletAddress") or "")
+            if owner and owner != submitter:
+                raise ValueError("audio source owner does not match chain submitter")
+            if source_access.get("rightsIntent"):
+                payload["rights_intent"] = source_access.get("rightsIntent") or {}
+            if source_access.get("walletSignature"):
+                payload["wallet_signature"] = source_access.get("walletSignature") or ""
 
         await self._finalize_media_resolution(
             request_id=request_id,
@@ -662,7 +810,11 @@ class OracleWorker:
         )
 
         resolved_asset_id = child_asset_id or pending_id
-        rights_payload = default_rights_payload(submitter)
+        rights_payload = verified_visual_registration_rights(
+            submitter=submitter,
+            content_commitment_hex=content_hex,
+            fingerprint_commitment_hex=fp_hex,
+        )
         self.fingerprint_obs.record(
             self.network,
             {
@@ -938,6 +1090,137 @@ class OracleWorker:
         )
         self.submitter.submit_move_call(move_call)
 
+    def _rights_implement_move_call(
+        self,
+        *,
+        proposal_id: str,
+        media_asset_id: str,
+        claims: list,
+        usage_grants: list,
+        reasoning: str,
+        evidence_urls: list[str] | None,
+        target: dict,
+    ) -> dict:
+        from app.chain.ptb_builder import extract_event_field
+        from app.services.myso_client import _normalize_object_id
+        from app.services.poc_chain_helpers import (
+            fetch_profile_for_username,
+            fetch_username_beneficiary_by_identity,
+            fetch_username_beneficiary_by_username,
+        )
+
+        kind = int(target["target_kind"])
+        profile = self.submitter.profile
+        committed = _normalize_object_id(str(target["beneficiary_address"]))
+
+        if kind == TARGET_KIND_WALLET:
+            return build_implement_media_asset_rights_move_call(
+                proposal_id=proposal_id,
+                media_asset_id=media_asset_id,
+                claims=claims,
+                usage_grants=usage_grants,
+                reasoning=reasoning,
+                evidence_urls=evidence_urls,
+            )
+
+        if kind == TARGET_KIND_VAULT:
+            vault_id = target.get("vault_id")
+            if not vault_id:
+                raise ValueError(f"kind 1 bundle {proposal_id} is missing target_vault_id")
+            return build_implement_media_asset_rights_to_beneficiary_move_call(
+                profile=profile,
+                proposal_id=proposal_id,
+                media_asset_id=media_asset_id,
+                vault_id=str(vault_id),
+                claims=claims,
+                usage_grants=usage_grants,
+                reasoning=reasoning,
+            )
+
+        if kind == TARGET_KIND_ONCHAIN_USERNAME:
+            username = str(target.get("username") or "")
+            existing = fetch_username_beneficiary_by_username(profile, username)
+            if existing and existing.get("beneficiaryId"):
+                found = _normalize_object_id(str(existing.get("beneficiaryAddress") or ""))
+                if found != committed:
+                    raise ValueError(
+                        f"username beneficiary for {username} does not match the committed address"
+                    )
+                return build_implement_media_asset_rights_to_onchain_username_move_call(
+                    profile=profile,
+                    proposal_id=proposal_id,
+                    media_asset_id=media_asset_id,
+                    beneficiary_id=str(existing["beneficiaryId"]),
+                    username=username,
+                    claims=claims,
+                    usage_grants=usage_grants,
+                    reasoning=reasoning,
+                )
+            registered = fetch_profile_for_username(profile, username)
+            if not registered:
+                raise ValueError(
+                    f"kind 2 username {username} has no beneficiary and no profile"
+                )
+            owner = _normalize_object_id(registered["owner"])
+            if owner != committed:
+                raise ValueError(
+                    f"profile owner for {username} does not match the committed address"
+                )
+            return build_implement_media_asset_rights_to_profile_username_move_call(
+                profile=profile,
+                proposal_id=proposal_id,
+                media_asset_id=media_asset_id,
+                profile_id=registered["profile_id"],
+                username=username,
+                claims=claims,
+                usage_grants=usage_grants,
+                reasoning=reasoning,
+            )
+
+        if kind == TARGET_KIND_OFFCHAIN:
+            username = str(target.get("username") or "")
+            identity_hash = str(target.get("identity_hash") or "")
+            source = int(target["identity_source"]) if target.get("identity_source") is not None else 1
+            existing = fetch_username_beneficiary_by_identity(
+                profile, identity_hash, identity_source=source
+            )
+            beneficiary_id = str(existing["beneficiaryId"]) if existing and existing.get("beneficiaryId") else None
+            if beneficiary_id:
+                found = _normalize_object_id(str(existing.get("beneficiaryAddress") or ""))
+                if found != committed:
+                    raise ValueError(
+                        "identity beneficiary does not match the committed address"
+                    )
+            else:
+                if not username.startswith("x_"):
+                    raise RuntimeError(
+                        "kind 3 identity is not indexed yet; retry implement after the existing vault is visible"
+                    )
+                created = self.submitter.create_username_beneficiary(
+                    username=username,
+                    identity_hash=identity_hash,
+                    required_x_handle=username[2:],
+                )
+                beneficiary_id = extract_event_field(
+                    created, "UsernameBeneficiaryProvisionedEvent", "beneficiary_id"
+                )
+                if not beneficiary_id:
+                    raise RuntimeError(
+                        "username beneficiary was created but its id was not in the transaction events; retry implement"
+                    )
+            return build_implement_media_asset_rights_to_offchain_identity_move_call(
+                profile=profile,
+                proposal_id=proposal_id,
+                media_asset_id=media_asset_id,
+                beneficiary_id=str(beneficiary_id),
+                username=username,
+                claims=claims,
+                usage_grants=usage_grants,
+                reasoning=reasoning,
+            )
+
+        raise ValueError(f"unknown rights target kind {kind}")
+
     async def _process_poc_gov_implement_rights(self, job: dict) -> None:
         import json
 
@@ -968,20 +1251,23 @@ class OracleWorker:
         commitment = bundle["claims_commitment"]
         if isinstance(commitment, memoryview):
             commitment = commitment.tobytes()
-        expected = compute_claims_bundle_commitment(claims, usage_grants)
+        target = target_from_bundle_row(bundle)
+        expected = commitment_for_resolution(claims, usage_grants, target)
         if bytes(commitment) != expected:
             raise ValueError(
-                f"claims commitment mismatch for proposal {proposal_id}: "
+                f"rights resolution commitment mismatch for proposal {proposal_id}: "
                 f"stored={bytes(commitment).hex()} computed={expected.hex()}"
             )
 
-        move_call = build_implement_media_asset_rights_move_call(
+        reasoning = str(payload.get("reasoning") or "DAO approved media asset rights update")
+        move_call = self._rights_implement_move_call(
             proposal_id=proposal_id,
             media_asset_id=media_asset_id,
             claims=claims,
             usage_grants=usage_grants,
-            reasoning=str(payload.get("reasoning") or "DAO approved media asset rights update"),
+            reasoning=reasoning,
             evidence_urls=payload.get("evidence_urls"),
+            target=target,
         )
         self.submitter.submit_move_call(move_call)
         self.rights_bundles.mark_status(proposal_id, "implemented")
@@ -1032,6 +1318,8 @@ class OracleWorker:
             payload = json.loads(payload)
 
         media_asset_ids = payload.get("media_asset_ids") or []
+        media_asset_roles = payload.get("media_asset_roles") or {}
+        audio_edit_recipe = payload.get("audio_edit_recipe")
         if not media_asset_ids:
             post_row = self.posts.get(self.network, post_id) or {}
             media_asset_ids = post_row.get("media_asset_ids") or []
@@ -1066,8 +1354,22 @@ class OracleWorker:
                 continue
 
             rights = row.get("rights_json") or {}
-            if not usage_permitted(rights, USAGE_SOCIAL_POST):
-                raise ValueError(f"asset {asset_id} does not permit social_post usage")
+            media_type = int(row.get("media_type") or 1)
+            role_value = media_asset_roles.get(asset_id) if isinstance(media_asset_roles, dict) else None
+            role = (
+                str(role_value.get("role") or "")
+                if isinstance(role_value, dict)
+                else str(role_value or "")
+            )
+            usage_class = (
+                USAGE_MUSIC_SOUNDTRACK
+                if role == "soundtrack" or media_type == 3
+                else USAGE_SOCIAL_POST
+            )
+            if usage_class == USAGE_MUSIC_SOUNDTRACK and not audio_edit_recipe:
+                raise ValueError("soundtrack asset requires canonical audio_edit_recipe evidence")
+            if not usage_permitted(rights, usage_class):
+                raise ValueError(f"asset {asset_id} does not permit usage class {usage_class}")
 
             rights_version = int(row.get("rights_version") or 1)
             economics_version = int(row.get("economics_version") or 1)
@@ -1077,7 +1379,14 @@ class OracleWorker:
 
             share_bps = 0
             beneficiary = None
-            media_url = media_urls[idx] if idx < len(media_urls) else None
+            # Post display/cache URLs describe the top-level visual output, not the
+            # protected catalog M4A. Soundtrack identity is already resolved and is
+            # bound by the canonical AudioEditRecipe evidence instead.
+            media_url = (
+                None
+                if usage_class == USAGE_MUSIC_SOUNDTRACK
+                else (media_urls[idx] if idx < len(media_urls) else None)
+            )
             if media_url:
                 analysis = await self.analysis.analyze(
                     self.network,
@@ -1101,7 +1410,7 @@ class OracleWorker:
                     asset_id=asset_id,
                     rights_version=rights_version,
                     economics_version=economics_version,
-                    usage_class=USAGE_SOCIAL_POST,
+                    usage_class=usage_class,
                     share_bps=share_bps,
                     beneficiary=beneficiary,
                     source_asset_id=asset_id,
@@ -1116,7 +1425,7 @@ class OracleWorker:
                     "asset_id": asset_id,
                     "container_id": post_id,
                     "container_type": 1,
-                    "usage_class": USAGE_SOCIAL_POST,
+                    "usage_class": usage_class,
                     "position": idx,
                 },
             )
@@ -1152,14 +1461,29 @@ class OracleWorker:
         if not oracle_address and self.submitter.client:
             oracle_address = self.submitter.client.wallet.get_address()
         for idx, asset_id in enumerate(media_asset_ids):
-            component = MEDIA_COMPONENT_VIDEO if int((self.media_assets.get(self.network, str(asset_id)) or {}).get("media_type") or 1) == 2 else MEDIA_COMPONENT_AUDIO
+            media_type = int(
+                (self.media_assets.get(self.network, str(asset_id)) or {}).get("media_type") or 1
+            )
+            usage_class = USAGE_MUSIC_SOUNDTRACK if media_type == 3 else USAGE_SOCIAL_POST
+            component = (
+                MEDIA_COMPONENT_VIDEO
+                if media_type == 2
+                else MEDIA_COMPONENT_AUDIO
+                if media_type == 3
+                else MEDIA_COMPONENT_IMAGE
+            )
             bindings.append(
                 EmbeddedAssetBinding(
-                    binding_id=idx + 1,
+                    binding_id=deterministic_binding_id(post_id, str(asset_id), usage_class),
                     source_asset_id=str(asset_id),
-                    usage_class=USAGE_SOCIAL_POST,
+                    usage_class=usage_class,
                     stem=0,
                     media_component=component,
+                    evidence_commitment=(
+                        audio_edit_recipe_commitment(audio_edit_recipe)
+                        if usage_class == USAGE_MUSIC_SOUNDTRACK
+                        else None
+                    ),
                 )
             )
         if bindings and oracle_address:
@@ -1193,6 +1517,9 @@ class OracleWorker:
                             "usage_class": b.usage_class,
                             "stem": b.stem,
                             "media_component": b.media_component,
+                            "evidence_commitment": (
+                                b.evidence_commitment.hex() if b.evidence_commitment else None
+                            ),
                         }
                         for b in bindings
                     ],
@@ -1237,7 +1564,7 @@ class OracleWorker:
             },
         )
 
-    async def _process_claim(self, job: dict) -> None:
+    async def _process_claim(self, job: dict) -> dict:
         payload = job.get("payload") or {}
         if isinstance(payload, str):
             import json
@@ -1301,8 +1628,59 @@ class OracleWorker:
                 "claimant_address": claimant,
                 "tx_digest": tx,
                 "verifier": verified.verifier,
+                **(result.get("claim_outcome") or {}),
             },
         )
+        return {"tx_digest": tx, **(result.get("claim_outcome") or {})}
+
+    async def _process_beneficiary_transfer_proposal(self, job: dict) -> dict:
+        payload = job.get("payload") or {}
+        if isinstance(payload, str):
+            import json
+
+            payload = json.loads(payload)
+        identity_hash = str(payload.get("identity_hash") or "")
+        beneficiary_id = str(payload.get("beneficiary_id") or "")
+        verified_wallet = str(payload.get("verified_wallet") or "")
+        recipient = str(payload.get("recipient_address") or "")
+        attested_handle = str(payload.get("attested_x_handle") or "")
+        evidence_hash_hex = str(payload.get("evidence_hash") or "")
+        if not all((identity_hash, beneficiary_id, verified_wallet, recipient, attested_handle, evidence_hash_hex)):
+            raise ValueError("beneficiary transfer proposal requires identity, beneficiary, verified wallet and recipient")
+        from app.services.poc_identity import IdentityVerifier
+
+        verified = IdentityVerifier(self.network).verify_beneficiary_transfer(
+            beneficiary_id=beneficiary_id,
+            verified_wallet=verified_wallet,
+            recipient=recipient,
+            identity_hash=identity_hash,
+            attested_x_handle=attested_handle,
+            evidence_hash=evidence_hash_hex,
+        )
+        result = await self.beneficiaries.propose_transfer(
+            beneficiary_id=beneficiary_id,
+            recipient=recipient,
+            evidence_hash=verified.evidence_hash,
+            attested_x_handle=verified.attested_x_handle,
+            identity_hash=identity_hash,
+        )
+        await event_bus.publish(
+            "beneficiary.transfer.proposal.completed",
+            {
+                "network": self.network,
+                "identity_hash": identity_hash,
+                "beneficiary_id": beneficiary_id,
+                "verified_wallet": verified_wallet,
+                "recipient": recipient,
+                "tx_digest": result.get("tx_hash"),
+                "verifier": verified.verifier,
+            },
+        )
+        return {
+            "tx_digest": result.get("tx_hash"),
+            "beneficiary_id": beneficiary_id,
+            "recipient_address": recipient,
+        }
 
 
 async def run_oracle_workers(networks: list[str]) -> None:

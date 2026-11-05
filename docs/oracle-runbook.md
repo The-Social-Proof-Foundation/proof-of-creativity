@@ -2,12 +2,13 @@
 
 ## Overview
 
-The oracle ingests on-chain social events via gRPC checkpoint sync and runs two job types:
+The oracle ingests on-chain social events via gRPC checkpoint sync. It is **chain-wide** (every `platform_id`). DripDrop HMAC is one private-source adapter; unknown platforms use public HTTP.
 
 | Job | Trigger | Chain entry |
 |-----|---------|-------------|
+| `resolve_post_media` | `PostCreatedEvent` with commitments on unresolved clips | oracle `submit_media_resolution` + `finalize_media_asset` |
 | `resolve_media_asset` | `MediaResolutionRequestedEvent` | `media_asset::finalize_media_asset` |
-| `analyze_composition` | `PostCreatedEvent` with `media_asset_ids` | `proof_of_creativity::analyze_post_composition` |
+| `analyze_composition` | All clips resolved (existing ids and/or newly finalized) | `proof_of_creativity::analyze_post_composition` |
 | `poc_gov_finalize_rights` | PoC governance proposal past `votingEndTime` (status=2) | `proof_of_creativity::finalize_media_asset_rights_governance_proposal` |
 | `poc_gov_implement_rights` | Approved rights dispute (status=3) + stored claims bundle | `proof_of_creativity::finalize_media_asset_rights_via_dao` |
 
@@ -22,12 +23,22 @@ Indexed event types:
 - `MediaResolutionRequestedEvent`
 - `MediaAssetResolvedEvent`, `FingerprintLinkedEvent`
 - `MediaAssetUsedEvent`
-- `PostCreatedEvent` (must decode `media_asset_ids`, `composition_status`, `monetization_status`)
+- `PostCreatedEvent` (must decode `platform_id`, `media_asset_ids`, `composition_status`, `monetization_status`)
 - `PostCompositionAnalyzedEvent`
+
+Existing `media_asset_ids` (e.g. soundtrack) do **not** skip resolution of new clips that carry commitments.
+
+## Platform routing
+
+- `chain_posts.platform_id` plus job payload `platform_id`
+- Adapter map: `config/platforms.yaml`, `DRIPDROP_PLATFORM_ID`, `POC_PLATFORM_ADAPTERS`
+- HLS `vid_*` on `VIDEO_MEDIA_HOST` still selects the DripDrop HMAC adapter
+- Audio fingerprint prefixes: canonical `poc:observed_fp:v1:audio_pcm:`, alias `dripdrop:observed_fp:v1:audio_pcm:`
+- Binding evidence: canonical `poc:binding:v1:`, alias helper `dripdrop:binding:v1:`
 
 ## Asset resolution pipeline
 
-1. Client submits `submit_media_resolution`.
+1. Post-first: oracle submits `submit_media_resolution` per unresolved clip. Or a client submits it directly.
 2. Worker loads job payload (`request_id`, fingerprint commitments, `media_type`).
 3. Off-chain dedup via `fingerprint_observations` / vector store → optional `link_to_existing_id`.
 4. Oracle submits `finalize_media_asset` with default or custom `claims` + `usage_grants`.

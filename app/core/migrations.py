@@ -32,8 +32,8 @@ def run_migrations():
         
         logger.info("Running database migrations...")
         
-        # Run migrations to HEAD (latest version)
-        command.upgrade(alembic_cfg, "head")
+        # Upgrade all Alembic heads (a single "head" skips a forked branch).
+        command.upgrade(alembic_cfg, "heads")
         
         logger.info("✅ Database migrations completed successfully")
         return True

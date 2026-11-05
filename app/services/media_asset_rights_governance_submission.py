@@ -51,6 +51,237 @@ def build_finalize_media_asset_rights_governance_move_call(
     }
 
 
+def _object_id(profile: Any, env_key: str, profile_key: str, label: str) -> str:
+    val = os.getenv(env_key, "").strip()
+    if not val and profile is not None:
+        val = str((getattr(profile, "objects", None) or {}).get(profile_key) or "").strip()
+    if not val:
+        raise RuntimeError(f"Missing on-chain object id for {label} ({env_key})")
+    return _normalize_object_id(val)
+
+
+def _rights_call(
+    profile: Any,
+    function: str,
+    arguments: list[Any],
+) -> dict[str, Any]:
+    package = _package_id()
+    if not package and profile is not None:
+        package = str((getattr(profile, "objects", None) or {}).get("poc_package") or "").strip()
+    return {
+        "packageObjectId": package,
+        "module": "proof_of_creativity",
+        "function": function,
+        "typeArguments": [],
+        "arguments": arguments,
+    }
+
+
+def _shared_rights_prefix(
+    profile: Any,
+    *,
+    proposal_id: str,
+    media_asset_id: str,
+    config_id: str | None,
+    governance_registry_id: str | None,
+) -> list[Any]:
+    _ = profile
+    config = config_id or _poc_config_id()
+    registry = governance_registry_id or _governance_registry_id()
+    if not config or not registry:
+        raise RuntimeError("PoC config and governance registry ids are required")
+    return [
+        _normalize_object_id(config),
+        _normalize_object_id(registry),
+        _normalize_object_id(proposal_id),
+        _normalize_object_id(media_asset_id),
+    ]
+
+
+def build_implement_media_asset_rights_to_beneficiary_move_call(
+    *,
+    profile: Any,
+    proposal_id: str,
+    media_asset_id: str,
+    vault_id: str,
+    claims: list[dict[str, Any]],
+    usage_grants: list[dict[str, Any]],
+    reasoning: str,
+    config_id: str | None = None,
+    governance_registry_id: str | None = None,
+    clock_id: str | None = None,
+) -> dict[str, Any]:
+    encoded_claims = [encode_claim(c) for c in claims]
+    encoded_grants = [encode_usage_grant(g) for g in usage_grants]
+    return _rights_call(
+        profile,
+        "implement_media_asset_rights_to_beneficiary",
+        [
+            *_shared_rights_prefix(
+                profile,
+                proposal_id=proposal_id,
+                media_asset_id=media_asset_id,
+                config_id=config_id,
+                governance_registry_id=governance_registry_id,
+            ),
+            _normalize_object_id(vault_id),
+            encoded_claims,
+            encoded_grants,
+            reasoning,
+            _normalize_object_id(clock_id or _clock_object_id()),
+        ],
+    )
+
+
+def build_implement_media_asset_rights_to_onchain_username_move_call(
+    *,
+    profile: Any,
+    proposal_id: str,
+    media_asset_id: str,
+    beneficiary_id: str,
+    username: str,
+    claims: list[dict[str, Any]],
+    usage_grants: list[dict[str, Any]],
+    reasoning: str,
+    config_id: str | None = None,
+    governance_registry_id: str | None = None,
+    clock_id: str | None = None,
+) -> dict[str, Any]:
+    from app.services.poc_chain_helpers import resolve_username_beneficiary_shard_id
+
+    directory_id = _object_id(
+        profile,
+        "MYSO_POC_USERNAME_BENEFICIARY_DIRECTORY_ID",
+        "username_beneficiary_directory",
+        "PoCUsernameBeneficiaryDirectory",
+    )
+    shard_id = resolve_username_beneficiary_shard_id(
+        profile, username, directory_id=directory_id
+    )
+    encoded_claims = [encode_claim(c) for c in claims]
+    encoded_grants = [encode_usage_grant(g) for g in usage_grants]
+    return _rights_call(
+        profile,
+        "implement_media_asset_rights_to_onchain_username",
+        [
+            *_shared_rights_prefix(
+                profile,
+                proposal_id=proposal_id,
+                media_asset_id=media_asset_id,
+                config_id=config_id,
+                governance_registry_id=governance_registry_id,
+            ),
+            directory_id,
+            _normalize_object_id(shard_id),
+            _normalize_object_id(beneficiary_id),
+            encoded_claims,
+            encoded_grants,
+            reasoning,
+            _normalize_object_id(clock_id or _clock_object_id()),
+        ],
+    )
+
+
+def build_implement_media_asset_rights_to_profile_username_move_call(
+    *,
+    profile: Any,
+    proposal_id: str,
+    media_asset_id: str,
+    profile_id: str,
+    username: str,
+    claims: list[dict[str, Any]],
+    usage_grants: list[dict[str, Any]],
+    reasoning: str,
+    config_id: str | None = None,
+    governance_registry_id: str | None = None,
+    clock_id: str | None = None,
+) -> dict[str, Any]:
+    from app.services.poc_chain_helpers import resolve_username_beneficiary_shard_id
+
+    directory_id = _object_id(
+        profile,
+        "MYSO_POC_USERNAME_BENEFICIARY_DIRECTORY_ID",
+        "username_beneficiary_directory",
+        "PoCUsernameBeneficiaryDirectory",
+    )
+    shard_id = resolve_username_beneficiary_shard_id(
+        profile, username, directory_id=directory_id
+    )
+    encoded_claims = [encode_claim(c) for c in claims]
+    encoded_grants = [encode_usage_grant(g) for g in usage_grants]
+    return _rights_call(
+        profile,
+        "implement_media_asset_rights_to_profile_username",
+        [
+            *_shared_rights_prefix(
+                profile,
+                proposal_id=proposal_id,
+                media_asset_id=media_asset_id,
+                config_id=config_id,
+                governance_registry_id=governance_registry_id,
+            ),
+            _normalize_object_id(shard_id),
+            _object_id(
+                profile, "MYSO_USERNAME_REGISTRY_ID", "username_registry", "UsernameRegistry"
+            ),
+            _normalize_object_id(profile_id),
+            encoded_claims,
+            encoded_grants,
+            reasoning,
+            _normalize_object_id(clock_id or _clock_object_id()),
+        ],
+    )
+
+
+def build_implement_media_asset_rights_to_offchain_identity_move_call(
+    *,
+    profile: Any,
+    proposal_id: str,
+    media_asset_id: str,
+    beneficiary_id: str,
+    username: str,
+    claims: list[dict[str, Any]],
+    usage_grants: list[dict[str, Any]],
+    reasoning: str,
+    config_id: str | None = None,
+    governance_registry_id: str | None = None,
+    clock_id: str | None = None,
+) -> dict[str, Any]:
+    from app.services.poc_chain_helpers import resolve_username_beneficiary_shard_id
+
+    directory_id = _object_id(
+        profile,
+        "MYSO_POC_USERNAME_BENEFICIARY_DIRECTORY_ID",
+        "username_beneficiary_directory",
+        "PoCUsernameBeneficiaryDirectory",
+    )
+    shard_id = resolve_username_beneficiary_shard_id(
+        profile, username, directory_id=directory_id
+    )
+    encoded_claims = [encode_claim(c) for c in claims]
+    encoded_grants = [encode_usage_grant(g) for g in usage_grants]
+    return _rights_call(
+        profile,
+        "implement_media_asset_rights_to_offchain_identity",
+        [
+            *_shared_rights_prefix(
+                profile,
+                proposal_id=proposal_id,
+                media_asset_id=media_asset_id,
+                config_id=config_id,
+                governance_registry_id=governance_registry_id,
+            ),
+            directory_id,
+            _normalize_object_id(shard_id),
+            _normalize_object_id(beneficiary_id),
+            encoded_claims,
+            encoded_grants,
+            reasoning,
+            _normalize_object_id(clock_id or _clock_object_id()),
+        ],
+    )
+
+
 def build_implement_media_asset_rights_move_call(
     *,
     proposal_id: str,

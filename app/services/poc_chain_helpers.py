@@ -151,39 +151,138 @@ def fetch_username_beneficiary_fields(
     }
 
 
+def fetch_username_beneficiary_by_username(
+    profile: NetworkProfile,
+    username: str,
+) -> dict[str, Any] | None:
+    query = """
+    query BeneficiaryByUsername($username: String!) {
+      pocUsernameBeneficiaryByUsername(username: $username) {
+        beneficiaryId
+        beneficiaryAddress
+        username
+        creatorIdentitySource
+        creatorIdentityHash
+      }
+    }
+    """
+    try:
+        data = _graphql_post(profile, query, {"username": username})
+    except Exception as exc:
+        logger.warning("username beneficiary lookup failed", username=username, error=str(exc))
+        return None
+    row = data.get("pocUsernameBeneficiaryByUsername")
+    return row if isinstance(row, dict) else None
+
+
+def fetch_username_beneficiary_by_identity(
+    profile: NetworkProfile,
+    identity_hash: str,
+    *,
+    identity_source: int = 1,
+) -> dict[str, Any] | None:
+    from app.chain.move_address import parse_identity_hash
+
+    ih_bytes = parse_identity_hash(identity_hash)
+    query = """
+    query BeneficiaryByIdentity($source: Int!, $hash: String!) {
+      pocUsernameBeneficiaryByIdentity(identitySource: $source, identityHash: $hash) {
+        beneficiaryId
+        beneficiaryAddress
+        username
+        creatorIdentitySource
+        creatorIdentityHash
+      }
+    }
+    """
+    try:
+        data = _graphql_post(
+            profile,
+            query,
+            {"source": int(identity_source), "hash": "0x" + ih_bytes.hex()},
+        )
+    except Exception as exc:
+        logger.warning(
+            "identity beneficiary lookup failed",
+            identity_hash=identity_hash,
+            error=str(exc),
+        )
+        return None
+    row = data.get("pocUsernameBeneficiaryByIdentity")
+    return row if isinstance(row, dict) else None
+
+
+def fetch_username_availability(profile: NetworkProfile, username: str) -> bool:
+    query = """
+    query UsernameAvailable($username: String!) {
+      usernameAvailability(username: $username) { available }
+    }
+    """
+    data = _graphql_post(profile, query, {"username": username})
+    row = data.get("usernameAvailability") or {}
+    return bool(row.get("available"))
+
+
+def fetch_profile_for_username(
+    profile: NetworkProfile,
+    username: str,
+) -> dict[str, str] | None:
+    """On-chain profile object id and owner when the username is registered and has no vault."""
+    query = """
+    query ProfileUsername($username: String!) {
+      usernameRegistryEntry(username: $username) { profileId username }
+    }
+    """
+    try:
+        data = _graphql_post(profile, query, {"username": username})
+    except Exception as exc:
+        logger.warning("username registry lookup failed", username=username, error=str(exc))
+        return None
+    entry = data.get("usernameRegistryEntry")
+    if not isinstance(entry, dict) or not entry.get("profileId"):
+        return None
+    profile_id = str(entry["profileId"])
+    fields = _rpc_get_object_fields(profile.rpc_url, profile_id)
+    owner = fields.get("owner")
+    if not owner:
+        return None
+    return {"profile_id": profile_id, "owner": str(owner), "username": username}
+
+
+def fetch_vault_beneficiary(profile: NetworkProfile, vault_id: str) -> str | None:
+    query = """
+    query VaultById($id: ID!) {
+      pocBeneficiaryVaultByVaultId(vaultId: $id) { vaultId beneficiary }
+    }
+    """
+    try:
+        data = _graphql_post(profile, query, {"id": vault_id})
+    except Exception as exc:
+        logger.warning("vault lookup failed", vault_id=vault_id, error=str(exc))
+        return None
+    vault = data.get("pocBeneficiaryVaultByVaultId") or {}
+    beneficiary = vault.get("beneficiary")
+    return str(beneficiary) if beneficiary else None
+
+
 def resolve_beneficiary_object_for_identity(
     profile: NetworkProfile,
     identity_hash: str,
     *,
     directory_id: str | None = None,
+    identity_source: int = 1,
 ) -> str | None:
-    """Lookup beneficiary shared object id from directory.beneficiary_by_identity (RPC scan fallback)."""
-    from app.chain.move_address import parse_identity_hash
-
-    ih_bytes = parse_identity_hash(identity_hash)
-    directory = directory_id or (profile.objects or {}).get("username_beneficiary_directory")
-    if not directory:
+    """Lookup beneficiary object id from the indexer identity index."""
+    _ = directory_id
+    row = fetch_username_beneficiary_by_identity(
+        profile,
+        identity_hash,
+        identity_source=identity_source,
+    )
+    if not row:
         return None
-
-    fields = _rpc_get_object_fields(profile.rpc_url, str(directory))
-    # Table contents are not exposed via simple getObject; use GraphQL when available.
-    query = """
-    query BeneficiaryByIdentity($hash: String!) {
-      pocUsernameBeneficiaries(filter: { identityHash: $hash }, first: 1) {
-        nodes { beneficiaryId address }
-      }
-    }
-    """
-    try:
-        data = _graphql_post(profile, query, {"hash": ih_bytes.hex()})
-        nodes = (data.get("pocUsernameBeneficiaries") or {}).get("nodes") or []
-        if nodes:
-            return str(nodes[0].get("beneficiaryId") or nodes[0].get("address"))
-    except Exception:
-        pass
-
-    _ = fields  # reserved for future table walk
-    return None
+    beneficiary_id = row.get("beneficiaryId")
+    return str(beneficiary_id) if beneficiary_id else None
 
 
 def get_network_profile(network: str) -> NetworkProfile:

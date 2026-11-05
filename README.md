@@ -170,13 +170,12 @@ uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 
 Visit `http://localhost:8000/docs` for interactive API documentation.
 
-**Basic Upload Test:**
+**Smoke test:**
 ```bash
-curl -X POST "http://localhost:8000/upload" \
-  -H "accept: application/json" \
-  -H "Content-Type: multipart/form-data" \
-  -F "file=@your-image.jpg"
+curl -s http://localhost:8000/health
 ```
+
+Video bytes are **not** uploaded through this API. Clients PUT to dripdrop-backend R2 presigns (`POST /v1/videos/uploads`), then `create_post`. The oracle watches chain events.
 
 ### MySocial Proof of Creativity (oracle)
 
@@ -191,13 +190,12 @@ See [`docs/media-asset-client-flow.md`](docs/media-asset-client-flow.md) for the
 
 ### DripDrop publish path (MediaAsset-centric)
 
-1. **`POST /uploads/presign`** — reservation + `public_url` (same as before).
-2. **`submit_media_resolution`** on-chain — content + fingerprint commitments; oracle enqueues `resolve_media_asset`.
+1. **dripdrop-backend `POST /v1/videos/uploads`** — iOS PUTs parts in parallel to R2 presigned URLs, then `POST /v1/videos/{id}/complete` (commitments).
+2. **`create_post`** with commitments in metadata (empty `media_asset_ids` for video/drop). Oracle later calls `submit_media_resolution`.
 3. **Oracle `finalize_media_asset`** — mint or link deduped `MediaAsset.id`.
-4. **`create_post`** with `media_asset_ids = [asset_id]` and optional `media_urls` for delivery; chain emits `MediaAssetUsedEvent`.
-5. **Oracle `analyze_composition`** — validates usage grants, builds version-pinned `CompositionAnalysis` + `RevenueManifest`, submits `analyze_post_composition` (or `_sync_token_pool` when SPT pool present).
+4. **Oracle `analyze_composition`** — validates usage grants, builds version-pinned `CompositionAnalysis` + `RevenueManifest`.
 
-Legacy path (post-centric `media_urls` + `analyze_post` job) remains for unmigrated clients but should not be used for new integrations.
+PoC does **not** expose `/upload` or `/uploads/presign`. Legacy post-centric `analyze_post` jobs may still exist in the DB for old rows.
 
 ### Basic PoC post E2E flow (legacy post-centric — deprecated)
 
@@ -218,7 +216,7 @@ When `MYSO_INTEGRATION_ENABLED=true`, composition sync uses **`MYSO_TOKEN_REGIST
 
 1. Set **`MYSO_INTEGRATION_ENABLED=true`** and fill **`MYSO_POC_PACKAGE_ID`**, **`MYSO_POC_CONFIG_ID`**, **`MYSO_POC_REGISTRY_ID`**, **`MYSO_POC_VAULT_DIRECTORY_ID`**, **`MYSOCIAL_RPC_URL`**, and oracle key (**`MYSO_ORACLE_PRIVATE_KEY`** or mnemonic via `myso_wallet`).
 2. Ensure the signing address matches **`PoCConfig.oracle_address`** on chain (use **`MYSO_POC_STRICT_ORACLE=true`** to fail client init if it does not).
-3. Pass **`post_id`** on **`POST /upload`** or **`POST /upload/stream`**; without it, the API only runs similarity + DB attribution and **does not** submit a PoC transaction.
+3. Publish via dripdrop + `create_post`; the oracle worker submits PoC from `PostCreatedEvent` / resolution jobs — there is no client `POST /upload`.
 4. Optionally set **`MYSO_POC_REQUIRE_TX_WHEN_POST_ID=true`** in production so a missing or failed submission returns **502** (sync) or marks the streaming job **failed** instead of completing with `tx_hash=null`.
 5. Optional **`MYSO_POC_FAIL_LIFESPAN_ON_MYS_MISCONFIG=true`**: refuse to boot if integration is on but the client cannot initialize (missing IDs, strict oracle, wallet error).
 6. **`GET /health`** includes a **`mysocial`** object (`integration_requested`, `client_active`, `oracle_authorized`, `ready_for_submission`). **`GET /readyz`** returns **503** when the database is down or when integration is requested but the oracle is not ready to submit.
@@ -227,11 +225,7 @@ When `MYSO_INTEGRATION_ENABLED=true`, composition sync uses **`MYSO_TOKEN_REGIST
 - **`MYSO_POC_REDIRECT_TARGET`:** `wallet` (0) vs `escrow` (1) for Move `derivative_redirection_target`.
 - **`MYSO_POC_CONFIG_CACHE_TTL_SECONDS`:** how long parsed `PoCConfig` stays in memory before refreshing from RPC (limits, thresholds, `max_reasoning_length`, etc.).
 
-**Upload query parameters:** `post_id`, optional `spt_pool_id`, `force_reanalyze`, optional `creator_address` (stored on `media_files` for **`original_creator`** resolution from matched corpus ids), **`royalty_free`** (explicit on-chain outcome 4 when PoC integration is enabled), and `upload_to_stream` on `/upload`.
-
-**Responses:** `UploadResponse` includes **`poc_chain_summary`** (media type code, score %, effective threshold %, whether the derivative-redirect path would apply, explicit-outcome flags). Each **`MediaMatch`** includes optional **`similarity_score_percent`** (0–100, same rounding as Move) alongside **`similarity_score`** (0–1 float). Video responses include **`video_attestation`** (visual vs embedded audio), aligned with Move’s **`embedded_audio_only_derivative`**.
-
-**Persistence:** `attribution_records.proof_data` stores **`poc_submission`** (Move args + `move_function`, `resolved_spt_pool_id`, `derivative_redirection_target`, `tx_hash` when submitted), **`poc_chain_summary`**, **`max_similarity_score_u64`**, **`effective_threshold_u64`**, and **`royalty_free_requested`**. Streaming uploads mirror **`poc_submission`** / **`poc_chain_summary`** on Redis completion for WebSocket/HTTP progress clients.
+Oracle composition/resolution jobs persist chain-aligned scores on oracle tables. Similarity matches still use **`similarity_score`** (0–1) plus optional **`similarity_score_percent`** (0–100) internally.
 
 See `env.example` for variable names and `app/config.py` for defaults.
 
@@ -244,32 +238,10 @@ See `env.example` for variable names and `app/config.py` for defaults.
 | `GET` | `/` | API information |
 | `GET` | `/health` | System health check (includes `mysocial` payload when available) |
 | `GET` | `/readyz` | Readiness probe: DB + optional MySocial oracle gate (**503** if not ready) |
-| `POST` | `/upload` | Upload and analyze media |
-| `GET` | `/media/{id}/matches` | Get similarity matches |
 | `GET` | `/stats` | System statistics |
+| `*` | `/oracle/*` | Oracle REST (pending assets, disputes, composition) |
 
-### Example Upload Response
-
-```json
-{
-  "media_id": "123e4567-e89b-12d3-a456-426614174000",
-  "filename": "example.jpg",
-  "content_type": "image/jpeg",
-  "file_size": 2048576,
-  "file_hash": "a1b2c3d4...",
-  "storage_uri": "gs://bucket/path/file.jpg",
-  "matches": [
-    {
-      "media_id": "other-media-id",
-      "similarity_score": 0.95,
-      "match_type": "embedding",
-      "confidence_level": "high"
-    }
-  ],
-  "processing_status": "completed",
-  "message": "Found 1 high-confidence match - possible derivative content"
-}
-```
+Video upload lives on **dripdrop-backend** (`POST /v1/videos/uploads`). PoC has no multipart upload API.
 
 ## 🔧 Architecture Deep Dive
 

@@ -97,14 +97,7 @@ class MediaDimensions(BaseModel):
     sample_rate: Optional[int] = Field(None, description="Audio sample rate")
     channels: Optional[int] = Field(None, description="Number of audio channels")
     format: Optional[str] = Field(None, description="Media format")
-    
-class MediaUploadRequest(BaseModel):
-    """Model for media upload request parameters."""
-    extract_keyframes: bool = Field(default=True, description="Extract keyframes from video")
-    keyframe_rate: int = Field(default=1, ge=1, le=10, description="Keyframes per second")
-    max_duration: float = Field(default=60.0, ge=1.0, le=600.0, description="Max processing duration")
-    generate_thumbnail: bool = Field(default=True, description="Generate thumbnail")
-    
+
 class ProcessingOptions(BaseModel):
     """Model for media processing options."""
     similarity_threshold: float = Field(default=0.7, ge=0.0, le=1.0)

@@ -41,48 +41,25 @@ async def download_media(
     creator_wallet_address: str | None = None,
     transaction_digest: str | None = None,
     event_sequence: int | None = None,
+    platform_id: str | None = None,
 ) -> tuple[str, str]:
     base = temp_dir or os.getenv("TEMP_DIR", "/tmp/proof-of-creativity")
     Path(base).mkdir(parents=True, exist_ok=True)
 
-    client = get_dripdrop_video_client()
-    asset_id = extract_asset_id_from_hls(url, client.media_host)
-    if asset_id and client.enabled:
-        if not (
-            post_object_id
-            and creator_wallet_address
-            and transaction_digest
-            and event_sequence is not None
-        ):
-            raise ValueError(
-                "DripDrop HLS URL requires post_object_id, creator_wallet_address, "
-                "transaction_digest, and event_sequence"
-            )
-        access = await client.source_access(
-            asset_id=asset_id,
-            post_object_id=post_object_id,
-            creator_wallet_address=creator_wallet_address,
-            hls_url=url,
-            transaction_digest=transaction_digest,
-            event_sequence=int(event_sequence),
-        )
-        source_url = access.get("sourceUrl")
-        if not source_url:
-            # Replayed delivery returns no URL — mint again with new delivery via retry
-            access = await client.source_access(
-                asset_id=asset_id,
-                post_object_id=post_object_id,
-                creator_wallet_address=creator_wallet_address,
-                hls_url=url,
-                transaction_digest=transaction_digest,
-                event_sequence=int(event_sequence),
-            )
-            source_url = access.get("sourceUrl")
-        if not source_url:
-            raise MediaNotReadyError(url, message="source-access returned no URL")
-        return await _stream_download(source_url, base, preferred_ext=".bin")
+    from app.services.source_access import fetch_post_source
 
-    return await _stream_download(url, base)
+    source_url = await fetch_post_source(
+        url=url,
+        platform_id=platform_id,
+        post_object_id=post_object_id,
+        creator_wallet_address=creator_wallet_address,
+        transaction_digest=transaction_digest,
+        event_sequence=event_sequence,
+    )
+    preferred = ".bin" if source_url != url or extract_asset_id_from_hls(
+        url, get_dripdrop_video_client().media_host
+    ) else None
+    return await _stream_download(source_url, base, preferred_ext=preferred)
 
 
 async def _stream_download(url: str, base: str, preferred_ext: str | None = None) -> tuple[str, str]:

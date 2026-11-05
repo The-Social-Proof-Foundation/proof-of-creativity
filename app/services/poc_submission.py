@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
 
 from app.models.similarity import MediaMatch, PocChainSummary, TrackMatchSummary, VideoTrackAttestation
 
@@ -131,40 +131,6 @@ def attribution_type_from_chain_summary(summary: PocChainSummary) -> str:
     return "original"
 
 
-def build_upload_attribution_message(matches: List[MediaMatch], summary: Optional[PocChainSummary]) -> str:
-    if summary is None:
-        if not matches:
-            return "No similar content found in corpus."
-        return f"Found {len(matches)} match(es) (PoC chain summary unavailable)."
-
-    if summary.apply_explicit_outcome and summary.explicit_poc_outcome == OUTCOME_ROYALTY_FREE:
-        return (
-            "Submitted explicit royalty-free PoC outcome (on-chain outcome 4); "
-            "see chain for badge and vault behavior."
-        )
-    if summary.would_apply_derivative_redirect:
-        return (
-            f"Chain derivative redirect path: score {summary.highest_similarity_score_u64}/100 "
-            f">= threshold {summary.effective_threshold_u64}/100 with resolvable original_creator."
-        )
-    if (
-        summary.original_creator is None
-        and summary.highest_similarity_score_u64 >= summary.effective_threshold_u64
-        and not summary.apply_explicit_outcome
-    ):
-        return (
-            f"Similarity {summary.highest_similarity_score_u64}/100 meets threshold "
-            f"{summary.effective_threshold_u64}/100 but matched corpus media has no creator_address; "
-            "Move treats this as non-derivative for redirect (original_creator unset)."
-        )
-    if not matches:
-        return "No similar content found in corpus."
-    return (
-        f"Found {len(matches)} match(es); below on-chain derivative threshold "
-        f"({summary.effective_threshold_u64}/100) or no attributable creator."
-    )
-
-
 def build_poc_submission_snapshot(bundle: Dict[str, Any], rpc_result: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     """Merge off-chain bundle with RPC metadata for persistence (proof_data / Redis)."""
     snap = dict(bundle)
@@ -288,34 +254,6 @@ def compose_submission_bundle(
     return pack(score_u64, False, creator if deriv else None, reason)
 
 
-def preview_poc_chain_summary_for_upload(
-    *,
-    media_cat: str,
-    media_type_code: int,
-    matches: List[MediaMatch],
-    video_analysis: Optional["VideoSimilarityAnalysis"],
-    poc_config: Dict[str, Any],
-    royalty_free: bool = False,
-) -> PocChainSummary:
-    """Same bundle/summary as on-chain submit, without RPC (offline attribution messaging)."""
-
-    def resolve_creator(media_ids: List[str]) -> Optional[str]:
-        from app.core.database import lookup_mysocial_creator_for_media_ids
-
-        return lookup_mysocial_creator_for_media_ids(media_ids)
-
-    bundle = compose_submission_bundle(
-        media_kind=media_cat,
-        media_type_code=media_type_code,
-        matches=matches,
-        video_analysis=video_analysis,
-        poc_config=poc_config,
-        resolve_creator=resolve_creator,
-        royalty_free=royalty_free,
-    )
-    return build_poc_chain_summary(bundle, poc_config)
-
-
 def build_video_track_attestation(
     analysis: "VideoSimilarityAnalysis",
     poc_config: Dict[str, Any],
@@ -413,53 +351,3 @@ def build_composition_submission(
         evidence_urls=evidence_urls,
         spt_pool_id=spt_pool_id,
     )
-
-
-def attempt_proof_of_creativity_submission(
-    *,
-    myso_client: Any,
-    post_id: str,
-    media_cat: str,
-    media_type_code: int,
-    matches: List[MediaMatch],
-    video_analysis: Optional["VideoSimilarityAnalysis"],
-    spt_pool_id: Optional[str],
-    royalty_free: bool = False,
-    e2e_override: Optional[Dict[str, Any]] = None,
-) -> Tuple[Dict[str, Any], Optional[VideoTrackAttestation], Dict[str, Any], PocChainSummary]:
-    """Fetch PoC config, compose Move args, submit RPC transaction, return RPC + audit snapshot."""
-
-    def resolve_creator(media_ids: List[str]) -> Optional[str]:
-        from app.core.database import lookup_mysocial_creator_for_media_ids
-
-        return lookup_mysocial_creator_for_media_ids(media_ids)
-
-    cfg = myso_client.get_poc_config()
-    if e2e_override:
-        bundle = compose_e2e_submission_bundle(
-            media_type_code=int(e2e_override.get("media_type") or media_type_code),
-            score=int(e2e_override["score"]),
-            original_creator=e2e_override.get("original_creator"),
-            derivative_target=int(e2e_override.get("derivative_target") or 0),
-            poc_config=cfg,
-            royalty_free=bool(e2e_override.get("royalty_free") or royalty_free),
-        )
-    else:
-        bundle = compose_submission_bundle(
-            media_kind=media_cat,
-            media_type_code=media_type_code,
-            matches=matches,
-            video_analysis=video_analysis,
-            poc_config=cfg,
-            resolve_creator=resolve_creator,
-            royalty_free=royalty_free,
-        )
-    summary = build_poc_chain_summary(bundle, cfg)
-    video_att: Optional[VideoTrackAttestation] = None
-    if media_cat == "video" and video_analysis is not None:
-        video_att = preview_video_track_attestation(video_analysis, cfg)
-        if royalty_free:
-            video_att = video_att.model_copy(update={"embedded_audio_only_derivative_sent": False})
-    res = myso_client.submit_poc_analysis(post_id, spt_pool_id=spt_pool_id, **bundle)
-    snapshot = build_poc_submission_snapshot(bundle, res)
-    return res, video_att, snapshot, summary

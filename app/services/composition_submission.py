@@ -58,19 +58,13 @@ def _package_id() -> str:
     return os.getenv("MYSO_POC_PACKAGE_ID", "").strip()
 
 
-def _struct_type(name: str) -> str:
-    return f"{_package_id()}::media_asset::{name}"
-
-
 def encode_asset_version_commitment(asset: AssetVersionInput) -> dict[str, Any]:
+    """Field map for unsafe_moveCall JSON-to-BCS (no type wrapper)."""
     return {
-        "type": _struct_type("AssetVersionCommitment"),
-        "fields": {
-            "asset_id": _normalize_object_id(asset.asset_id),
-            "rights_version": str(int(asset.rights_version)),
-            "economics_version": str(int(asset.economics_version)),
-            "usage_class": int(asset.usage_class),
-        },
+        "asset_id": _normalize_object_id(asset.asset_id),
+        "rights_version": str(int(asset.rights_version)),
+        "economics_version": str(int(asset.economics_version)),
+        "usage_class": int(asset.usage_class),
     }
 
 
@@ -81,12 +75,9 @@ def build_composition_analysis(
     analyzed_at_ms: int | None = None,
 ) -> dict[str, Any]:
     return {
-        "type": _struct_type("CompositionAnalysis"),
-        "fields": {
-            "analyzed_at": str(analyzed_at_ms or int(time.time() * 1000)),
-            "usage_context": int(usage_context),
-            "assets": [encode_asset_version_commitment(a) for a in assets],
-        },
+        "analyzed_at": str(analyzed_at_ms or int(time.time() * 1000)),
+        "usage_context": int(usage_context),
+        "assets": [encode_asset_version_commitment(a) for a in assets],
     }
 
 
@@ -104,7 +95,7 @@ def build_revenue_manifest(
     manifest_entries: list[dict[str, Any]] = []
     positive = [e for e in entries if int(e.share_bps) > 0]
     if not positive:
-        return {"type": _struct_type("RevenueManifest"), "fields": {"entries": []}}
+        return {"entries": []}
 
     total = sum(int(e.share_bps) for e in positive)
     if total != MANIFEST_BPS_TOTAL:
@@ -146,17 +137,14 @@ def build_revenue_manifest(
         beneficiary = entry.beneficiary or entry.asset_id
         manifest_entries.append(
             {
-                "type": _struct_type("ManifestEntry"),
-                "fields": {
-                    "beneficiary": _normalize_object_id(str(beneficiary)),
-                    "share_bps": str(bps),
-                    "source_asset_id": _move_option_address(entry.source_asset_id or entry.asset_id),
-                    "payout_mode": int(entry.payout_mode or payout_mode),
-                },
+                "beneficiary": _normalize_object_id(str(beneficiary)),
+                "share_bps": str(bps),
+                "source_asset_id": _move_option_address(entry.source_asset_id or entry.asset_id),
+                "payout_mode": int(entry.payout_mode or payout_mode),
             }
         )
 
-    return {"type": _struct_type("RevenueManifest"), "fields": {"entries": manifest_entries}}
+    return {"entries": manifest_entries}
 
 
 def build_analyze_post_composition_move_call(

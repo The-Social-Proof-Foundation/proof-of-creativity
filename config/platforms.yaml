@@ -1,0 +1,6 @@
+# platform_id → source adapter. Unknown ids use public_http.
+# HLS vid_* on the DripDrop media host still selects dripdrop_hmac even without an id.
+# Set DRIPDROP_PLATFORM_ID or POC_PLATFORM_ADAPTERS=0xabc:dripdrop_hmac to pin an on-chain Platform.
+adapters:
+  - platform_id: "*"
+    adapter: public_http

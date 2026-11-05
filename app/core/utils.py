@@ -1,47 +1,11 @@
 import uuid
 import hashlib
 import os
-import tempfile
 import structlog
 from pathlib import Path
 from typing import Optional
 
 logger = structlog.get_logger()
-
-def save_temp_upload(upload_file) -> str:
-    """Save uploaded file to temporary location and return path."""
-    try:
-        suffix = Path(upload_file.filename).suffix if upload_file.filename else ""
-        
-        # Create temporary file with proper suffix
-        temp_fd, temp_path = tempfile.mkstemp(suffix=suffix)
-        
-        try:
-            # Write file content
-            with os.fdopen(temp_fd, 'wb') as f:
-                # Read file content
-                content = upload_file.file.read()
-                f.write(content)
-            
-            # Reset file pointer for potential re-reading
-            upload_file.file.seek(0)
-            
-            logger.info("Saved temporary upload", 
-                       filename=upload_file.filename, temp_path=temp_path, size=len(content))
-            return temp_path
-            
-        except Exception as e:
-            # Clean up file descriptor if writing failed
-            try:
-                os.close(temp_fd)
-            except:
-                pass
-            raise e
-            
-    except Exception as e:
-        logger.error("Failed to save temporary upload", 
-                    filename=getattr(upload_file, 'filename', 'unknown'), error=str(e))
-        raise
 
 def new_media_id() -> str:
     """Generate a new unique media ID."""
@@ -233,54 +197,3 @@ def batch_cleanup_temp_files(file_paths: list[str]) -> int:
         if cleanup_temp_file(file_path):
             cleaned_count += 1
     return cleaned_count
-
-class ProgressFileWrapper:
-    """
-    File wrapper that tracks bytes read for upload progress
-    Used for byte-level progress reporting during R2 uploads
-    """
-    
-    def __init__(self, fileobj, file_size: int, progress_callback: callable):
-        """
-        Initialize progress wrapper
-        
-        Args:
-            fileobj: File object to wrap
-            file_size: Total file size in bytes
-            progress_callback: Callback function(bytes_uploaded: int)
-        """
-        self.fileobj = fileobj
-        self.file_size = file_size
-        self.progress_callback = progress_callback
-        self.bytes_read = 0
-    
-    def read(self, size=-1):
-        """Read from file and update progress"""
-        data = self.fileobj.read(size)
-        
-        if data:
-            self.bytes_read += len(data)
-            
-            # Call progress callback
-            if self.progress_callback:
-                try:
-                    self.progress_callback(self.bytes_read)
-                except Exception as e:
-                    # Don't fail upload if progress callback fails
-                    logger.warning("Progress callback failed", error=str(e))
-        
-        return data
-    
-    def seek(self, *args, **kwargs):
-        """Proxy seek to underlying file"""
-        return self.fileobj.seek(*args, **kwargs)
-    
-    def tell(self):
-        """Proxy tell to underlying file"""
-        return self.fileobj.tell()
-    
-    def __enter__(self):
-        return self
-    
-    def __exit__(self, *args):
-        return self.fileobj.__exit__(*args)

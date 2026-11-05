@@ -171,6 +171,7 @@ class ChainPost(Base):
     network = Column(String(20), primary_key=True)
     post_id = Column(String(128), primary_key=True)
     creator_address = Column(String(128))
+    platform_id = Column(String(128))
     enable_poc = Column(String(10), default="true")
     media_urls = Column(JSONB, default=list)
     media_types = Column(JSONB, default=list)

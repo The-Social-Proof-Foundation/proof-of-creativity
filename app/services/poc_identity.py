@@ -208,6 +208,43 @@ class IdentityVerifier:
             cover_photo_url=cover_photo_url,
         )
 
+    def verify_beneficiary_transfer(
+        self,
+        *,
+        beneficiary_id: str,
+        verified_wallet: str,
+        recipient: str,
+        identity_hash: str | bytes,
+        attested_x_handle: str,
+        evidence_hash: str,
+    ) -> VerifiedClaim:
+        """Recheck live chain state for an identity-service attestation."""
+        fields = fetch_username_beneficiary_fields(self.profile, beneficiary_id)
+        status = normalize_beneficiary_status(fields.get("status"))
+        raw = fields.get("raw") or {}
+        if raw.get("claimed_by") or raw.get("claimed_at"):
+            raise ValueError(f"Beneficiary {beneficiary_id} is already claimed")
+        if status != "ACTIVE":
+            raise ValueError(f"Beneficiary {beneficiary_id} is not ACTIVE (status={status})")
+        ih_bytes = parse_identity_hash(identity_hash)
+        on_chain_hash = fields.get("creator_identity_hash")
+        if not on_chain_hash or parse_identity_hash(str(on_chain_hash)) != ih_bytes:
+            raise ValueError("identity_hash does not match on-chain creator_identity")
+        handle = canonical_registry_username(attested_x_handle.strip().lstrip("@"))
+        required_handle = canonical_registry_username(
+            str(fields.get("required_x_handle") or fields.get("username") or "")
+        )
+        if not required_handle or handle != required_handle:
+            raise ValueError("OAuth username does not match beneficiary required_x_handle")
+        return VerifiedClaim(
+            attested_x_handle=handle,
+            identity_hash=ih_bytes,
+            evidence_hash=parse_identity_hash(evidence_hash),
+            verifier="myso-identity-verification",
+            beneficiary_id=beneficiary_id,
+            wallet=verified_wallet,
+        )
+
     def _verify_x_oauth(self, *, oauth_token: str | None) -> str:
         token = (oauth_token or os.getenv("X_API_BEARER") or "").strip()
         if not token:

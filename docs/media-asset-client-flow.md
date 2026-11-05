@@ -1,6 +1,6 @@
 # MediaAsset-Centric PoC Client Flow
 
-This document describes the V1 end-to-end sequence for DripDrop and other clients after the MediaAsset architecture clean break.
+This document describes the V1 end-to-end sequence for **any MySocial platform**. DripDrop is one storage adapter (HMAC private lease). Other apps work the same if they emit the metadata contract and a fetchable URL.
 
 ## Protocol hierarchy
 
@@ -23,12 +23,32 @@ Rights and economics version bumps on a `MediaAsset` restrict **future** usage/r
 
 ## Client sequence
 
+Default path is **post-first**. The client does not mint a MediaAsset. The oracle submits resolution after `PostCreatedEvent`.
+
 ### 1. Upload representation (off-chain)
 
-- DripDrop: `POST /uploads/presign` → PUT bytes to R2.
-- Compute `content_commitment` and `observed_fingerprint_commitment` (oracle-compatible hashing).
+- Platform-specific (DripDrop: `POST /v1/videos/uploads` → R2 PUTs → `/complete`).
+- Complete response includes `content_commitment` and `observed_fingerprint_commitment`.
+- PoC does not presign or accept multipart uploads.
 
-### 2. Request asset resolution (on-chain)
+### 2. Publish the post
+
+```text
+post::create_post(..., media_asset_ids: [], media_urls, metadata_json, ...)
+```
+
+`metadata_json` contract (either form):
+
+- Clip 0: `content_commitment` + `observed_fingerprint_commitment` (optional `asset_id`)
+- Multi-clip: `media_commitments[]` aligned with `media_urls` (`url`, hex commitments, optional `media_asset_id` / `media_type`)
+
+Already-resolved ids (e.g. soundtrack) may be passed in `media_asset_ids`. The oracle still resolves any clip that has commitments and no id.
+
+Emits `PostCreatedEvent`. Sync stores `platform_id` and enqueues `resolve_post_media`.
+
+### 3. Optional client request path
+
+Any client may still call `submit_media_resolution` (catalog audio, non-post containers). That emits `MediaResolutionRequestedEvent` and enqueues `resolve_media_asset`.
 
 ```text
 media_asset::submit_media_resolution(
@@ -39,9 +59,7 @@ media_asset::submit_media_resolution(
 )
 ```
 
-Emits `MediaResolutionRequestedEvent`. Oracle enqueues `resolve_media_asset`.
-
-### 3. Oracle finalizes asset
+### 4. Oracle finalizes asset
 
 Oracle calls `media_asset::finalize_media_asset` with:
 
@@ -52,28 +70,11 @@ Oracle calls `media_asset::finalize_media_asset` with:
 
 Returns canonical **`MediaAsset.id`** via `MediaAssetResolvedEvent`.
 
-### 4. Create container (post or profile)
-
-**Post:**
-
-```text
-post::create_post(..., media_asset_ids: vector<ID>, ...)
-```
-
-Emits `PostCreatedEvent` + `MediaAssetUsedEvent` per asset. Initial statuses: `composition_status = NONE`, `monetization_status = NONE`.
-
-**Profile picture / cover:**
-
-```text
-profile::update_profile_picture_asset(profile, asset, display_url, clock, ctx)
-profile::update_cover_photo_asset(profile, asset, display_url, clock, ctx)
-```
-
-Validates `UsageGrant` for `PROFILE_PICTURE` / `COVER_PHOTO`. Emits `MediaAssetUsedEvent` + `ProfileMediaAssetUpdatedEvent`.
+Avatars and covers stay URL-only on create/update profile. `update_profile_picture_asset` / `update_cover_photo_asset` remain for a later “bind an existing published work” path.
 
 ### 5. Oracle composition analysis
 
-gRPC sync enqueues `analyze_composition` when `PostCreatedEvent.media_asset_ids` is non-empty.
+After unresolved clips are finalized (or when every clip already has an id), the worker enqueues `analyze_composition`.
 
 Oracle builds:
 
@@ -100,7 +101,7 @@ On tips / SPT fees:
 
 | Helper | Purpose |
 |--------|---------|
-| `build_submit_media_resolution_move_call` | Client upload step |
+| `build_submit_media_resolution_move_call` | Oracle post-first / optional client request |
 | `build_finalize_media_asset_move_call` | Oracle resolution |
 | `build_composition_submission_from_assets` | Oracle composition + manifest |
 | `build_analyze_post_composition_move_call` | Chain submission |

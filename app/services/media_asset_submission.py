@@ -3,8 +3,15 @@
 from __future__ import annotations
 
 import os
+import base64
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
+import hashlib
+import json
 from typing import Any
+
+from nacl.exceptions import BadSignatureError
+from nacl.signing import VerifyKey
 
 from app.chain.move_address import bytes_to_move_hex
 from app.services.myso_client import _clock_object_id, _move_option_address, _normalize_object_id
@@ -40,7 +47,10 @@ USAGE_DOWNLOAD = 8
 USAGE_STREAM = 9
 
 LICENSE_NON_EXCLUSIVE = 1
+LICENSE_ROYALTY_FREE = 3
+COMPENSATION_NONE = 0
 COMPENSATION_REVENUE_SHARE = 2
+CLAIM_ASSERTED = 1
 CLAIM_ORACLE_VERIFIED = 2
 
 CLAIM_TYPE_AUTHORSHIP = 1
@@ -127,7 +137,7 @@ def grant_covers_usage(grant: dict[str, Any], usage_class: int, *, now_ms: int =
 def usage_permitted(rights_payload: dict[str, Any] | None, usage_class: int, *, now_ms: int = 0) -> bool:
     """True when rights_json contains an effective UsageGrant covering the usage class."""
     payload = rights_payload or {}
-    grants = payload.get("usage_grants") or default_usage_grants(now_ms)
+    grants = payload.get("usage_grants") or []
     for grant in grants:
         if grant_covers_usage(grant, usage_class, now_ms=now_ms):
             return True
@@ -154,15 +164,22 @@ class MediaResolutionResult:
     dedup_matched: bool = False
 
 
-def default_claim(claim_type: int, claimant: str, rights_mask: int = 0) -> dict[str, Any]:
+def default_claim(
+    claim_type: int,
+    claimant: str,
+    rights_mask: int = 0,
+    *,
+    verification_status: int = CLAIM_ASSERTED,
+    evidence_commitment: bytes | None = None,
+) -> dict[str, Any]:
     return {
         "claim_type": claim_type,
         "claimant": claimant,
         "asset_id": None,
         "rights_mask": rights_mask,
         "scope": 0,
-        "verification_status": CLAIM_ORACLE_VERIFIED,
-        "evidence_commitment": None,
+        "verification_status": verification_status,
+        "evidence_commitment": evidence_commitment,
     }
 
 
@@ -199,13 +216,204 @@ def default_usage_grant(
 
 
 def default_usage_grants(effective_from: int = 0) -> list[dict[str, Any]]:
-    return [default_usage_grant(u, effective_from) for u in range(1, 10)]
+    # There is no safe universal license. Callers must supply evidence-backed grants.
+    return []
 
 
 def default_rights_payload(controller: str, *, now_ms: int = 0) -> dict[str, Any]:
     return {
-        "claims": default_claims(controller),
-        "usage_grants": default_usage_grants(now_ms),
+        "claims": [],
+        "usage_grants": [],
+    }
+
+
+def audio_rights_intent_hash(intent: dict[str, Any]) -> str:
+    canonical = json.dumps(intent, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return "0x" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _uleb128(value: int) -> bytes:
+    out = bytearray()
+    while True:
+        byte = value & 0x7F
+        value >>= 7
+        if value:
+            out.append(byte | 0x80)
+        else:
+            out.append(byte)
+            return bytes(out)
+
+
+def verify_audio_rights_intent_signature(
+    *, intent: dict[str, Any], wallet_signature: str, expected_owner: str,
+) -> None:
+    """Verify the Ed25519 MySo personal-message signature over the frozen intent hash."""
+    try:
+        serialized = base64.b64decode(wallet_signature, validate=True)
+    except Exception as exc:
+        raise ValueError("audio rights intent signature encoding is invalid") from exc
+    if len(serialized) != 97 or serialized[0] != 0:
+        raise ValueError("audio rights intent requires an Ed25519 user signature")
+    signature = serialized[1:65]
+    public_key = serialized[65:97]
+    signer = "0x" + hashlib.blake2b(bytes([0]) + public_key, digest_size=32).hexdigest()
+    if _normalize_object_id(signer) != _normalize_object_id(expected_owner):
+        raise ValueError("audio rights intent signature does not match its owner")
+    message = audio_rights_intent_hash(intent).encode("utf-8")
+    bcs_personal_message = _uleb128(len(message)) + message
+    digest = hashlib.blake2b(bytes([3, 0, 0]) + bcs_personal_message, digest_size=32).digest()
+    try:
+        VerifyKey(public_key).verify(digest, signature)
+    except BadSignatureError as exc:
+        raise ValueError("audio rights intent signature is invalid") from exc
+
+
+def _assert_audio_provenance_policy(intent: dict[str, Any]) -> None:
+    provenance = intent.get("provenance") or {}
+    if int(provenance.get("policyVersion") or 0) != 1:
+        raise ValueError("unsupported audio provenance policy")
+    source = str(provenance.get("source") or "")
+    basis = str(provenance.get("basis") or "")
+    declaration = str(provenance.get("declaration") or "").strip()
+    if source in ("user_upload", "post_original"):
+        if basis != "original_rightsholder_attestation" or not declaration:
+            raise ValueError("user audio requires a signed rightsholder attestation")
+    elif source == "royalty_free_ingest":
+        if basis != "licensed_catalog_evidence" or not declaration:
+            raise ValueError("catalog audio requires licensed provenance evidence")
+        if not provenance.get("evidenceUri") or not provenance.get("evidenceHash"):
+            raise ValueError("catalog audio provenance evidence is incomplete")
+    else:
+        raise ValueError("unsupported audio provenance source")
+    expires_raw = str(intent.get("expiresAt") or "").replace("Z", "+00:00")
+    try:
+        expires_at = datetime.fromisoformat(expires_raw)
+    except ValueError as exc:
+        raise ValueError("audio rights intent expiry is invalid") from exc
+    if expires_at.tzinfo is None or expires_at <= datetime.now(timezone.utc):
+        raise ValueError("audio rights intent is expired")
+
+
+def audio_rights_from_intent(
+    *,
+    intent: dict[str, Any],
+    wallet_signature: str,
+    submitter: str,
+    content_commitment_hex: str,
+) -> dict[str, Any]:
+    """Validate the frozen user intent and return the only grants allowed for v1 catalog audio."""
+    owner = _normalize_object_id(str(intent.get("ownerWalletAddress") or ""))
+    if owner != _normalize_object_id(submitter):
+        raise ValueError("audio rights intent owner does not match chain submitter")
+    expected_content = str(intent.get("contentCommitment") or "").lower().removeprefix("0x")
+    if expected_content != content_commitment_hex.lower().removeprefix("0x"):
+        raise ValueError("audio rights intent content commitment mismatch")
+    if int(intent.get("version") or 0) != 1:
+        raise ValueError("unsupported audio rights intent version")
+    verify_audio_rights_intent_signature(
+        intent=intent,
+        wallet_signature=wallet_signature,
+        expected_owner=owner,
+    )
+    _assert_audio_provenance_policy(intent)
+    if str(intent.get("assetKind") or "") != "sound_recording":
+        raise ValueError("standalone audio must resolve as sound_recording")
+
+    grants: list[dict[str, Any]] = []
+    for raw in intent.get("grants") or []:
+        usage_class = int(raw.get("usageClass") or 0)
+        if usage_class not in (USAGE_STREAM, USAGE_MUSIC_SOUNDTRACK):
+            raise ValueError("audio catalog intent contains unsupported usage class")
+        grant = {
+            "usage_class": usage_class,
+            "granted_rights": int(raw.get("grantedRights") or 0),
+            "license_type": int(raw.get("licenseType") or LICENSE_ROYALTY_FREE),
+            "compensation_type": int(raw.get("compensationType") or COMPENSATION_NONE),
+            "compensation_bps": int(raw.get("compensationBps") or 0),
+            "attribution_required": bool(raw.get("attributionRequired", True)),
+            "derivatives_permitted": bool(raw.get("derivativesPermitted", False)),
+            "commercial_use_permitted": bool(raw.get("commercialUsePermitted", False)),
+            "effective_from": int(raw.get("effectiveFrom") or 0),
+            "expires_at": raw.get("expiresAt"),
+            "revocable": bool(raw.get("revocable", True)),
+        }
+        if grant["license_type"] != LICENSE_ROYALTY_FREE:
+            raise ValueError("v1 audio catalog grants must be royalty-free")
+        if grant["compensation_type"] != COMPENSATION_NONE or grant["compensation_bps"] != 0:
+            raise ValueError("v1 audio catalog grants cannot configure compensation")
+        if not grant_covers_usage(grant, usage_class):
+            raise ValueError(f"audio grant does not cover usage class {usage_class}")
+        grants.append(grant)
+    if {int(grant["usage_class"]) for grant in grants} != {USAGE_STREAM, USAGE_MUSIC_SOUNDTRACK}:
+        raise ValueError("audio catalog intent requires stream and soundtrack grants")
+
+    evidence = hashlib.sha256(
+        json.dumps(intent, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).digest()
+    controlled_rights = 0
+    for grant in grants:
+        controlled_rights |= int(grant["granted_rights"])
+    claims = [
+        default_claim(
+            CLAIM_TYPE_AUTHORSHIP,
+            owner,
+            verification_status=CLAIM_ORACLE_VERIFIED,
+            evidence_commitment=evidence,
+        ),
+        default_claim(
+            CLAIM_TYPE_RIGHTS_CONTROL,
+            owner,
+            controlled_rights,
+            verification_status=CLAIM_ORACLE_VERIFIED,
+            evidence_commitment=evidence,
+        ),
+    ]
+    return {"claims": claims, "usage_grants": grants, "evidence_commitment": evidence}
+
+
+def verified_visual_registration_rights(
+    *,
+    submitter: str,
+    content_commitment_hex: str,
+    fingerprint_commitment_hex: str,
+) -> dict[str, Any]:
+    """Narrow legacy image/video registration rights backed by analyzed commitments."""
+    evidence = hashlib.sha256(
+        bytes.fromhex(content_commitment_hex.removeprefix("0x"))
+        + bytes.fromhex(fingerprint_commitment_hex.removeprefix("0x"))
+    ).digest()
+    rights = required_rights_for_usage(USAGE_SOCIAL_POST)
+    return {
+        "claims": [
+            default_claim(
+                CLAIM_TYPE_AUTHORSHIP,
+                submitter,
+                verification_status=CLAIM_ORACLE_VERIFIED,
+                evidence_commitment=evidence,
+            ),
+            default_claim(
+                CLAIM_TYPE_RIGHTS_CONTROL,
+                submitter,
+                rights,
+                verification_status=CLAIM_ORACLE_VERIFIED,
+                evidence_commitment=evidence,
+            ),
+        ],
+        "usage_grants": [
+            {
+                "usage_class": USAGE_SOCIAL_POST,
+                "granted_rights": rights,
+                "license_type": LICENSE_ROYALTY_FREE,
+                "compensation_type": COMPENSATION_NONE,
+                "compensation_bps": 0,
+                "attribution_required": True,
+                "derivatives_permitted": False,
+                "commercial_use_permitted": False,
+                "effective_from": 0,
+                "expires_at": None,
+                "revocable": True,
+            }
+        ],
     }
 
 
@@ -217,63 +425,52 @@ def _package_id() -> str:
     return os.getenv("MYSO_POC_PACKAGE_ID", "").strip()
 
 
-def _struct_type(name: str) -> str:
-    pkg = _package_id()
-    return f"{pkg}::media_asset::{name}"
-
-
 def encode_beneficiary_split(beneficiary: str, share_bps: int) -> dict[str, Any]:
+    """Field map for unsafe_moveCall JSON-to-BCS (no type wrapper)."""
     return {
-        "type": _struct_type("BeneficiarySplit"),
-        "fields": {
-            "beneficiary": _normalize_object_id(beneficiary),
-            "share_bps": str(int(share_bps)),
-        },
+        "beneficiary": _normalize_object_id(beneficiary),
+        "share_bps": str(int(share_bps)),
     }
 
 
 def encode_claim(claim: dict[str, Any]) -> dict[str, Any]:
+    """Field map for unsafe_moveCall JSON-to-BCS (no type wrapper)."""
     evidence = claim.get("evidence_commitment")
     evidence_hex = bytes_to_move_hex(evidence) if isinstance(evidence, (bytes, bytearray)) else None
     asset_id = claim.get("asset_id")
     return {
-        "type": _struct_type("Claim"),
-        "fields": {
-            "claim_type": str(int(claim["claim_type"])),
-            "claimant": _normalize_object_id(str(claim["claimant"])),
-            "asset_id": _move_option_address(asset_id),
-            "rights_mask": str(int(claim.get("rights_mask", 0))),
-            "scope": str(int(claim.get("scope", 0))),
-            "verification_status": str(int(claim.get("verification_status", CLAIM_ORACLE_VERIFIED))),
-            "evidence_commitment": (
-                {"Some": evidence_hex} if evidence_hex is not None else {"None": None}
-            ),
-        },
+        "claim_type": str(int(claim["claim_type"])),
+        "claimant": _normalize_object_id(str(claim["claimant"])),
+        "asset_id": _move_option_address(asset_id),
+        "rights_mask": str(int(claim.get("rights_mask", 0))),
+        "scope": str(int(claim.get("scope", 0))),
+        "verification_status": str(int(claim.get("verification_status", CLAIM_ORACLE_VERIFIED))),
+        "evidence_commitment": (
+            {"Some": evidence_hex} if evidence_hex is not None else {"None": None}
+        ),
     }
 
 
 def encode_usage_grant(grant: dict[str, Any]) -> dict[str, Any]:
+    """Field map for unsafe_moveCall JSON-to-BCS (no type wrapper)."""
     usage_class = int(grant["usage_class"])
     expires_at = grant.get("expires_at")
     return {
-        "type": _struct_type("UsageGrant"),
-        "fields": {
-            "usage_class": str(usage_class),
-            "granted_rights": str(int(grant.get("granted_rights", required_rights_for_usage(usage_class)))),
-            "license_type": str(int(grant.get("license_type", LICENSE_NON_EXCLUSIVE))),
-            "compensation_type": str(int(grant.get("compensation_type", COMPENSATION_REVENUE_SHARE))),
-            "compensation_bps": str(int(grant.get("compensation_bps", MANIFEST_BPS_TOTAL))),
-            "attribution_required": bool(grant.get("attribution_required", False)),
-            "derivatives_permitted": bool(
-                grant.get("derivatives_permitted", _usage_requires_derivatives(usage_class) or True)
-            ),
-            "commercial_use_permitted": bool(grant.get("commercial_use_permitted", True)),
-            "effective_from": str(int(grant.get("effective_from", 0))),
-            "expires_at": (
-                {"Some": str(int(expires_at))} if expires_at is not None else {"None": None}
-            ),
-            "revocable": bool(grant.get("revocable", True)),
-        },
+        "usage_class": str(usage_class),
+        "granted_rights": str(int(grant.get("granted_rights", required_rights_for_usage(usage_class)))),
+        "license_type": str(int(grant.get("license_type", LICENSE_NON_EXCLUSIVE))),
+        "compensation_type": str(int(grant.get("compensation_type", COMPENSATION_NONE))),
+        "compensation_bps": str(int(grant.get("compensation_bps", 0))),
+        "attribution_required": bool(grant.get("attribution_required", False)),
+        "derivatives_permitted": bool(
+            grant.get("derivatives_permitted", _usage_requires_derivatives(usage_class) or True)
+        ),
+        "commercial_use_permitted": bool(grant.get("commercial_use_permitted", True)),
+        "effective_from": str(int(grant.get("effective_from", 0))),
+        "expires_at": (
+            {"Some": str(int(expires_at))} if expires_at is not None else {"None": None}
+        ),
+        "revocable": bool(grant.get("revocable", True)),
     }
 
 
@@ -298,8 +495,10 @@ def build_finalize_media_asset_move_call(
     ]
 
     primary = _normalize_object_id(resolution.submitter)
-    claims = resolution.claims or default_claims(primary)
-    usage_grants = resolution.usage_grants or default_usage_grants(now_ms)
+    claims = resolution.claims
+    usage_grants = resolution.usage_grants
+    if not claims or not usage_grants:
+        raise ValueError("finalize_media_asset requires evidence-backed claims and usage grants")
 
     return {
         "packageObjectId": _package_id(),
@@ -339,6 +538,30 @@ def build_submit_media_resolution_move_call(
             bytes_to_move_hex(content_commitment),
             bytes_to_move_hex(observed_fingerprint_commitment),
             str(int(media_type)),
+            clock_id or _clock_object_id(),
+        ],
+    }
+
+
+def build_update_media_asset_usage_grants_move_call(
+    *,
+    media_asset_id: str,
+    usage_grants: list[dict[str, Any]],
+    max_compensation_bps: int = 0,
+    clock_id: str | None = None,
+) -> dict[str, Any]:
+    """Unsigned creator-wallet call for prospective usage-grant updates."""
+    if not usage_grants:
+        raise ValueError("usage_grants cannot be empty")
+    return {
+        "packageObjectId": _package_id(),
+        "module": "media_asset",
+        "function": "update_media_asset_usage_grants",
+        "typeArguments": [],
+        "arguments": [
+            _normalize_object_id(media_asset_id),
+            [encode_usage_grant(grant) for grant in usage_grants],
+            str(int(max_compensation_bps)),
             clock_id or _clock_object_id(),
         ],
     }

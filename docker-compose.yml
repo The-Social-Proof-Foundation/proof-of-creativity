@@ -53,6 +53,7 @@ services:
       MYSO_NETWORK: localnet
       MYSO_INTEGRATION_ENABLED: "${MYSO_INTEGRATION_ENABLED:-false}"
       MYSOCIAL_RPC_URL: http://host.docker.internal:9000
+      MYSO_GRPC_URL: http://host.docker.internal:9000
       GRAPHQL_URL: http://host.docker.internal:9125/graphql
       API_HOST: 0.0.0.0
       API_PORT: "8000"
@@ -84,6 +85,7 @@ services:
       DATABASE_URL: postgresql://poc:poc@postgres:5432/proof_of_creativity
       MYSO_NETWORK: localnet
       MYSOCIAL_RPC_URL: http://host.docker.internal:9000
+      MYSO_GRPC_URL: http://host.docker.internal:9000
       GRAPHQL_URL: http://host.docker.internal:9125/graphql
       POC_SYNC_MODE: "${POC_SYNC_MODE:-grpc}"
     depends_on:
@@ -106,6 +108,7 @@ services:
       MYSO_NETWORK: localnet
       MYSO_INTEGRATION_ENABLED: "${MYSO_INTEGRATION_ENABLED:-false}"
       MYSOCIAL_RPC_URL: http://host.docker.internal:9000
+      MYSO_GRPC_URL: http://host.docker.internal:9000
       GRAPHQL_URL: http://host.docker.internal:9125/graphql
       ORACLE_WORKER_CONCURRENCY: "2"
       POC_X_HANDLE_CONFIDENCE_THRESHOLD: "${POC_X_HANDLE_CONFIDENCE_THRESHOLD:-0.85}"

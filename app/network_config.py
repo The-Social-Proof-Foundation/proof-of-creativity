@@ -45,6 +45,11 @@ class GrpcSyncConfig(BaseModel):
     checkpoint_catchup_batch_size: int = 10
 
 
+class PlatformAdapterConfig(BaseModel):
+    platform_id: str
+    adapter: str = "public_http"
+
+
 class NetworkProfile(BaseModel):
     network: str
     rpc_url: str
@@ -58,6 +63,7 @@ class NetworkProfile(BaseModel):
     storage: StorageConfig = Field(default_factory=StorageConfig)
     signers: SignerConfig = Field(default_factory=SignerConfig)
     grpc_sync: GrpcSyncConfig = Field(default_factory=GrpcSyncConfig)
+    platforms: list[PlatformAdapterConfig] = Field(default_factory=list)
 
 
 class Settings(BaseModel):

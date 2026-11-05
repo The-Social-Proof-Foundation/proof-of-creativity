@@ -10,9 +10,9 @@ import structlog
 from app.chain.chain_types import CHECKPOINT_MARKER_EVENT
 from app.chain.event_parser import (
     infer_media_type,
-    infer_primary_media_type,
     parse_post_created,
-    parse_post_metadata_commitments,
+    parse_post_audio_metadata,
+    plan_post_media_jobs,
 )
 from app.chain.grpc_client import (
     GrpcChainClient,
@@ -329,9 +329,20 @@ class GrpcSyncService:
 
         media_asset_ids = parsed.get("media_asset_ids") or []
         media_urls = parsed.get("media_urls") or []
+        audio_metadata = parse_post_audio_metadata(parsed.get("metadata_json"))
         enable_poc = parsed.get("enable_poc", True)
+        platform_id = parsed.get("platform_id")
+        metadata_json = parsed.get("metadata_json") or (event.payload or {}).get("metadata_json")
+        media_types = parsed.get("media_types") or []
+        plan = plan_post_media_jobs(
+            media_urls=media_urls,
+            media_types=media_types,
+            media_asset_ids=media_asset_ids,
+            metadata_json=metadata_json,
+            enable_poc=bool(enable_poc),
+        )
 
-        if not media_asset_ids and (not enable_poc or not media_urls):
+        if plan["action"] == "skip":
             return
 
         inserted = self.posts.upsert_discovered(
@@ -340,14 +351,17 @@ class GrpcSyncService:
             creator_address=parsed.get("creator"),
             enable_poc=bool(enable_poc),
             media_urls=media_urls,
-            media_types=parsed.get("media_types") or [],
+            media_types=media_types,
             media_asset_ids=media_asset_ids,
             composition_status=parsed.get("composition_status"),
             monetization_status=parsed.get("monetization_status"),
+            platform_id=platform_id,
             metadata={
                 "tx_digest": event.transaction_digest,
                 "event_sequence": getattr(event, "event_idx", 0) or 0,
                 "spt_id": parsed.get("spt_id"),
+                "platform_id": platform_id,
+                **audio_metadata,
             },
         )
         if not inserted:
@@ -360,19 +374,22 @@ class GrpcSyncService:
                 "post_id": parsed["post_id"],
                 "media_urls": media_urls,
                 "media_asset_ids": media_asset_ids,
+                "platform_id": platform_id,
                 "enable_poc": bool(enable_poc),
             },
         )
 
-        if media_asset_ids:
+        if plan["action"] == "analyze_composition":
             job_id = self.jobs.enqueue(
                 self.network,
                 parsed["post_id"],
                 job_type="analyze_composition",
                 payload={
-                    "media_asset_ids": media_asset_ids,
+                    "media_asset_ids": plan["media_asset_ids"],
                     "spt_id": parsed.get("spt_id"),
                     "tx_digest": event.transaction_digest,
+                    "platform_id": platform_id,
+                    **audio_metadata,
                 },
             )
             logger.info(
@@ -380,28 +397,31 @@ class GrpcSyncService:
                 network=self.network,
                 post_id=parsed["post_id"],
                 job_id=job_id,
-                asset_count=len(media_asset_ids),
+                asset_count=len(plan["media_asset_ids"]),
             )
             return
 
-        metadata_json = parsed.get("metadata_json") or (event.payload or {}).get("metadata_json")
-        commitments = parse_post_metadata_commitments(metadata_json)
-        if commitments and media_urls:
-            media_types = parsed.get("media_types") or []
+        if plan["action"] == "resolve_post_media":
+            clips = plan["clips"]
+            first = clips[0]
             job_id = self.jobs.enqueue(
                 self.network,
                 parsed["post_id"],
                 job_type="resolve_post_media",
                 payload={
                     "post_id": parsed["post_id"],
-                    "content_commitment": commitments["content_commitment"],
-                    "observed_fingerprint_commitment": commitments["observed_fingerprint_commitment"],
-                    "media_type": infer_primary_media_type(media_urls, media_types),
+                    "clips": clips,
+                    "existing_media_asset_ids": plan["existing_media_asset_ids"],
+                    "content_commitment": first.get("content_commitment"),
+                    "observed_fingerprint_commitment": first.get("observed_fingerprint_commitment"),
+                    "media_type": first.get("media_type"),
                     "submitter": parsed.get("creator") or parsed.get("owner") or "",
                     "media_urls": media_urls,
-                    "storage_asset_id": commitments.get("asset_id") or "",
+                    "storage_asset_id": first.get("storage_asset_id") or "",
                     "spt_id": parsed.get("spt_id"),
                     "tx_digest": event.transaction_digest,
+                    "platform_id": platform_id,
+                    **audio_metadata,
                 },
             )
             logger.info(
@@ -409,10 +429,10 @@ class GrpcSyncService:
                 network=self.network,
                 post_id=parsed["post_id"],
                 job_id=job_id,
+                clip_count=len(clips),
             )
             return
 
-        media_types = parsed.get("media_types") or []
         for idx, url in enumerate(media_urls):
             media_type = infer_media_type(url, idx, media_types)
             job_id = self.jobs.enqueue(
@@ -422,6 +442,7 @@ class GrpcSyncService:
                 media_url=url,
                 media_index=idx,
                 media_type=media_type,
+                payload={"platform_id": platform_id},
             )
             logger.info(
                 "Enqueued analyze job",

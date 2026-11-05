@@ -11,6 +11,7 @@ import structlog
 from app.chain.move_calls import (
     build_claim_username_beneficiary_call,
     build_create_username_beneficiary_call,
+    build_propose_username_beneficiary_transfer_call,
 )
 from app.network_config import NetworkProfile, bootstrap_network_session, chain_writes_allowed, load_network_profile
 from app.services.myso_client import MySocialClient, init_myso_client
@@ -241,6 +242,41 @@ class TransactionSubmitter:
             wallet=claimant_address,
             clock_id=_require_object_id(self.profile, "MYSO_CLOCK_OBJECT_ID", "clock", "Clock"),
         )
+        return self._execute_move_call(data)
+
+    def propose_username_beneficiary_transfer(
+        self,
+        *,
+        beneficiary_id: str,
+        recipient: str,
+        evidence_hash: bytes,
+        attested_x_handle: str,
+    ) -> dict:
+        if not self.writes_enabled:
+            return self._mock_tx(
+                "propose_username_beneficiary_transfer",
+                {"beneficiary_id": beneficiary_id, "recipient": recipient},
+            )
+        if not self.client:
+            raise RuntimeError("MySocial client unavailable for chain writes")
+        package_id = self.client.package_id or _env_object_id(
+            self.profile, "MYSO_POC_PACKAGE_ID", "poc_package"
+        )
+        if not package_id:
+            raise RuntimeError("PoC package id not configured")
+        data = build_propose_username_beneficiary_transfer_call(
+            package_id=str(package_id),
+            poc_config_id=_require_object_id(
+                self.profile, "MYSO_POC_CONFIG_ID", "poc_config", "PoCConfig"
+            ),
+            beneficiary_id=beneficiary_id,
+            recipient=recipient,
+            evidence_hash=evidence_hash,
+            attested_x_handle=attested_x_handle,
+            clock_id=_require_object_id(self.profile, "MYSO_CLOCK_OBJECT_ID", "clock", "Clock"),
+        )
+        # This call must be signed by a configured PoC oracle, not the
+        # beneficiary admin-cap signer used for provisioning.
         return self._execute_move_call(data)
 
     def reserve_towards_post(

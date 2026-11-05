@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hmac
 import os
 import json
 import time
@@ -38,9 +39,11 @@ from app.chain.grpc_client import (
 from app.chain.grpc_v2_client import GrpcV2Client
 from app.network_config import get_settings, load_network_profile
 from app.services.indexer_graphql_client import fetch_media_asset, fetch_post_playback_policy
-from app.chain.bcs_media_asset_claims import (
-    compute_claims_bundle_commitment,
-    split_claims_and_grants_bcs,
+from app.chain.bcs_media_asset_claims import split_claims_and_grants_bcs
+from app.services.rights_resolution import (
+    RightsResolutionError,
+    commitment_for_resolution,
+    resolve_rights_target,
 )
 from app.services.media_asset_rights_governance_submission import (
     build_finalize_media_asset_rights_governance_move_call,
@@ -90,6 +93,12 @@ class BeneficiaryClaimRequest(BaseModel):
 
 class PocClaimOAuthStartRequest(BaseModel):
     claimant_address: str
+    beneficiary_id: str
+
+
+class BeneficiaryTransferProposalRequest(BaseModel):
+    verified_wallet: str
+    recipient_address: str
     beneficiary_id: str
 
 
@@ -270,11 +279,25 @@ async def _wait_for_job(job_id: str, timeout_sec: float = 120.0) -> dict:
     raise HTTPException(status_code=504, detail=f"Job {job_id} did not complete within {timeout_sec}s")
 
 
+def _authorize_poc_transfer_request(request: Request, wallet: str) -> str | None:
+    """Accept the user's wallet session or the authenticated MySo server bridge."""
+    session_jwt = request.headers.get("Authorization", "").removeprefix("Bearer ").strip()
+    if session_jwt:
+        return session_jwt
+    expected = os.getenv("MYSO_POC_MCP_SERVICE_SECRET", "").strip()
+    supplied = request.headers.get("X-MySo-PoC-Service-Key", "").strip()
+    if len(expected.encode("utf-8")) >= 32 and supplied and hmac.compare_digest(expected, supplied):
+        return None
+    raise HTTPException(status_code=401, detail="Authenticated MySo wallet session or service bridge required")
+
+
 @router.get("/beneficiaries/{identity_hash}/claim/status")
+@router.get("/beneficiaries/{identity_hash}/transfer/status")
 async def get_claim_status(
     identity_hash: str,
     request: Request,
     claimant_address: str = Query(...),
+    beneficiary_id: str | None = Query(default=None),
     network: str | None = Query(default=None),
 ):
     net = _network_param(network)
@@ -286,7 +309,7 @@ async def get_claim_status(
     claimable = bool(record and record.get("provision_tx_digest") and not record.get("claim_tx_digest"))
     required_x_handle = (record or {}).get("username")
 
-    session_jwt = request.headers.get("Authorization", "").removeprefix("Bearer ").strip() or None
+    session_jwt = _authorize_poc_transfer_request(request, wallet)
     mode = resolve_identity_verifier_mode(net)
     oauth_required = mode in ("myso-identity", "myso_identity", "identity-verification")
     oauth_complete = False
@@ -301,11 +324,16 @@ async def get_claim_status(
                     identity_hash=identity_hash,
                     wallet=wallet,
                     session_jwt=session_jwt,
+                    beneficiary_id=beneficiary_id,
                 )
                 oauth_required = status.oauth_required
                 oauth_complete = status.oauth_complete
                 authorize_url = status.authorize_url
                 attested_x_handle = status.attested_x_handle
+                if beneficiary_id and status.beneficiary_id != beneficiary_id.lower():
+                    oauth_required = True
+                    oauth_complete = False
+                    attested_x_handle = None
             except Exception as exc:
                 oauth_required = True
                 authorize_url = None
@@ -322,11 +350,13 @@ async def get_claim_status(
         "required_x_handle": required_x_handle,
         "authorize_url": authorize_url,
         "attested_x_handle": attested_x_handle,
+        "claim_outcome": ((record or {}).get("metadata") or {}).get("claim_outcome"),
         "beneficiary": record,
     }
 
 
 @router.post("/beneficiaries/{identity_hash}/claim/oauth/start")
+@router.post("/beneficiaries/{identity_hash}/transfer/oauth/start")
 async def start_claim_oauth(
     identity_hash: str,
     request: Request,
@@ -334,9 +364,7 @@ async def start_claim_oauth(
     network: str | None = Query(default=None),
 ):
     net = _network_param(network)
-    session_jwt = request.headers.get("Authorization", "").removeprefix("Bearer ").strip()
-    if not session_jwt:
-        raise HTTPException(status_code=401, detail="Authorization Bearer session JWT required")
+    session_jwt = _authorize_poc_transfer_request(request, body.claimant_address.strip())
 
     client = IdentityVerificationClient()
     if not client.enabled:
@@ -423,7 +451,90 @@ async def enqueue_claim(
         "job_id": job_id,
         "status": "completed",
         "claim_tx_digest": record.get("claim_tx_digest"),
+        # profile_created | username_reserved (+ profile_id / reserved_for / linked_wallet)
+        "claim_outcome": (record.get("metadata") or {}).get("claim_outcome"),
         "beneficiary": record,
+    }
+
+
+@router.post("/beneficiaries/{identity_hash}/transfer-proposal")
+async def enqueue_beneficiary_transfer_proposal(
+    identity_hash: str,
+    request: Request,
+    body: BeneficiaryTransferProposalRequest,
+    sync: bool = Query(default=False, description="Wait for oracle proposal submission"),
+    network: str | None = Query(default=None),
+):
+    net = _network_param(network)
+    session_jwt = _authorize_poc_transfer_request(request, body.verified_wallet.strip())
+    if not body.recipient_address.strip() or not body.verified_wallet.strip():
+        raise HTTPException(status_code=400, detail="verified_wallet and recipient_address are required")
+    identity_client = IdentityVerificationClient()
+    if not identity_client.enabled:
+        raise HTTPException(status_code=503, detail="identity verification service not configured")
+    try:
+        attestation = identity_client.attest_for_beneficiary_transfer_sync(
+            identity_hash=identity_hash,
+            beneficiary_id=body.beneficiary_id,
+            wallet=body.verified_wallet.strip(),
+            recipient=body.recipient_address.strip(),
+            session_jwt=session_jwt,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=403, detail=f"identity verification failed: {exc}") from exc
+    job_id = jobs_repo.enqueue(
+        net,
+        post_id=f"beneficiary-transfer:{identity_hash}",
+        job_type="propose_beneficiary_transfer",
+        payload={
+            "identity_hash": identity_hash,
+            "beneficiary_id": body.beneficiary_id,
+            "verified_wallet": body.verified_wallet.strip(),
+            "recipient_address": body.recipient_address.strip(),
+            "attested_x_handle": attestation.attested_x_handle,
+            "evidence_hash": attestation.evidence_hash,
+        },
+    )
+    if not sync:
+        return {"network": net, "job_id": job_id, "status": "queued"}
+    job = await _wait_for_job(job_id)
+    if job.get("status") == "failed":
+        raise HTTPException(status_code=500, detail=job.get("last_error") or "transfer proposal failed")
+    return {"network": net, "job_id": job_id, "status": "completed", "result": (job.get("payload") or {}).get("result")}
+
+
+@router.get("/beneficiary-transfer-jobs/{job_id}")
+async def get_beneficiary_transfer_job(
+    job_id: str,
+    request: Request,
+    identity_hash: str = Query(...),
+    verified_wallet: str = Query(...),
+):
+    session_jwt = _authorize_poc_transfer_request(request, verified_wallet)
+    identity_client = IdentityVerificationClient()
+    if not identity_client.enabled:
+        raise HTTPException(status_code=503, detail="identity verification service not configured")
+    try:
+        identity_client.get_claim_status_sync(
+            identity_hash=identity_hash,
+            wallet=verified_wallet,
+            session_jwt=session_jwt,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=403, detail="wallet session could not be verified") from exc
+    job = jobs_repo.get(job_id)
+    if not job or job.get("job_type") != "propose_beneficiary_transfer":
+        raise HTTPException(status_code=404, detail="Transfer proposal job not found")
+    payload = job.get("payload") or {}
+    if isinstance(payload, str):
+        payload = json.loads(payload)
+    if payload.get("identity_hash") != identity_hash or str(payload.get("verified_wallet", "")).lower() != verified_wallet.lower():
+        raise HTTPException(status_code=404, detail="Transfer proposal job not found")
+    result = payload.get("result") or {}
+    return {
+        "status": job.get("status"),
+        "tx_digest": result.get("tx_digest"),
+        "error": "Transfer proposal could not be submitted" if job.get("status") == "failed" else None,
     }
 
 
@@ -695,14 +806,29 @@ class MediaAssetRightsPrepareRequest(BaseModel):
     media_asset_id: str
     claims: list[dict]
     usage_grants: list[dict]
+    target: dict | None = None
+    network: str | None = None
+
+
+def _resolve_rights_bundle(network: str, claims: list[dict], usage_grants: list[dict], target: dict | None):
+    try:
+        resolved = resolve_rights_target(network, claims, target)
+        commitment = commitment_for_resolution(claims, usage_grants, resolved)
+    except RightsResolutionError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return resolved, commitment
 
 
 @router.post("/disputes/media-asset-rights/prepare")
 async def prepare_media_asset_rights_dispute(body: MediaAssetRightsPrepareRequest):
-    commitment = compute_claims_bundle_commitment(body.claims, body.usage_grants)
+    net = _network_param(body.network)
+    resolved, commitment = _resolve_rights_bundle(net, body.claims, body.usage_grants, body.target)
     return {
+        "network": net,
         "media_asset_id": body.media_asset_id,
         "claims_commitment": "0x" + commitment.hex(),
+        "target": resolved,
+        "submit_function": resolved["submit_function"],
     }
 
 
@@ -712,13 +838,14 @@ class MediaAssetRightsSubmitRequest(BaseModel):
     submitter: str
     claims: list[dict]
     usage_grants: list[dict]
+    target: dict | None = None
     network: str | None = None
 
 
 @router.post("/disputes/media-asset-rights/submit")
 async def submit_media_asset_rights_bundle(body: MediaAssetRightsSubmitRequest):
     net = _network_param(body.network)
-    commitment = compute_claims_bundle_commitment(body.claims, body.usage_grants)
+    resolved, commitment = _resolve_rights_bundle(net, body.claims, body.usage_grants, body.target)
     claims_bcs, grants_bcs = split_claims_and_grants_bcs(body.claims, body.usage_grants)
     rights_bundles_repo.upsert(
         net,
@@ -729,11 +856,19 @@ async def submit_media_asset_rights_bundle(body: MediaAssetRightsSubmitRequest):
         usage_grants_bcs=grants_bcs,
         submitter=body.submitter,
         status="pending",
+        target_kind=int(resolved["target_kind"]),
+        beneficiary_address=str(resolved["beneficiary_address"]),
+        target_vault_id=resolved.get("vault_id"),
+        target_username=resolved.get("username"),
+        identity_source=resolved.get("identity_source"),
+        identity_hash=resolved.get("identity_hash"),
     )
     return {
         "network": net,
         "proposal_id": body.proposal_id,
         "claims_commitment": "0x" + commitment.hex(),
+        "target": resolved,
+        "submit_function": resolved["submit_function"],
         "status": "pending",
     }
 
@@ -754,6 +889,12 @@ async def get_media_asset_rights_bundle(proposal_id: str):
         "claims_commitment": "0x" + bytes(commitment).hex(),
         "claims_bcs_hex": "0x" + bytes(row["claims_bcs"]).hex(),
         "usage_grants_bcs_hex": "0x" + bytes(row["usage_grants_bcs"]).hex(),
+        "target_kind": row.get("target_kind"),
+        "beneficiary_address": row.get("beneficiary_address"),
+        "target_vault_id": row.get("target_vault_id"),
+        "target_username": row.get("target_username"),
+        "identity_source": row.get("identity_source"),
+        "identity_hash": row.get("identity_hash"),
     }
 
 

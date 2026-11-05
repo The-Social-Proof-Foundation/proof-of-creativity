@@ -110,6 +110,35 @@ def build_claim_username_beneficiary_call(
     }
 
 
+def build_propose_username_beneficiary_transfer_call(
+    *,
+    package_id: str,
+    poc_config_id: str,
+    beneficiary_id: str,
+    recipient: str,
+    evidence_hash: bytes,
+    attested_x_handle: str,
+    clock_id: str,
+) -> dict[str, Any]:
+    handle = canonical_registry_username(attested_x_handle)
+    if len(evidence_hash) != 32:
+        raise ValueError("beneficiary transfer evidence hash must be exactly 32 bytes")
+    return {
+        "packageObjectId": package_id,
+        "module": "proof_of_creativity",
+        "function": "propose_username_beneficiary_transfer",
+        "typeArguments": [],
+        "arguments": [
+            _require(poc_config_id, "PoCConfig"),
+            _require(beneficiary_id, "PoCUsernameBeneficiary"),
+            _require(recipient, "recipient wallet"),
+            bytes_to_move_hex(evidence_hash),
+            text_to_move_hex(handle),
+            _require(clock_id, "Clock"),
+        ],
+    }
+
+
 
 def build_reserve_towards_post_with_platform_call(
     *,

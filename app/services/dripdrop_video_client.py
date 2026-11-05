@@ -150,6 +150,31 @@ class DripdropVideoClient:
             resp.raise_for_status()
             return resp.json()
 
+    async def audio_source_access(
+        self,
+        *,
+        content_commitment: str,
+        resolution_request_id: str,
+    ) -> dict[str, Any]:
+        """Mint a short-lived private M4A lease for standalone audio resolution."""
+        if not self.enabled:
+            raise RuntimeError("Dripdrop source client is not configured")
+        import json
+
+        body = {
+            "contentCommitment": content_commitment,
+            "resolutionRequestId": resolution_request_id,
+        }
+        raw = json.dumps(body, separators=(",", ":"))
+        headers = self._sign(raw)
+        url = f"{self.base_url}/v1/internal/audio-assets/source-access"
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.post(url, content=raw, headers=headers)
+            if resp.status_code >= 400:
+                logger.warning("audio source-access failed", status=resp.status_code)
+            resp.raise_for_status()
+            return resp.json()
+
 
 _client: DripdropVideoClient | None = None
 

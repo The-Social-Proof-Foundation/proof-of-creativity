@@ -29,6 +29,7 @@ class ChainPostRepository:
         media_asset_ids: list[str] | None = None,
         composition_status: int | None = None,
         monetization_status: int | None = None,
+        platform_id: str | None = None,
         metadata: dict | None = None,
     ) -> bool:
         with get_db_connection() as conn:
@@ -36,10 +37,10 @@ class ChainPostRepository:
                 cur.execute(
                     """
                     INSERT INTO chain_posts (
-                        network, post_id, creator_address, enable_poc, media_urls,
+                        network, post_id, creator_address, platform_id, enable_poc, media_urls,
                         media_types, media_asset_ids, composition_status, monetization_status,
                         analysis_status, metadata, discovered_at, updated_at
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 'discovered', %s, NOW(), NOW())
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'discovered', %s, NOW(), NOW())
                     ON CONFLICT (network, post_id) DO NOTHING
                     RETURNING post_id
                     """,
@@ -47,6 +48,7 @@ class ChainPostRepository:
                         network,
                         post_id,
                         creator_address,
+                        platform_id,
                         "true" if enable_poc else "false",
                         json.dumps(media_urls),
                         json.dumps(media_types or []),
@@ -295,16 +297,27 @@ class JobRepository:
                 )
                 conn.commit()
 
-    def complete(self, job_id: str, status: str = "completed", error: str | None = None) -> None:
+    def complete(
+        self,
+        job_id: str,
+        status: str = "completed",
+        error: str | None = None,
+        result: dict | None = None,
+    ) -> None:
         with get_db_connection() as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     """
                     UPDATE oracle_jobs
-                    SET status = %s, last_error = %s, updated_at = NOW()
+                    SET status = %s,
+                        last_error = %s,
+                        payload = CASE WHEN %s::jsonb IS NULL THEN payload
+                                       ELSE payload || jsonb_build_object('result', %s::jsonb) END,
+                        updated_at = NOW()
                     WHERE id = %s
                     """,
-                    (status, error, job_id),
+                    (status, error, json.dumps(result) if result is not None else None,
+                     json.dumps(result) if result is not None else None, job_id),
                 )
                 conn.commit()
 
@@ -522,16 +535,34 @@ class UsernameBeneficiaryRepository:
                 )
                 conn.commit()
 
-    def mark_claimed(self, network: str, identity_hash: str, claim_tx_digest: str) -> None:
+    def mark_claimed(
+        self,
+        network: str,
+        identity_hash: str,
+        claim_tx_digest: str,
+        *,
+        claim_outcome: dict | None = None,
+    ) -> None:
+        """Record the claim; ``claim_outcome`` (profile_created | username_reserved) is merged into
+        ``metadata`` so clients can offer adopt/release for a reserved username."""
+        import json
+
         with get_db_connection() as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     """
                     UPDATE username_beneficiaries
-                    SET claimed = 'true', claim_tx_digest = %s, updated_at = NOW()
+                    SET claimed = 'true', claim_tx_digest = %s,
+                        metadata = COALESCE(metadata, '{}'::jsonb) || %s::jsonb,
+                        updated_at = NOW()
                     WHERE network = %s AND identity_hash = %s
                     """,
-                    (claim_tx_digest, network, identity_hash),
+                    (
+                        claim_tx_digest,
+                        json.dumps({"claim_outcome": claim_outcome or {}}),
+                        network,
+                        identity_hash,
+                    ),
                 )
                 conn.commit()
 
@@ -972,6 +1003,12 @@ class MediaAssetRightsBundleRepository:
         usage_grants_bcs: bytes,
         submitter: str,
         status: str = "pending",
+        target_kind: int = 0,
+        beneficiary_address: str = "0x0",
+        target_vault_id: str | None = None,
+        target_username: str | None = None,
+        identity_source: int | None = None,
+        identity_hash: str | None = None,
     ) -> None:
         with get_db_connection() as conn:
             with conn.cursor() as cur:
@@ -979,11 +1016,21 @@ class MediaAssetRightsBundleRepository:
                     """
                     INSERT INTO media_asset_rights_bundles (
                         proposal_id, network, media_asset_id, claims_commitment,
-                        claims_bcs, usage_grants_bcs, submitter, status
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                        claims_bcs, usage_grants_bcs, submitter, status,
+                        target_kind, beneficiary_address, target_vault_id,
+                        target_username, identity_source, identity_hash
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                     ON CONFLICT (proposal_id) DO UPDATE SET
                         status = EXCLUDED.status,
-                        claims_commitment = EXCLUDED.claims_commitment
+                        claims_commitment = EXCLUDED.claims_commitment,
+                        claims_bcs = EXCLUDED.claims_bcs,
+                        usage_grants_bcs = EXCLUDED.usage_grants_bcs,
+                        target_kind = EXCLUDED.target_kind,
+                        beneficiary_address = EXCLUDED.beneficiary_address,
+                        target_vault_id = EXCLUDED.target_vault_id,
+                        target_username = EXCLUDED.target_username,
+                        identity_source = EXCLUDED.identity_source,
+                        identity_hash = EXCLUDED.identity_hash
                     """,
                     (
                         proposal_id,
@@ -994,6 +1041,12 @@ class MediaAssetRightsBundleRepository:
                         usage_grants_bcs,
                         submitter,
                         status,
+                        target_kind,
+                        beneficiary_address,
+                        target_vault_id,
+                        target_username,
+                        identity_source,
+                        identity_hash,
                     ),
                 )
                 conn.commit()
@@ -1004,7 +1057,9 @@ class MediaAssetRightsBundleRepository:
                 cur.execute(
                     """
                     SELECT proposal_id, network, media_asset_id, claims_commitment,
-                           claims_bcs, usage_grants_bcs, submitter, status, created_at
+                           claims_bcs, usage_grants_bcs, submitter, status, created_at,
+                           target_kind, beneficiary_address, target_vault_id,
+                           target_username, identity_source, identity_hash
                     FROM media_asset_rights_bundles
                     WHERE proposal_id = %s
                     """,

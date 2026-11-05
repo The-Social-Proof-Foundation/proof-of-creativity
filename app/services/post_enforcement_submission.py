@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import os
+import hashlib
+import json
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -26,6 +28,27 @@ class EmbeddedAssetBinding:
     stem: int
     media_component: int
     evidence_commitment: bytes | None = None
+
+
+def deterministic_binding_id(post_id: str, source_asset_id: str, usage_class: int) -> int:
+    digest = hashlib.sha256(
+        f"poc:binding:v1:{post_id.lower()}:{source_asset_id.lower()}:{usage_class}".encode("utf-8")
+    ).digest()
+    return int.from_bytes(digest[:8], "big") or 1
+
+
+def legacy_dripdrop_binding_id(post_id: str, source_asset_id: str, usage_class: int) -> int:
+    digest = hashlib.sha256(
+        f"dripdrop:binding:v1:{post_id.lower()}:{source_asset_id.lower()}:{usage_class}".encode("utf-8")
+    ).digest()
+    return int.from_bytes(digest[:8], "big") or 1
+
+
+def audio_edit_recipe_commitment(recipe: dict[str, Any] | None) -> bytes | None:
+    if not recipe:
+        return None
+    canonical = json.dumps(recipe, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(canonical).digest()
 
 
 def _package_id() -> str:

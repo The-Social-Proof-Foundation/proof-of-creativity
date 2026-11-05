@@ -18,6 +18,7 @@ from app.services.media_asset_submission import (
     build_submit_media_resolution_move_call,
     default_rights_payload,
     usage_permitted,
+    verified_visual_registration_rights,
 )
 from app.chain.bcs_post_created import decode_post_created_event
 from tests.unit.test_bcs_post_created import encode_post_created_media_asset
@@ -46,11 +47,23 @@ def test_client_upload_resolve_create_post_move_shapes(poc_env):
         observed_fingerprint_commitment=b"\x03\x04",
         media_type=1,
         submitter="0xcreator",
+        **verified_visual_registration_rights(
+            submitter="0xcreator",
+            content_commitment_hex="0102",
+            fingerprint_commitment_hex="0304",
+        ),
     )
     finalize_mc = build_finalize_media_asset_move_call(resolution)
     assert finalize_mc["function"] == "finalize_media_asset"
     assert finalize_mc["module"] == "proof_of_creativity"
     assert len(finalize_mc["arguments"]) == 11
+    claims, grants, splits = finalize_mc["arguments"][7:10]
+    assert "type" not in claims[0]
+    assert "claim_type" in claims[0]
+    assert "claimant" in claims[0]
+    assert "asset_id" in claims[0]
+    assert "type" not in grants[0]
+    assert "type" not in splits[0]
 
 
 def test_post_created_bcs_carries_media_asset_ids(poc_env):
@@ -85,15 +98,29 @@ def test_composition_analysis_manifest_move_call(poc_env):
     mc = build_analyze_post_composition_move_call(submission)
     assert mc["function"] == "analyze_post_composition"
     assert mc["module"] == "proof_of_creativity"
+    analysis = mc["arguments"][6]
+    manifest_opt = mc["arguments"][7]
+    assert "type" not in analysis
+    assert "assets" in analysis
+    assert "type" not in analysis["assets"][0]
+    assert manifest_opt
+    assert "type" not in manifest_opt[0]
+    assert "entries" in manifest_opt[0]
+    assert "type" not in manifest_opt[0]["entries"][0]
 
 
 def test_usage_grant_permits_social_post_after_resolution(poc_env):
     rights = default_rights_payload("0xcreator")
-    assert usage_permitted(rights, USAGE_SOCIAL_POST)
+    assert not usage_permitted(rights, USAGE_SOCIAL_POST)
+    verified = verified_visual_registration_rights(
+        submitter="0xcreator",
+        content_commitment_hex="0102",
+        fingerprint_commitment_hex="0304",
+    )
+    assert usage_permitted(verified, USAGE_SOCIAL_POST)
 
 
-@patch("app.workers.oracle_worker.MySocialClient")
-def test_oracle_worker_enqueues_composition_when_post_has_assets(mock_client_cls, poc_env):
+def test_oracle_worker_enqueues_composition_when_post_has_assets(poc_env):
     """Simulate gRPC post discovery with media_asset_ids → analyze_composition job payload."""
     from app.chain.event_parser import parse_post_created
 

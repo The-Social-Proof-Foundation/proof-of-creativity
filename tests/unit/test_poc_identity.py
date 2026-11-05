@@ -137,3 +137,56 @@ def test_mock_verifier_localnet_ok(mock_fields):
         )
         assert verified.attested_x_handle == "alice"
         assert verified.verifier == "mock"
+
+
+# --- Claim outcome (profile created vs username reserved) -------------------------------------
+
+from app.services.username_beneficiary import parse_claim_outcome  # noqa: E402
+
+_CLAIMED_TYPE = "0x50c1::poc_username_beneficiary::UsernameBeneficiaryClaimedEvent"
+
+
+def test_claim_outcome_profile_created():
+    result = {
+        "events": [
+            {
+                "type": _CLAIMED_TYPE,
+                "parsedJson": {
+                    "username": "creator",
+                    "profile_id": "0xp1",
+                    "reserved_for": None,
+                    "linked_wallet": "0xc1",
+                },
+            }
+        ]
+    }
+    out = parse_claim_outcome(result)
+    assert out["outcome"] == "profile_created"
+    assert out["profile_id"] == "0xp1"
+    assert out["reserved_for"] is None
+    assert out["linked_wallet"] == "0xc1"
+
+
+def test_claim_outcome_username_reserved_when_wallet_has_profile():
+    result = {
+        "events": [
+            {"type": "0x50c1::poc_username_beneficiary::CreatorIdentityWalletLinkedEvent", "parsedJson": {}},
+            {
+                "type": _CLAIMED_TYPE,
+                "parsedJson": {
+                    "username": "creator",
+                    "profile_id": {"vec": []},
+                    "reserved_for": {"vec": ["0xc1"]},
+                    "linked_wallet": "0xc1",
+                },
+            },
+        ]
+    }
+    out = parse_claim_outcome(result)
+    assert out["outcome"] == "username_reserved"
+    assert out["profile_id"] is None
+    assert out["reserved_for"] == "0xc1"
+
+
+def test_claim_outcome_unknown_without_event():
+    assert parse_claim_outcome({"events": [], "mock": True})["outcome"] is None

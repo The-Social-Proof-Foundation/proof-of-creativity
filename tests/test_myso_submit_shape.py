@@ -13,7 +13,11 @@ from app.services.composition_submission import (
     build_analyze_post_composition_move_call,
     build_composition_submission_from_assets,
 )
-from app.services.media_asset_submission import MediaResolutionResult, build_finalize_media_asset_move_call
+from app.services.media_asset_submission import (
+    MediaResolutionResult,
+    build_finalize_media_asset_move_call,
+    verified_visual_registration_rights,
+)
 from app.services.myso_client import MySocialClient
 
 
@@ -26,18 +30,41 @@ def poc_env_base(monkeypatch):
     monkeypatch.setenv("MYSOCIAL_RPC_URL", "https://rpc.example")
 
 
+def _assert_field_maps(value) -> None:
+    if isinstance(value, dict):
+        assert "type" not in value
+        for nested in value.values():
+            _assert_field_maps(nested)
+    elif isinstance(value, list):
+        for item in value:
+            _assert_field_maps(item)
+
+
 def test_submit_finalize_media_asset_move_call_argument_count(poc_env_base):
+    rights = verified_visual_registration_rights(
+        submitter="0xsubmitter",
+        content_commitment_hex="0102",
+        fingerprint_commitment_hex="0304",
+    )
     resolution = MediaResolutionResult(
         request_id="0xrequest",
         content_commitment=b"\x01\x02",
         observed_fingerprint_commitment=b"\x03\x04",
         media_type=1,
         submitter="0xsubmitter",
+        claims=rights["claims"],
+        usage_grants=rights["usage_grants"],
     )
     mc = build_finalize_media_asset_move_call(resolution)
     assert mc["module"] == "proof_of_creativity"
     assert mc["function"] == "finalize_media_asset"
     assert len(mc["arguments"]) == 11
+    claims, grants, splits = mc["arguments"][7], mc["arguments"][8], mc["arguments"][9]
+    assert claims and grants and splits
+    assert "claim_type" in claims[0]
+    assert "claimant" in claims[0]
+    assert "asset_id" in claims[0]
+    _assert_field_maps([claims, grants, splits])
 
 
 def test_submit_analyze_post_composition_plain_move_call_argument_count(poc_env_base):

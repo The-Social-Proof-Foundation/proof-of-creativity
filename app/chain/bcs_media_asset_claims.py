@@ -63,6 +63,20 @@ class BcsWriter:
         self.write_u8(1)
         self.write_u64(value)
 
+    def write_option_u8(self, value: int | None) -> None:
+        if value is None:
+            self.write_u8(0)
+            return
+        self.write_u8(1)
+        self.write_u8(value)
+
+    def write_option_string(self, value: str | None) -> None:
+        if value is None:
+            self.write_u8(0)
+            return
+        self.write_u8(1)
+        self.write_bytes_vector(value.encode("utf-8"))
+
     def write_bytes_vector(self, data: bytes) -> None:
         self.write_uleb128(len(data))
         self._buf.extend(data)
@@ -120,6 +134,43 @@ def compute_claims_bundle_commitment(
 ) -> bytes:
     payload = serialize_claims_bundle(claims, usage_grants)
     return hashlib.sha3_256(payload).digest()
+
+
+def serialize_rights_resolution_target(target: dict[str, Any]) -> bytes:
+    """BCS for `RightsResolutionTarget` (same Option layout for every kind, including 0)."""
+    w = BcsWriter()
+    w.write_u8(int(target["target_kind"]))
+    w.write_address(str(target["beneficiary_address"]))
+    w.write_option_address(target.get("vault_id"))
+    username = target.get("username")
+    w.write_option_string(str(username) if username else None)
+    source = target.get("identity_source")
+    w.write_option_u8(int(source) if source is not None else None)
+    identity_hash = target.get("identity_hash")
+    if isinstance(identity_hash, str):
+        identity_hash = bytes.fromhex(identity_hash.removeprefix("0x")) if identity_hash else None
+    w.write_option_bytes(identity_hash if isinstance(identity_hash, (bytes, bytearray)) else None)
+    return w.bytes()
+
+
+def serialize_rights_resolution_bundle(
+    claims: list[dict[str, Any]],
+    usage_grants: list[dict[str, Any]],
+    target: dict[str, Any],
+) -> bytes:
+    payload = bytearray(serialize_claims_bundle(claims, usage_grants))
+    payload.extend(serialize_rights_resolution_target(target))
+    return bytes(payload)
+
+
+def compute_rights_resolution_commitment(
+    claims: list[dict[str, Any]],
+    usage_grants: list[dict[str, Any]],
+    target: dict[str, Any],
+) -> bytes:
+    return hashlib.sha3_256(
+        serialize_rights_resolution_bundle(claims, usage_grants, target)
+    ).digest()
 
 
 def split_claims_and_grants_bcs(

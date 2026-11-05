@@ -87,6 +87,7 @@ class AnalysisService:
         creator_wallet_address: str | None = None,
         transaction_digest: str | None = None,
         event_sequence: int | None = None,
+        platform_id: str | None = None,
     ) -> AnalysisResult:
         await event_bus.publish(
             "post.analysis.progress",
@@ -103,6 +104,7 @@ class AnalysisService:
             creator_wallet_address=creator_wallet_address,
             transaction_digest=transaction_digest,
             event_sequence=event_sequence,
+            platform_id=platform_id,
         )
         media_id = new_media_id()
         try:

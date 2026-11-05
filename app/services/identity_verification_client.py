@@ -30,6 +30,7 @@ class PocClaimStatus:
     identity_hash: str
     wallet: str
     authorize_url: str | None = None
+    beneficiary_id: str | None = None
 
 
 class IdentityVerificationClient:
@@ -81,19 +82,55 @@ class IdentityVerificationClient:
             verified_at=int(body["verified_at"]),
         )
 
+    def attest_for_beneficiary_transfer_sync(
+        self,
+        *,
+        identity_hash: str,
+        beneficiary_id: str,
+        wallet: str,
+        recipient: str,
+        session_jwt: str | None = None,
+    ) -> PocClaimAttestation:
+        if not self.enabled:
+            raise RuntimeError("MYSO_IDENTITY_VERIFICATION_URL is not configured")
+        resp = requests.post(
+            f"{self.base_url}/verification/poc/attest-for-beneficiary-transfer",
+            json={
+                "identity_hash": identity_hash,
+                "beneficiary_id": beneficiary_id,
+                "wallet": wallet,
+                "recipient": recipient,
+            },
+            headers=self._headers(session_jwt),
+            timeout=15.0,
+        )
+        resp.raise_for_status()
+        body: dict[str, Any] = resp.json()
+        return PocClaimAttestation(
+            attested_x_handle=str(body["attested_x_handle"]),
+            identity_hash=str(body["identity_hash"]),
+            evidence_hash=str(body["evidence_hash"]),
+            verifier=str(body.get("verifier") or "myso-identity-verification"),
+            verified_at=int(body["verified_at"]),
+        )
+
     def get_claim_status_sync(
         self,
         *,
         identity_hash: str,
         wallet: str,
         session_jwt: str | None = None,
+        beneficiary_id: str | None = None,
     ) -> PocClaimStatus:
         if not self.enabled:
             raise RuntimeError("MYSO_IDENTITY_VERIFICATION_URL is not configured")
         url = f"{self.base_url}/verification/poc/status"
+        params = {"identity_hash": identity_hash, "wallet": wallet}
+        if beneficiary_id:
+            params["beneficiary_id"] = beneficiary_id
         resp = requests.get(
             url,
-            params={"identity_hash": identity_hash, "wallet": wallet},
+            params=params,
             headers=self._headers(session_jwt),
             timeout=15.0,
         )
@@ -106,6 +143,7 @@ class IdentityVerificationClient:
             identity_hash=str(body.get("identity_hash") or identity_hash),
             wallet=str(body.get("wallet") or wallet),
             authorize_url=body.get("authorize_url"),
+            beneficiary_id=body.get("beneficiary_id"),
         )
 
     async def get_claim_status(
@@ -114,14 +152,18 @@ class IdentityVerificationClient:
         identity_hash: str,
         wallet: str,
         session_jwt: str | None = None,
+        beneficiary_id: str | None = None,
     ) -> PocClaimStatus:
         if not self.enabled:
             raise RuntimeError("MYSO_IDENTITY_VERIFICATION_URL is not configured")
         url = f"{self.base_url}/verification/poc/status"
         async with httpx.AsyncClient(timeout=15.0) as client:
+            params = {"identity_hash": identity_hash, "wallet": wallet}
+            if beneficiary_id:
+                params["beneficiary_id"] = beneficiary_id
             resp = await client.get(
                 url,
-                params={"identity_hash": identity_hash, "wallet": wallet},
+                params=params,
                 headers=self._headers(session_jwt),
             )
             resp.raise_for_status()
@@ -133,6 +175,7 @@ class IdentityVerificationClient:
             identity_hash=str(body.get("identity_hash") or identity_hash),
             wallet=str(body.get("wallet") or wallet),
             authorize_url=body.get("authorize_url"),
+            beneficiary_id=body.get("beneficiary_id"),
         )
 
     async def connect_for_poc_claim(
@@ -141,7 +184,7 @@ class IdentityVerificationClient:
         identity_hash: str,
         beneficiary_id: str,
         wallet: str,
-        session_jwt: str,
+        session_jwt: str | None = None,
     ) -> str:
         if not self.enabled:
             raise RuntimeError("MYSO_IDENTITY_VERIFICATION_URL is not configured")

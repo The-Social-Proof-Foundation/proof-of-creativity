@@ -27,7 +27,6 @@ class StorageClient:
     
     def __init__(self):
         self.r2_client = None
-        self.stream_client = None
         self.gcs_client = None
         self.session = None
         
@@ -38,14 +37,6 @@ class StorageClient:
             except Exception as e:
                 logger.error("Failed to initialize Cloudflare R2 client", error=str(e))
                 logger.warning("R2 initialization failed, will try other storage backends")
-        
-        # Initialize Cloudflare Stream client if credentials are available (VIDEO STREAMING - opt-in per upload)
-        if config.STREAM_ACCOUNT_ID and config.STREAM_API_TOKEN:
-            try:
-                self._initialize_stream()
-            except Exception as e:
-                logger.error("Failed to initialize Cloudflare Stream client", error=str(e))
-                logger.warning("Stream initialization failed, video streaming URLs will not be available")
         
         # Initialize GCS client if enabled (BACKUP/ARCHIVE - optional)
         if config.USE_GCS:
@@ -74,7 +65,6 @@ class StorageClient:
         
         logger.info("Storage client initialized", 
                    r2_enabled=self.r2_client is not None,
-                   stream_enabled=self.stream_client is not None,
                    gcs_enabled=self.gcs_client is not None,
                    walrus_enabled=config.USE_WALRUS and self.session is not None)
     
@@ -119,43 +109,6 @@ class StorageClient:
                     
         except Exception as e:
             logger.error("R2 initialization failed", error=str(e))
-            raise
-    
-    def _initialize_stream(self):
-        """Initialize Cloudflare Stream client for video streaming."""
-        try:
-            account_id = config.STREAM_ACCOUNT_ID
-            api_token = config.STREAM_API_TOKEN
-            
-            if not all([account_id, api_token]):
-                raise ValueError("Missing Stream credentials: STREAM_ACCOUNT_ID or STREAM_API_TOKEN")
-            
-            # Stream uses REST API (not S3-compatible like R2)
-            # We'll use requests for Stream API calls
-            self.stream_client = {
-                'account_id': account_id,
-                'api_token': api_token,
-                'api_base_url': f"https://api.cloudflare.com/client/v4/accounts/{account_id}/stream",
-                'customer_subdomain': config.STREAM_CUSTOMER_SUBDOMAIN
-            }
-            
-            # Test Stream API access by getting account details
-            headers = {'Authorization': f'Bearer {api_token}'}
-            test_url = f"https://api.cloudflare.com/client/v4/accounts/{account_id}/stream"
-            response = requests.get(test_url, headers=headers, timeout=10)
-            
-            if response.status_code == 200:
-                logger.info("Cloudflare Stream client initialized successfully", 
-                           account_id=account_id,
-                           custom_domain=bool(config.STREAM_CUSTOMER_SUBDOMAIN))
-            else:
-                logger.error("Stream API test failed", 
-                           status_code=response.status_code,
-                           response=response.text[:200])
-                raise ValueError(f"Stream API test failed with status {response.status_code}")
-                
-        except Exception as e:
-            logger.error("Stream initialization failed", error=str(e))
             raise
     
     def _initialize_gcs(self):
@@ -321,56 +274,6 @@ class StorageClient:
             return f"{domain}/{key}"
         return f"https://{domain}/{key}"
 
-    def create_presigned_put(
-        self,
-        key: str,
-        content_type: str,
-        expires_in: int = 3600,
-    ) -> str:
-        """Create a short-lived presigned PUT URL for direct client→R2 upload."""
-        if not self.r2_client:
-            raise ValueError("R2 client is not initialized")
-        return self.r2_client.generate_presigned_url(
-            "put_object",
-            Params={
-                "Bucket": config.R2_BUCKET_NAME,
-                "Key": key,
-                "ContentType": content_type,
-            },
-            ExpiresIn=expires_in,
-        )
-
-    def reserve_presigned_upload(
-        self,
-        *,
-        media_type: str,
-        media_id: str,
-        filename: str,
-        content_type: str,
-        expires_in: int = 3600,
-    ) -> dict:
-        """
-        Reserve an R2 key and return public_url + upload_url for chain-first publish.
-        Filename is only used for extension; object basename is always {media_id}{ext}.
-        """
-        from pathlib import Path
-
-        ext = Path(filename or "").suffix or mimetypes.guess_extension(content_type) or ".bin"
-        if not ext.startswith("."):
-            ext = f".{ext}"
-        object_filename = f"{media_id}{ext}"
-        key = self.build_r2_object_key(media_type, object_filename)
-        public_url = self.public_url_for_key(key)
-        upload_url = self.create_presigned_put(key, content_type, expires_in=expires_in)
-        return {
-            "media_id": media_id,
-            "key": key,
-            "public_url": public_url,
-            "upload_url": upload_url,
-            "expires_in": expires_in,
-            "content_type": content_type,
-        }
-
     def _upload_to_r2(self, filename: str, fileobj: BinaryIO, media_type: str, file_size: int, progress_callback: Optional[callable] = None) -> str:
         """Upload file to Cloudflare R2 (S3-compatible) with progress tracking."""
         try:
@@ -398,28 +301,13 @@ class StorageClient:
             
             # Upload to R2 using boto3 S3 client with progress tracking
             fileobj.seek(0)  # Reset to beginning
-            
-            if progress_callback and file_size > 0:
-                # Wrap file object to track bytes uploaded
-                from app.core.utils import ProgressFileWrapper
-                wrapped_fileobj = ProgressFileWrapper(fileobj, file_size, progress_callback)
-                
-                self.r2_client.put_object(
-                    Bucket=bucket_name,
-                    Key=storage_path,
-                    Body=wrapped_fileobj,
-                    ContentType=content_type,
-                    Metadata=metadata
-                )
-            else:
-                # No progress tracking
-                self.r2_client.put_object(
-                    Bucket=bucket_name,
-                    Key=storage_path,
-                    Body=fileobj,
-                    ContentType=content_type,
-                    Metadata=metadata
-                )
+            self.r2_client.put_object(
+                Bucket=bucket_name,
+                Key=storage_path,
+                Body=fileobj,
+                ContentType=content_type,
+                Metadata=metadata
+            )
             
             upload_time = time.time() - start_time
             
@@ -597,60 +485,6 @@ class StorageClient:
         except Exception as e:
             logger.error("Unexpected error during local upload", filename=filename, error=str(e))
             raise
-    
-    def upload_to_stream(self, filename: str, fileobj: BinaryIO, media_type: str, file_size: int, metadata: Optional[Dict[str, Any]] = None) -> Optional[str]:
-        """
-        Retired: Cloudflare Stream is no longer used for DripDrop video.
-        HLS encoding is owned by dripdrop-backend + external encoder → R2 streams.
-        """
-        logger.warning(
-            "upload_to_stream is retired; use dripdrop-backend /v1/videos",
-            filename=filename,
-            media_type=media_type,
-        )
-        return None
-    
-    def get_stream_playback_url(self, stream_uri: str) -> Optional[str]:
-        """
-        Get playback URL from Stream URI.
-        
-        Args:
-            stream_uri: Stream URI in format stream://{video_uid}
-            
-        Returns:
-            Playback URL or None
-        """
-        if not stream_uri or not stream_uri.startswith("stream://"):
-            return None
-        
-        video_uid = stream_uri.replace("stream://", "")
-        
-        if self.stream_client and self.stream_client.get('customer_subdomain'):
-            return f"https://{self.stream_client['customer_subdomain']}/{video_uid}/manifest/video.m3u8"
-        elif self.stream_client:
-            return f"https://customer-{self.stream_client['account_id']}.cloudflarestream.com/{video_uid}/manifest/video.m3u8"
-        else:
-            return None
-    
-    def get_stream_embed_url(self, stream_uri: str) -> Optional[str]:
-        """
-        Get iframe embed URL from Stream URI.
-        
-        Args:
-            stream_uri: Stream URI in format stream://{video_uid}
-            
-        Returns:
-            Embed URL or None
-        """
-        if not stream_uri or not stream_uri.startswith("stream://"):
-            return None
-        
-        video_uid = stream_uri.replace("stream://", "")
-        
-        if self.stream_client:
-            return f"https://customer-{self.stream_client['account_id']}.cloudflarestream.com/{video_uid}/iframe"
-        else:
-            return None
     
     def download(self, storage_uri: str, output_path: Optional[str] = None) -> str:
         """
@@ -917,7 +751,6 @@ class StorageClient:
         """Check the health of storage backends."""
         health = {
             "r2": {"available": False, "error": None},
-            "stream": {"available": False, "error": None},
             "gcs": {"available": False, "error": None},
             "walrus": {"available": False, "error": None}
         }
@@ -934,22 +767,6 @@ class StorageClient:
                 health["r2"]["error"] = str(e)
             except Exception as e:
                 health["r2"]["error"] = str(e)
-        
-        # Check Cloudflare Stream
-        if self.stream_client:
-            try:
-                headers = {'Authorization': f"Bearer {self.stream_client['api_token']}"}
-                test_url = f"{self.stream_client['api_base_url']}"
-                response = requests.get(test_url, headers=headers, timeout=5)
-                if response.status_code == 200:
-                    health["stream"]["available"] = True
-                    health["stream"]["account_id"] = self.stream_client['account_id']
-                    if self.stream_client.get('customer_subdomain'):
-                        health["stream"]["custom_domain"] = self.stream_client['customer_subdomain']
-                else:
-                    health["stream"]["error"] = f"HTTP {response.status_code}"
-            except Exception as e:
-                health["stream"]["error"] = str(e)
         
         # Check GCS (backup)
         if config.USE_GCS and self.gcs_client:
